@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.13)
+project(xd_gpuctr CXX)
+set(CMAKE_CXX_STANDARD 17)
+add_subdirectory(${LIBGPUCOUNTERS_DIR} libgpucounters)
+add_executable(xd_gpuctr xd_gpuctr.cpp)
+target_link_libraries(xd_gpuctr PRIVATE hwcpipe)

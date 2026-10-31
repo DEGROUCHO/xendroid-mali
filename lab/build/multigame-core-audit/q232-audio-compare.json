@@ -1,0 +1,38 @@
+{
+  "q231-rect": {
+    "full": {
+      "periods": 214,
+      "gap_percent": 1.95,
+      "queue_avg": 4.4,
+      "queue_max": 8.0,
+      "xruns_max": 0.0,
+      "clipped_sum": 5626.0
+    },
+    "last40": {
+      "periods": 40,
+      "gap_percent": 5.67,
+      "queue_avg": 3.83,
+      "queue_max": 6.0,
+      "xruns_max": 0.0,
+      "clipped_sum": 2175.0
+    }
+  },
+  "q232-all": {
+    "full": {
+      "periods": 200,
+      "gap_percent": 0.44,
+      "queue_avg": 7.49,
+      "queue_max": 9.0,
+      "xruns_max": 0.0,
+      "clipped_sum": 1726.0
+    },
+    "last40": {
+      "periods": 40,
+      "gap_percent": 1.54,
+      "queue_avg": 7.01,
+      "queue_max": 9.0,
+      "xruns_max": 0.0,
+      "clipped_sum": 879.0
+    }
+  }
+}

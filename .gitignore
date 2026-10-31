@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[co]
+local.properties
+/src/*/.gradle/
+/src/*/.kotlin/
+/src/*/build/
+/src/*/app/build/
+/src/*/emulator-core/build/
+/src/*/emulator-core/.cxx/
+/lab/build/apk/
+*.apk
+*.aab
+*.xds
+/lab/test/*/
+!/lab/test/tools-pass/
+!/lab/test/history/

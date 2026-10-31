@@ -1,0 +1,12 @@
+{
+  "title": "Dante s Inferno",
+  "title_id": "454108CF",
+  "apk": "q302-test.apk",
+  "apk_sha256": "3cf83d87b52adecfc7594887bcacc2e0c6f704b7d4af1193bc022c541ced2251",
+  "profile": "/path/to/xendroid-ultimate-mali/lab/build/session-2026-10-08-night/454108CF-q302-daily.config.toml",
+  "profile_sha256": "f5caa8bd8cf729ae27044b2d5f7ded1d068864b5bbff652f5b648ad7ce2e6816",
+  "reference": "q302-dante300s clean,userapproved",
+  "default_restore_global": "q232-all-original-global.toml",
+  "promotion": "userexplicit2026-10-08",
+  "logging_difference": "diagnosticlog_vk_memory=false,render_pass_breaks=0"
+}

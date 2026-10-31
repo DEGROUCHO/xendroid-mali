@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and general chat
+    url: https://github.com/DEGROUCHO/xendroid-mali/discussions
+    about: Ask questions, share setups and results in Discussions.

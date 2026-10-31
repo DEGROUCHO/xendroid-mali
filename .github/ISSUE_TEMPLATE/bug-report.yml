@@ -1,0 +1,34 @@
+name: 🐞 Bug report
+description: Something crashes, looks wrong, or got worse.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you saw instead.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Phone, SoC and GPU
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      placeholder: e.g. q636
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game
+  - type: textarea
+    id: log
+    attributes:
+      label: Log (optional)
+      description: "adb logcat output around the problem. Remove anything personal before pasting."
+      render: text

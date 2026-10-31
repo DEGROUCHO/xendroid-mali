@@ -1,0 +1,57 @@
+name: 📱 Device / game report
+description: Tell us how a game runs on your phone (good or bad).
+labels: ["device report"]
+body:
+  - type: input
+    id: phone
+    attributes:
+      label: Phone model
+      placeholder: e.g. POCO X7 Pro
+    validations:
+      required: true
+  - type: input
+    id: soc
+    attributes:
+      label: SoC and GPU
+      placeholder: e.g. Dimensity 8400, Mali-G720 MC7
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version / skin
+      placeholder: e.g. Android 16, HyperOS 3
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      placeholder: e.g. q636
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game (and region / title update if known)
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - Playable
+        - In-game, with problems
+        - Menus only
+        - Does not boot / crashes
+    validations:
+      required: true
+  - type: input
+    id: fps
+    attributes:
+      label: Typical fps in gameplay
+      placeholder: e.g. 30-40
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes, artifacts, screenshots
+      description: Drag in-game screenshots here. Note whether the phone was charging or hot.

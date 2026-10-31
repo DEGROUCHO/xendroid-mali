@@ -134,19 +134,9 @@
 
 Xenia translates Xbox 360 PowerPC code to ARM64 and Xbox 360 GPU commands to Vulkan. On Mali, most of the cost and almost every visual bug sat in the second half of that chain. That half is where this fork does most of its work.
 
-```mermaid
-flowchart LR
-    A["Xbox 360 game<br/>(PowerPC code)"] --> B["ARM64 JIT<br/>+ guest scheduler"]
-    B --> C["Command processor<br/>(Xenos GPU commands)"]
-    C --> D["Vulkan renderer"]
-    D --> E["Mali GPU"]
-    B -.- B1["lighter waits<br/>fewer busy cores"]
-    C -.- C1["mprotect coherency<br/>index cache · raw timers"]
-    D -.- D1["MSAA 2×2 · BC→ASTC<br/>memexport in compute<br/>render passes · zero-copy"]
-    style B1 fill:#0d1117,stroke:#2edc5a,color:#c9d1d9
-    style C1 fill:#0d1117,stroke:#2edc5a,color:#c9d1d9
-    style D1 fill:#0d1117,stroke:#2edc5a,color:#c9d1d9
-```
+<p align="center">
+  <img src="docs/media/pipeline.png" width="900" alt="Pipeline: Xbox 360 game, ARM64 JIT, command processor, Vulkan renderer, Mali GPU">
+</p>
 
 <details>
 <summary><b>🎨 GPU: Vulkan on Mali (click to expand)</b></summary>

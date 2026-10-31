@@ -1,0 +1,34 @@
+# XenDroid profile — MW2 41560817 — Balanced (2x, no post)
+[GPU]
+draw_resolution_scale_x = 2
+draw_resolution_scale_y = 2
+native_2x_msaa = true
+anisotropic_override = 3
+occlusion_query = "fake"
+framerate_limit = 0
+guest_display_refresh_cap = true
+clear_memory_page_state = false
+render_target_path = "performance"
+vulkan_mid_frame_submission_draws = 0
+gpu_stall_spin_iterations = 0
+half_pixel_offset = true
+texture_cache_memory_limit_soft = 1024
+texture_cache_memory_limit_hard = 2048
+store_shaders = true
+
+[Vulkan]
+vulkan_in_pass_resolve = true
+vulkan_resolve_to_texture_promote = true
+vulkan_resolve_to_texture = true
+vulkan_resolve_to_texture_serve = true
+vulkan_async_skip_draws = true
+vulkan_avoid_geometry_shaders = true
+vulkan_pipeline_creation_threads = 4
+
+[Display]
+postprocess_scaling_and_sharpening = ""
+postprocess_antialiasing = ""
+postprocess_dither = true
+
+[Kernel]
+cl = "+r_vsync 0 +com_maxfps 0"

@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Halves a luma level (2x2 average, edge-clamped).
+#include "fg_common.glsl"
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform XeFgDownConstants {
+  uvec2 src_size;
+  uvec2 dst_size;
+  uint src_offset;
+  uint dst_offset;
+} pc;
+void main() {
+  uvec2 d = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(d, pc.dst_size))) {
+    return;
+  }
+  float sum = 0.0;
+  for (uint i = 0u; i < 4u; ++i) {
+    uvec2 s = min(d * 2u + uvec2(i & 1u, i >> 1u), pc.src_size - 1u);
+    sum += xe_fg_data[pc.src_offset + s.y * pc.src_size.x + s.x];
+  }
+  xe_fg_data[pc.dst_offset + d.y * pc.dst_size.x + d.x] = sum * 0.25;
+}

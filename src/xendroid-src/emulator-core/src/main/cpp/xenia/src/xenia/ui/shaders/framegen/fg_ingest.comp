@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Copies the new guest output frame (tex_a) into a history image (out), one
+// pixel per invocation, and writes its luma averaged over factor x factor
+// pixels (2 normally, 4 for high-resolution output so the motion search cost
+// doesn't grow with it) to the buffer - the averaging goes through shared
+// memory so all the accesses stay coalesced.
+#include "fg_common.glsl"
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(push_constant) uniform XeFgIngestConstants {
+  uvec2 size;
+  uvec2 l1_size;
+  uint l1_offset;
+  uint factor;
+} pc;
+
+shared float luma_tile[256];
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  vec4 c = texelFetch(xe_fg_tex_a, min(p, ivec2(pc.size) - 1), 0);
+  if (all(lessThan(p, ivec2(pc.size)))) {
+    imageStore(xe_fg_out, p, c);
+  }
+  luma_tile[gl_LocalInvocationIndex] = XeFgLuma(c.rgb);
+  barrier();
+  // factor is 2 or 4, dividing the 16x16 workgroup evenly.
+  uint blocks_per_side = 16u / pc.factor;
+  uint i = gl_LocalInvocationIndex;
+  if (i >= blocks_per_side * blocks_per_side) {
+    return;
+  }
+  uvec2 block = uvec2(i % blocks_per_side, i / blocks_per_side);
+  uvec2 l1 = gl_WorkGroupID.xy * blocks_per_side + block;
+  if (any(greaterThanEqual(l1, pc.l1_size))) {
+    return;
+  }
+  float sum = 0.0;
+  for (uint y = 0u; y < pc.factor; ++y) {
+    for (uint x = 0u; x < pc.factor; ++x) {
+      uvec2 t = block * pc.factor + uvec2(x, y);
+      sum += luma_tile[t.y * 16u + t.x];
+    }
+  }
+  xe_fg_data[pc.l1_offset + l1.y * pc.l1_size.x + l1.x] =
+      sum / float(pc.factor * pc.factor);
+}

@@ -1,0 +1,177 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+// Full-search block matching at the coarsest pyramid level (same cost as
+// fg_me.comp without parent), with the previous frame's area around the
+// workgroup's 8x8 blocks staged in shared memory.
+#include "fg_common.glsl"
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform XeFgMeConstants {
+  uvec2 level_size;
+  uvec2 grid_size;
+  uvec2 parent_grid_size;
+  uint cur_offset;
+  uint prev_offset;
+  uint flow_offset;
+  uint parent_flow_offset;
+  int radius;
+  uint has_parent;
+  uint static_early_out;
+  uint quality_offset;
+  uint scene_offset;
+  uint quality_flags;
+} pc;
+
+// 8 blocks of 4 pixels, the 1-pixel window border and up to 6 pixels of
+// search on each side.
+const int kMaxRadius = 6;
+const int kTileSize = 8 * 4 + 2 * (kMaxRadius + 1);
+shared float prev_tile[kTileSize * kTileSize];
+shared vec2 scene_error[64];
+
+float XeFgLevel(uint offset, ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.level_size) - 1);
+  return xe_fg_data[offset + uint(p.y) * pc.level_size.x + uint(p.x)];
+}
+
+// The block's window and moving pixels, packed as in fg_me.comp.
+uint cur_packed[18];
+uint moving_bits[2];
+
+float XeFgCur(int i) {
+  vec2 h = unpackHalf2x16(cur_packed[i >> 1]);
+  return (i & 1) != 0 ? h.y : h.x;
+}
+
+float XeFgMoving(int i) {
+  return float((moving_bits[i >> 5] >> uint(i & 31)) & 1u);
+}
+
+void main() {
+  int radius = min(pc.radius, kMaxRadius);
+  ivec2 tile_origin = ivec2(gl_WorkGroupID.xy * 32u) - (kMaxRadius + 1);
+  for (uint i = gl_LocalInvocationIndex; i < uint(kTileSize * kTileSize);
+       i += 64u) {
+    ivec2 t = ivec2(int(i) % kTileSize, int(i) / kTileSize);
+    prev_tile[i] = XeFgLevel(pc.prev_offset, tile_origin + t);
+  }
+  barrier();
+
+  // Sparse global 8x8 luma probe in the existing coarse dispatch, no extra
+  // pass, atomics, or CPU readback. Uniform workgroup branch, before returns.
+  if (all(equal(gl_WorkGroupID.xy, uvec2(0)))) {
+    if ((pc.quality_flags & 8u) != 0u) {
+      uint lane = gl_LocalInvocationIndex;
+      uvec2 q = min(((gl_LocalInvocationID.xy * 2u + 1u) * pc.level_size) / 16u,
+                    pc.level_size - 1u);
+      float d = abs(XeFgLevel(pc.cur_offset, ivec2(q)) -
+                    XeFgLevel(pc.prev_offset, ivec2(q)));
+      scene_error[lane] = vec2(d, d > 0.20 ? 1.0 : 0.0);
+      barrier();
+      for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+          scene_error[lane] += scene_error[lane + stride];
+        }
+        barrier();
+      }
+      if (lane == 0u) {
+        // A cut requires both high mean error and widespread change. A fast
+        // pan / flash can still trigger this conservative repeat heuristic.
+        xe_fg_data[pc.scene_offset] =
+            min(scene_error[0].x / (64.0 * 0.30),
+                scene_error[0].y / (64.0 * 0.85));
+      }
+    } else if (gl_LocalInvocationIndex == 0u) {
+      xe_fg_data[pc.scene_offset] = -1.0;
+    }
+  }
+
+  uvec2 cell = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(cell, pc.grid_size))) {
+    return;
+  }
+  ivec2 block_origin = ivec2(cell * 4u);
+  // The window's top-left in the tile at zero motion.
+  ivec2 base = block_origin - ivec2(1) - tile_origin;
+  moving_bits[0] = 0u;
+  moving_bits[1] = 0u;
+  [[unroll]] for (int k = 0; k < 18; ++k) {
+    vec2 c;
+    [[unroll]] for (int h = 0; h < 2; ++h) {
+      int i = k * 2 + h;
+      int x = i % 6, y = i / 6;
+      float cv = XeFgLevel(pc.cur_offset, block_origin + ivec2(x - 1, y - 1));
+      cv = unpackHalf2x16(packHalf2x16(vec2(cv, 0.0))).x;
+      if (abs(cv - prev_tile[(base.y + y) * kTileSize + base.x + x]) >=
+          (2.0 / 255.0)) {
+        moving_bits[i >> 5] |= 1u << uint(i & 31);
+      }
+      c[h] = cv;
+    }
+    cur_packed[k] = packHalf2x16(c);
+  }
+  // No moving sample in the 6x6 window: every candidate's SAD is zero, so the
+  // (favored) zero vector wins anyway - skip the search.
+  if (pc.static_early_out != 0u && (moving_bits[0] | moving_bits[1]) == 0u) {
+    uint o = pc.flow_offset + 2u * (cell.y * pc.grid_size.x + cell.x);
+    xe_fg_data[o] = 0.0;
+    xe_fg_data[o + 1u] = 0.0;
+    if ((pc.quality_flags & 32u) != 0u) {
+      xe_fg_data[pc.quality_offset + cell.y * pc.grid_size.x + cell.x] =
+          (pc.quality_flags & 2u) != 0u ? 0.0 : -1.0;
+    }
+    return;
+  }
+  const float kSmoothness = 0.02;
+  ivec2 best_v = ivec2(0);
+  float best_cost = 3.4e38;
+  float best_sad = 0.0;
+  for (int dy = -radius; dy <= radius; ++dy) {
+    // The costs of all horizontal vectors of this row at once: every tile
+    // sample of the rows is read once (prev at column x - dx of the window is
+    // column k = x + kMaxRadius - dx of the row span), not once per vector.
+    float sad[2 * kMaxRadius + 1];
+    [[unroll]] for (int i = 0; i < 2 * kMaxRadius + 1; ++i) {
+      sad[i] = 0.0;
+    }
+    [[unroll]] for (int y = 0; y < 6; ++y) {
+      int row = (base.y + y - dy) * kTileSize + base.x - kMaxRadius;
+      [[unroll]] for (int k = 0; k < 6 + 2 * kMaxRadius; ++k) {
+        float p = prev_tile[row + k];
+        [[unroll]] for (int x = 0; x < 6; ++x) {
+          int dx = x + kMaxRadius - k;
+          if (dx < -kMaxRadius || dx > kMaxRadius) {
+            continue;
+          }
+          sad[dx + kMaxRadius] +=
+              abs(XeFgCur(y * 6 + x) - p) * XeFgMoving(y * 6 + x);
+        }
+      }
+    }
+    [[unroll]] for (int dx = -kMaxRadius; dx <= kMaxRadius; ++dx) {
+      if (dx < -radius || dx > radius) {
+        continue;
+      }
+      float s = sad[dx + kMaxRadius];
+      // Zero motion slightly favored so static content (HUD) stays still.
+      float cost = (dx == 0 && dy == 0)
+                       ? s * 0.9
+                       : s + kSmoothness * float(abs(dx) + abs(dy));
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_sad = s;
+        best_v = ivec2(dx, dy);
+      }
+    }
+  }
+  uint o = pc.flow_offset + 2u * (cell.y * pc.grid_size.x + cell.x);
+  xe_fg_data[o] = float(best_v.x);
+  xe_fg_data[o + 1u] = float(best_v.y);
+  if ((pc.quality_flags & 32u) != 0u) {
+    // Unpenalized winning SAD / number of moving samples, not the search
+    // objective (which biases zero motion and adds smoothness penalties).
+    float count = float(bitCount(moving_bits[0]) + bitCount(moving_bits[1]));
+    xe_fg_data[pc.quality_offset + cell.y * pc.grid_size.x + cell.x] =
+        (pc.quality_flags & 2u) != 0u ? best_sad / max(count, 1.0) : -1.0;
+  }
+}

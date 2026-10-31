@@ -1,0 +1,248 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Synthesizes the frame at phase t between the previous (tex_a) and the
+// current (tex_b) frames along the estimated motion, keeping static pixels
+// (the HUD) exact and falling back to the temporally nearer frame where the
+// two motion-compensated samples disagree (occlusions).
+#include "fg_common.glsl"
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform XeFgInterpConstants {
+  uvec2 size;
+  uvec2 grid_size;
+  uint flow_offset;
+  float flow_scale;
+  float cell_size;
+  float t;
+  uint deduplicate;
+  uint quality_offset;
+  uint scene_offset;
+  uint quality_flags;
+} pc;
+
+vec2 XeFgFlow(ivec2 cell) {
+  cell = clamp(cell, ivec2(0), ivec2(pc.grid_size) - 1);
+  uint i = pc.flow_offset + 2u * (uint(cell.y) * pc.grid_size.x + uint(cell.x));
+  return vec2(xe_fg_data[i], xe_fg_data[i + 1u]);
+}
+
+// The motion vector field (defined at the blocks of the current frame)
+// bilinearly interpolated at a pixel position, in pixels.
+vec2 XeFgFlowAt(vec2 position) {
+  vec2 g = position / pc.cell_size - 0.5;
+  ivec2 g0 = ivec2(floor(g));
+  vec2 f = g - vec2(g0);
+  return mix(mix(XeFgFlow(g0), XeFgFlow(g0 + ivec2(1, 0)), f.x),
+             mix(XeFgFlow(g0 + ivec2(0, 1)), XeFgFlow(g0 + ivec2(1, 1)), f.x),
+             f.y) *
+         pc.flow_scale;
+}
+
+// quality_flags: HUD=1, confidence=2, occlusion=4, cut=8, debug=16.
+float XeFgMax(vec3 v) { return max(v.r, max(v.g, v.b)); }
+
+void XeFgStore(ivec2 p, vec3 color, vec3 mask) {
+  if ((pc.quality_flags & 16u) != 0u && any(greaterThan(mask, vec3(0.0)))) {
+    color = mask;
+  }
+  imageStore(xe_fg_out, p, vec4(color, 1.0));
+}
+
+bool XeFgHud(ivec2 p, vec3 s) {
+  // Four point samples only for nearly unchanged pixels. Test color contrast
+  // (also detects colored HUD text), with clamp rather than undefined fetches
+  // at borders. This is a conservative classifier, not semantic HUD knowledge.
+  const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0),
+                                  ivec2(0, -1), ivec2(0, 1));
+  float contrast = 0.0;
+  for (int i = 0; i < 4; ++i) {
+    ivec2 q = clamp(p + offsets[i], ivec2(0), ivec2(pc.size) - 1);
+    contrast = max(contrast, XeFgMax(abs(texelFetch(xe_fg_tex_b, q, 0).rgb - s)));
+  }
+  return contrast > 0.12;
+}
+
+float XeFgSadAt(vec2 position) {
+  ivec2 cell = clamp(ivec2(floor(position / pc.cell_size)),
+                     ivec2(0), ivec2(pc.grid_size) - 1);
+  return xe_fg_data[pc.quality_offset + uint(cell.y) * pc.grid_size.x +
+                    uint(cell.x)];
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, ivec2(pc.size)))) {
+    return;
+  }
+  // Pair metadata was completed by the existing ME barriers / timeline wait.
+  if ((pc.quality_flags & 8u) != 0u && xe_fg_data[pc.scene_offset] >= 1.0) {
+    vec3 real = pc.t < 0.5 ? texelFetch(xe_fg_tex_a, p, 0).rgb
+                           : texelFetch(xe_fg_tex_b, p, 0).rgb;
+    XeFgStore(p, real, vec3(1.0, 0.0, 1.0));
+    return;
+  }
+  vec2 inv_size = 1.0 / vec2(pc.size);
+  vec3 s0 = texelFetch(xe_fg_tex_a, p, 0).rgb;
+  vec3 s1 = texelFetch(xe_fg_tex_b, p, 0).rgb;
+  vec3 result;
+  vec3 nearest = pc.t < 0.5 ? s0 : s1;
+  vec3 mask = vec3(0.0);
+  vec3 still_diff = abs(s1 - s0);
+  float still_error = XeFgMax(still_diff);
+  if ((pc.quality_flags & 1u) != 0u && still_error < (6.0 / 1023.0)) {
+    if (still_error < (3.0 / 1023.0)) {
+      // Already static under the legacy test: copying exactly also protects
+      // HUD interiors, without paying for contrast fetches. Debug alone tests
+      // contrast here so its green mask remains specific to HUD-like edges.
+      vec3 hud_mask = vec3(0.0);
+      if ((pc.quality_flags & 16u) != 0u && XeFgHud(p, s1)) {
+        hud_mask = vec3(0.0, 1.0, 0.0);
+      }
+      XeFgStore(p, nearest, hud_mask);
+      return;
+    }
+    if (XeFgHud(p, s1)) {
+      XeFgStore(p, nearest, vec3(0.0, 1.0, 0.0));
+      return;
+    }
+  }
+  if (max(still_diff.r, max(still_diff.g, still_diff.b)) < (3.0 / 1023.0)) {
+    result = mix(s0, s1, pc.t);
+  } else {
+    vec2 g = (vec2(p) + 0.5) / pc.cell_size - 0.5;
+    ivec2 g0 = ivec2(floor(g));
+    vec2 f = g - vec2(g0);
+    vec2 f00 = XeFgFlow(g0), f10 = XeFgFlow(g0 + ivec2(1, 0));
+    vec2 f01 = XeFgFlow(g0 + ivec2(0, 1)), f11 = XeFgFlow(g0 + ivec2(1, 1));
+    vec2 v = mix(mix(f00, f10, f.x), mix(f01, f11, f.x), f.y) * pc.flow_scale;
+    vec2 center = vec2(p) + 0.5;
+    if ((pc.quality_flags & 2u) != 0u) {
+      float sad = XeFgSadAt(center + (1.0 - pc.t) * v);
+      vec2 lv = v / pc.flow_scale;
+      vec2 e00 = f00 - lv, e10 = f10 - lv;
+      vec2 e01 = f01 - lv, e11 = f11 - lv;
+      float spread2 = max(max(dot(e00, e00), dot(e10, e10)),
+                          max(dot(e01, e01), dot(e11, e11)));
+      float limit = 3.0 + 0.25 * max(abs(lv.x), abs(lv.y));
+      // Early reject before costly texture / candidate search. -1 means this
+      // pair was analyzed while confidence was off; wait for the next pair.
+      if (sad >= 0.0 && (sad > 0.08 || spread2 > limit * limit)) {
+        XeFgStore(p, nearest, vec3(1.0, 0.0, 0.0));
+        return;
+      }
+    }
+    vec3 a = textureLod(sampler2D(xe_fg_tex_a, xe_fg_sampler),
+                        (center - pc.t * v) * inv_size, 0.0).rgb;
+    vec3 b = textureLod(sampler2D(xe_fg_tex_b, xe_fg_sampler),
+                        (center + (1.0 - pc.t) * v) * inv_size, 0.0).rgb;
+    vec3 d0 = abs(a - b);
+    if (any(notEqual(f00, f10)) || any(notEqual(f00, f01)) ||
+        any(notEqual(f00, f11)) || max(d0.r, max(d0.g, d0.b)) > 0.06) {
+      // The blended vector is doubtful: at a motion boundary (like the HUD over
+      // a moving background) it belongs to neither side, and the field is
+      // defined at the positions in the current frame, not at the synthesized
+      // one. Take the candidate whose two samples agree the best: the
+      // neighboring vectors, the vector where the object is in the current
+      // frame (v = flow(p + (1 - t) v), two fixed-point iterations), and the
+      // vector at its position in the previous frame (FSR 3 frame
+      // interpolation similarly reprojects the vectors to the interpolated
+      // position; measured offline 2026-09-30: +1.1 dB on moving pixels).
+      vec3 d = d0;
+      float best_error = d.r + d.g + d.b;
+      vec2 v1 = XeFgFlowAt(center + (1.0 - pc.t) * v);
+      vec2 v2 = XeFgFlowAt(center + (1.0 - pc.t) * v1);
+      vec2 vp = XeFgFlowAt(center - pc.t * v);
+      vec2 candidates[7] = vec2[7](
+          f00 * pc.flow_scale, f10 * pc.flow_scale, f01 * pc.flow_scale,
+          f11 * pc.flow_scale, v1, v2, vp);
+      vec2 best_v = v;
+      // No motion (the samples at this pixel are already loaded): wins where
+      // the vectors are fooled by repetitive detail such as MW2's camouflage
+      // nets.
+      {
+        vec3 dz = abs(s0 - s1);
+        float zero_error = dz.r + dz.g + dz.b;
+        if (zero_error < best_error) {
+          best_error = zero_error;
+          a = s0;
+          b = s1;
+          best_v = vec2(0.0);
+        }
+      }
+      for (int i = 0; i < 7; ++i) {
+        vec2 cv = candidates[i];
+        // Paying for protection should not also pay for duplicate candidates.
+        // Exact deduplication preserves the strict comparison and its order.
+        if (pc.deduplicate != 0u || (pc.quality_flags & 15u) != 0u) {
+          // Same coordinates give the same error, which can't win the strict
+          // comparison against the one already tested.
+          bool duplicate = all(equal(cv, v));
+          for (int j = 0; j < i; ++j) {
+            duplicate = duplicate || all(equal(cv, candidates[j]));
+          }
+          if (duplicate) {
+            continue;
+          }
+        }
+        vec3 ca = textureLod(sampler2D(xe_fg_tex_a, xe_fg_sampler),
+                             (center - pc.t * cv) * inv_size, 0.0).rgb;
+        vec3 cb = textureLod(sampler2D(xe_fg_tex_b, xe_fg_sampler),
+                             (center + (1.0 - pc.t) * cv) * inv_size, 0.0).rgb;
+        vec3 cd = abs(ca - cb);
+        float error = cd.r + cd.g + cd.b;
+        if (error < best_error) {
+          best_error = error;
+          a = ca;
+          b = cb;
+          best_v = cv;
+        }
+      }
+      v = best_v;
+    }
+    if ((pc.quality_flags & 2u) != 0u &&
+        XeFgSadAt(center + (1.0 - pc.t) * v) > 0.08) {
+      XeFgStore(p, nearest, vec3(1.0, 0.0, 0.0));
+      return;
+    }
+    // Retain the legacy cross-fade only when occlusion selection is off.
+    // Selection uses one compensated side for strong sample disagreement.
+    vec3 blended = mix(a, b, pc.t);
+    vec3 fallback = mix(s0, s1, pc.t);
+    vec3 d = abs(a - b);
+    float mismatch = max(d.r, max(d.g, d.b));
+    if ((pc.quality_flags & 4u) != 0u) {
+      result = blended;
+      if (mismatch > 0.06) {
+        // Visibility proxy: prefer the side matching the nearer real sample.
+        // A small temporal bias stabilizes ties. Without depth / reverse flow
+        // this cannot prove visibility, but never creates a double exposure.
+        float ea = XeFgMax(abs(a - nearest));
+        float eb = XeFgMax(abs(b - nearest));
+        bool use_a = (ea - eb) < (pc.t < 0.5 ? 0.01 : -0.01);
+        result = use_a ? a : b;
+        mask = vec3(1.0, 1.0, 0.0);
+      }
+    } else {
+      result = mix(blended, fallback, smoothstep(0.03, 0.10, mismatch));
+    }
+    // Content entering at the screen edges exists only in one of the frames -
+    // don't smear the edge of the other one.
+    vec2 pa = center - pc.t * v;
+    vec2 pb = center + (1.0 - pc.t) * v;
+    bool a_outside = any(lessThan(pa, vec2(0.0))) ||
+                     any(greaterThan(pa, vec2(pc.size)));
+    bool b_outside = any(lessThan(pb, vec2(0.0))) ||
+                     any(greaterThan(pb, vec2(pc.size)));
+    if (a_outside && !b_outside) {
+      result = b;
+      if ((pc.quality_flags & 4u) != 0u) {
+        mask = vec3(1.0, 1.0, 0.0);
+      }
+    } else if (b_outside && !a_outside) {
+      result = a;
+      if ((pc.quality_flags & 4u) != 0u) {
+        mask = vec3(1.0, 1.0, 0.0);
+      }
+    }
+  }
+  XeFgStore(p, result, mask);
+}

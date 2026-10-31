@@ -1,0 +1,111 @@
+#ifndef XENIA_GPU_SHADERS_SHARED_MEMORY_SEGMENTED_XESLI_
+#define XENIA_GPU_SHADERS_SHARED_MEMORY_SEGMENTED_XESLI_
+#include "../../ui/shaders/xesl.xesli"
+#if defined(XE_SHARED_MEMORY_BDA_2MIB) && SHADING_LANGUAGE_GLSL_XE
+// One immutable address-table descriptor replaces the payload descriptor array.
+// Every missing/OOB entry names a full, zeroed 2 MiB guard; physical pointers
+// do not inherit robustBufferAccess bounds checks.
+#define guest_byte_buffer_declare_xe(name, glsl_set, glsl_binding) \
+  layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer name##_bda_bank { uint data[]; }; \
+  layout(std430, set=glsl_set, binding=glsl_binding) readonly buffer name##_bda_table_block { uint64_t data[257]; } name##_bda_table; \
+  layout(std140, set=glsl_set, binding=3) uniform name##_bda_guard_block { uint64_t address; } name##_bda_guard; \
+  uint name##_Load4(uint address) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    return bank.data[offset]; \
+  } \
+  uint2_xe name##_Load8(uint address) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    if (offset > 524286u) { \
+      return uint2_xe(name##_Load4(address + 0u), name##_Load4(address + 4u)); \
+    } \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    return uint2_xe(bank.data[offset + 0u], bank.data[offset + 1u]); \
+  } \
+  uint4_xe name##_Load16(uint address) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    if (offset > 524284u) { \
+      return uint4_xe(name##_Load4(address + 0u), name##_Load4(address + 4u), name##_Load4(address + 8u), name##_Load4(address + 12u)); \
+    } \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    return uint4_xe(bank.data[offset + 0u], bank.data[offset + 1u], bank.data[offset + 2u], bank.data[offset + 3u]); \
+  }
+#define guest_byte_buffer_wo_declare_xe(name, glsl_set, glsl_binding) \
+  layout(buffer_reference, std430, buffer_reference_align=4) buffer name##_bda_bank { uint data[]; }; \
+  layout(std430, set=glsl_set, binding=glsl_binding) readonly buffer name##_bda_table_block { uint64_t data[257]; } name##_bda_table; \
+  layout(std140, set=glsl_set, binding=3) uniform name##_bda_guard_block { uint64_t address; } name##_bda_guard; \
+  void name##_Store4(uint address, uint value) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    if (base == name##_bda_guard.address) return; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    bank.data[offset + 0u] = value; \
+  } \
+  void name##_Store8(uint address, uint2_xe value) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    if (offset > 524286u) { \
+      name##_Store4(address + 0u, value.x); \
+      name##_Store4(address + 4u, value.y); \
+      return; \
+    } \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    if (base == name##_bda_guard.address) return; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    bank.data[offset + 0u] = value.x; \
+    bank.data[offset + 1u] = value.y; \
+  } \
+  void name##_Store16(uint address, uint4_xe value) { \
+    uint offset = (address & 0x1FFFFFu) >> 2u; \
+    if (offset > 524284u) { \
+      name##_Store4(address + 0u, value.x); \
+      name##_Store4(address + 4u, value.y); \
+      name##_Store4(address + 8u, value.z); \
+      name##_Store4(address + 12u, value.w); \
+      return; \
+    } \
+    uint64_t base = name##_bda_table.data[min(address >> 21u, 256u)]; \
+    if (base == name##_bda_guard.address) return; \
+    name##_bda_bank bank = name##_bda_bank(base); \
+    bank.data[offset + 0u] = value.x; \
+    bank.data[offset + 1u] = value.y; \
+    bank.data[offset + 2u] = value.z; \
+    bank.data[offset + 3u] = value.w; \
+  }
+#define guest_byte_buffer_align4_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align4_wo_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_wo_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align8_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align8_wo_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_wo_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align16_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align16_wo_declare_xe(name, glsl_set, glsl_binding, hlsl_t, hlsl_space, msl_index) guest_byte_buffer_wo_declare_xe(name, glsl_set, glsl_binding)
+#define guest_byte_buffer_align4_load4_xe(name, address) name##_Load4(uint(address))
+#define guest_byte_buffer_align4_load8u_xe(name, address) name##_Load8(uint(address))
+#define guest_byte_buffer_align4_load16u_xe(name, address) name##_Load16(uint(address))
+#define guest_byte_buffer_align4_load8a_xe(name, address) name##_Load8(uint(address))
+#define guest_byte_buffer_align4_load16a_xe(name, address) name##_Load16(uint(address))
+#define guest_byte_buffer_align8_load8_xe(name, address) name##_Load8(uint(address))
+#define guest_byte_buffer_align16_load16_xe(name, address) name##_Load16(uint(address))
+#define guest_byte_buffer_align4_store4_xe(name, address, value) name##_Store4(uint(address), value)
+#define guest_byte_buffer_align8_store8_xe(name, address, value) name##_Store8(uint(address), value)
+#define guest_byte_buffer_align16_store16_xe(name, address, value) name##_Store16(uint(address), value)
+#else
+#define guest_byte_buffer_align4_declare_xe byte_buffer_align4_declare_xe
+#define guest_byte_buffer_align4_wo_declare_xe byte_buffer_align4_wo_declare_xe
+#define guest_byte_buffer_align8_declare_xe byte_buffer_align8_declare_xe
+#define guest_byte_buffer_align8_wo_declare_xe byte_buffer_align8_wo_declare_xe
+#define guest_byte_buffer_align16_declare_xe byte_buffer_align16_declare_xe
+#define guest_byte_buffer_align16_wo_declare_xe byte_buffer_align16_wo_declare_xe
+#define guest_byte_buffer_align4_load4_xe byte_buffer_align4_load4_xe
+#define guest_byte_buffer_align4_load8u_xe byte_buffer_align4_load8u_xe
+#define guest_byte_buffer_align4_load16u_xe byte_buffer_align4_load16u_xe
+#define guest_byte_buffer_align4_load8a_xe byte_buffer_align4_load8a_xe
+#define guest_byte_buffer_align4_load16a_xe byte_buffer_align4_load16a_xe
+#define guest_byte_buffer_align4_store4_xe byte_buffer_align4_store4_xe
+#define guest_byte_buffer_align8_load8_xe byte_buffer_align8_load8_xe
+#define guest_byte_buffer_align8_store8_xe byte_buffer_align8_store8_xe
+#define guest_byte_buffer_align16_load16_xe byte_buffer_align16_load16_xe
+#define guest_byte_buffer_align16_store16_xe byte_buffer_align16_store16_xe
+#endif
+#endif

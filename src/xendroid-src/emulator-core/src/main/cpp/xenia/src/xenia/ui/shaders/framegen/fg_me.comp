@@ -1,0 +1,187 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+// Block-matching motion estimation for one pyramid level. Each invocation
+// finds, for a 4x4 block of the current frame, the offset into the previous
+// frame (cur(x) ~ prev(x - v)) with the lowest cost over a 6x6 window, testing
+// zero motion, and a 3x3 search around the upscaled vectors of the parent
+// block and its four neighbors.
+#include "fg_common.glsl"
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform XeFgMeConstants {
+  uvec2 level_size;
+  uvec2 grid_size;
+  uvec2 parent_grid_size;
+  uint cur_offset;
+  uint prev_offset;
+  uint flow_offset;
+  uint parent_flow_offset;
+  int radius;
+  uint has_parent;
+  uint static_early_out;
+  uint quality_offset;
+  uint scene_offset;
+  uint quality_flags;
+} pc;
+
+float XeFgLevel(uint offset, ivec2 p) {
+  p = clamp(p, ivec2(0), ivec2(pc.level_size) - 1);
+  return xe_fg_data[offset + uint(p.y) * pc.level_size.x + uint(p.x)];
+}
+
+// The block's 6x6 window of the current frame as half pairs and the pixels
+// that changed between the frames at the same position (static ones - the HUD
+// over a moving background - must not pull the vector towards zero) as bits,
+// so they stay in registers (36 + 36 floats spilled to the stack on Mali).
+uint cur_packed[18];
+uint moving_bits[2];
+
+float XeFgCur(int i) {
+  vec2 h = unpackHalf2x16(cur_packed[i >> 1]);
+  return (i & 1) != 0 ? h.y : h.x;
+}
+
+float XeFgMoving(int i) {
+  return float((moving_bits[i >> 5] >> uint(i & 31)) & 1u);
+}
+
+vec2 XeFgParent(ivec2 cell) {
+  cell = clamp(cell, ivec2(0), ivec2(pc.parent_grid_size) - 1);
+  uint i = pc.parent_flow_offset +
+           2u * (uint(cell.y) * pc.parent_grid_size.x + uint(cell.x));
+  return vec2(xe_fg_data[i], xe_fg_data[i + 1u]) * 2.0;
+}
+
+// Costs of the 3x3 vectors around center (index (dy + 1) * 3 + dx + 1). The
+// previous frame's 8x8 area they cover is read once, a row at a time, instead
+// of 36 samples per vector.
+void XeFgCost3x3(ivec2 block_origin, ivec2 center, out float sad[9]) {
+  [[unroll]] for (int k = 0; k < 9; ++k) {
+    sad[k] = 0.0;
+  }
+  // prev(block_origin + (x - 1, y - 1) - center - (dx, dy)) is
+  // row[x + 1 - dx] of row j = y + 1 - dy.
+  ivec2 area_origin = block_origin - center - ivec2(2);
+  [[unroll]] for (int j = 0; j < 8; ++j) {
+    float row[8];
+    [[unroll]] for (int i = 0; i < 8; ++i) {
+      row[i] = XeFgLevel(pc.prev_offset, area_origin + ivec2(i, j));
+    }
+    [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+      int y = j - 1 + dy;
+      if (y < 0 || y > 5) {
+        continue;
+      }
+      [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+        float s = 0.0;
+        [[unroll]] for (int x = 0; x < 6; ++x) {
+          s += abs(XeFgCur(y * 6 + x) - row[x + 1 - dx]) *
+               XeFgMoving(y * 6 + x);
+        }
+        sad[(dy + 1) * 3 + dx + 1] += s;
+      }
+    }
+  }
+}
+
+// Requires has_parent != 0 and radius 1 (the parent refinement levels; the
+// coarsest level uses fg_me_coarse.comp).
+void main() {
+  uvec2 cell = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(cell, pc.grid_size))) {
+    return;
+  }
+  ivec2 block_origin = ivec2(cell * 4u);
+  // Zero motion cost from the same samples as the moving mask.
+  float zero_sad = 0.0;
+  moving_bits[0] = 0u;
+  moving_bits[1] = 0u;
+  [[unroll]] for (int k = 0; k < 18; ++k) {
+    vec2 c, m;
+    [[unroll]] for (int h = 0; h < 2; ++h) {
+      int i = k * 2 + h;
+      ivec2 p = block_origin + ivec2(i % 6 - 1, i / 6 - 1);
+      float cv = XeFgLevel(pc.cur_offset, p);
+      cv = unpackHalf2x16(packHalf2x16(vec2(cv, 0.0))).x;
+      float d = abs(cv - XeFgLevel(pc.prev_offset, p));
+      bool moving = d >= (2.0 / 255.0);
+      if (moving) {
+        moving_bits[i >> 5] |= 1u << uint(i & 31);
+        zero_sad += d;
+      }
+      c[h] = cv;
+    }
+    cur_packed[k] = packHalf2x16(c);
+  }
+  // No moving sample in the 6x6 window: every candidate's SAD is zero, so the
+  // (favored) zero vector wins anyway - skip the search.
+  if (pc.static_early_out != 0u && (moving_bits[0] | moving_bits[1]) == 0u) {
+    uint o = pc.flow_offset + 2u * (cell.y * pc.grid_size.x + cell.x);
+    xe_fg_data[o] = 0.0;
+    xe_fg_data[o + 1u] = 0.0;
+    if ((pc.quality_flags & 32u) != 0u) {
+      xe_fg_data[pc.quality_offset + cell.y * pc.grid_size.x + cell.x] =
+          (pc.quality_flags & 2u) != 0u ? 0.0 : -1.0;
+    }
+    return;
+  }
+  // Zero motion, slightly favored so static content (HUD) stays still.
+  ivec2 best_v = ivec2(0);
+  float best_cost = zero_sad * 0.9;
+  float best_sad = zero_sad;
+  const float kSmoothness = 0.02;
+  // has_parent is the number of parent candidates: the own parent block only
+  // (the finest level, where the parent was already refined against its
+  // neighbors), or it and its four neighbors.
+  ivec2 parent_cell = ivec2(cell) / 2;
+  ivec2 offsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
+                              ivec2(0, -1), ivec2(0, 1));
+  int candidate_count = clamp(int(pc.has_parent), 1, 5);
+  // Where the motion is smooth, the neighbors share the vector - search
+  // around each distinct one once.
+  ivec2 tested0 = ivec2(0), tested1 = ivec2(0), tested2 = ivec2(0),
+        tested3 = ivec2(0);
+  for (int c = 0; c < candidate_count; ++c) {
+    ivec2 center = ivec2(round(XeFgParent(parent_cell + offsets[c])));
+    bool duplicate = (c > 0 && all(equal(tested0, center))) ||
+                     (c > 1 && all(equal(tested1, center))) ||
+                     (c > 2 && all(equal(tested2, center))) ||
+                     (c > 3 && all(equal(tested3, center)));
+    if (c == 0) {
+      tested0 = center;
+    } else if (c == 1) {
+      tested1 = center;
+    } else if (c == 2) {
+      tested2 = center;
+    } else if (c == 3) {
+      tested3 = center;
+    }
+    if (duplicate) {
+      continue;
+    }
+    float sad[9];
+    XeFgCost3x3(block_origin, center, sad);
+    [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+      [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+        float cost = sad[(dy + 1) * 3 + dx + 1] +
+                     kSmoothness * float(abs(dx) + abs(dy)) +
+                     (c != 0 ? 0.01 : 0.0);
+        if (cost < best_cost) {
+          best_cost = cost;
+          best_sad = sad[(dy + 1) * 3 + dx + 1];
+          best_v = center + ivec2(dx, dy);
+        }
+      }
+    }
+  }
+  uint o = pc.flow_offset + 2u * (cell.y * pc.grid_size.x + cell.x);
+  xe_fg_data[o] = float(best_v.x);
+  xe_fg_data[o + 1u] = float(best_v.y);
+  if ((pc.quality_flags & 32u) != 0u) {
+    // Unpenalized winning SAD / number of moving samples, not the search
+    // objective (which biases zero motion and adds smoothness penalties).
+    float count = float(bitCount(moving_bits[0]) + bitCount(moving_bits[1]));
+    xe_fg_data[pc.quality_offset + cell.y * pc.grid_size.x + cell.x] =
+        (pc.quality_flags & 2u) != 0u ? best_sad / max(count, 1.0) : -1.0;
+  }
+}

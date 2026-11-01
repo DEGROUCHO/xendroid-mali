@@ -91,8 +91,8 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Call of Duty: Modern Warfare 2 | ✅ Playable | 44–57 | Measured on an October build |
 | Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing |
 | Halo: Reach | ✅ Playable | 26–30 | Savestates |
-| Forza Horizon | 🟡 Runs | 20–24 | Player report: stable |
-| Forza Horizon 2 | 🟡 Runs | 20–24 | Player report: stable |
+| Forza Horizon | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
+| Forza Horizon 2 | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 
 <sub>✅ measured in gameplay · 🟡 boots and plays below 30 fps · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
 
@@ -172,7 +172,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 |:--|:--|
 | ✅ **Tested** | POCO X7 Pro: MediaTek Dimensity 8400, Mali-G720 MC7, driver r49p1, Android 16 |
 | 🟡 **Should work** | Other recent Mali GPUs (G615, G710, G715, G925) on Dimensity and Exynos, and Adreno 7xx |
-| ✅ **Reported working** | **POCO X8 Pro**: Need for Speed: Most Wanted runs well in races (player report) |
+| ✅ **Reported working** | **POCO X8 Pro** (player reports): Need for Speed: Most Wanted runs well in races; Forza Horizon and Forza Horizon 2 at about 24 fps |
 | 📝 **Help wanted** | Anything else. [Report your device](../../issues/new/choose): reports from other phones are the most useful contribution right now |
 
 <br>

@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -142,6 +143,19 @@ import coil.request.ImageRequest
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import xendroid.compose.data.Game
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.rememberUpdatedState
+import coil.imageLoader
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.geometry.RoundRect
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -225,6 +239,7 @@ private val TILE_SPREAD = floatArrayOf(0f, 0.8f, 1.3f, 1.7f, 2.05f)
 private val TILE_ALPHA = floatArrayOf(1f, 1f, 0.85f, 0.5f, 0f)
 private const val TILE_TURN_DEG = 50f       // rotationY of a neighbour at rest
 private const val REFLECTION = 0.3f         // reflection height, in tile heights
+private const val REFLECTION_LANDSCAPE = 0.16f  // shorter on a screen on its side: bigger cards
 private const val REFLECTION_GAP_DP = 5
 private const val TILE_WINDOW = 4          // tiles composed on each side of the focused one
 private const val TILE_TAPPABLE = 3        // the outermost slot is fading in/out: not a target
@@ -251,15 +266,21 @@ data class NxeChannel(
     val open: ((Game?) -> Unit)? = null,
 )
 
-/** Title id of the game whose background the dashboard shows; set by [NxeDashboard]. */
-private val LocalNxeBackdrop = staticCompositionLocalOf<MutableState<String?>?> { null }
+/** What the backdrop shows for the focused game. [titleId] finds its Marketplace art; [icon],
+ *  the picture embedded in the game, stands in when the archive has none or there is no
+ *  network, so every game gets a themed screen. */
+@Immutable
+data class NxeBackdrop(val key: String, val titleId: String?, val icon: Any)
+
+/** The focused game's backdrop; set by [NxeDashboard]. */
+private val LocalNxeBackdrop = staticCompositionLocalOf<MutableState<NxeBackdrop?>?> { null }
 
 /** Wraps the library screen while the dashboard is active: dark NXE colour scheme, the
  *  game-themed backdrop behind everything (top bar included) and light status-bar icons.
  *  With [enabled] false it is a pass-through, and the tree shape stays the same either way. */
 @Composable
 fun NxeSurface(enabled: Boolean, content: @Composable () -> Unit) {
-    val backdrop = remember { mutableStateOf<String?>(null) }
+    val backdrop = remember { mutableStateOf<NxeBackdrop?>(null) }
     MaterialTheme(
         colorScheme = if (enabled) NxeColorScheme else MaterialTheme.colorScheme,
         typography = MaterialTheme.typography,
@@ -297,6 +318,7 @@ fun NxeDashboard(
     modifier: Modifier = Modifier,
 ) {
     if (games.isEmpty() || channels.isEmpty()) return
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // A PackageManager query: once per dashboard, not per recomposition.
     val canLaunch = remember(viewModel) { viewModel.canLaunchGames }
@@ -309,38 +331,50 @@ fun NxeDashboard(
         HashMap<String, Int>(games.size * 2).also { m -> games.forEachIndexed { i, g -> m[g.stableId] = i } }
     }
     val focused = indexById[focusedId] ?: 0
-    // Visual position = focused + offset (in tiles). Only graphicsLayer blocks read it.
+    // The flow sits at focused + offset (in tiles); only graphicsLayer blocks read the offset.
+    // It never leaves [-0.5, 0.5]: a move across many games walks the focus through each of
+    // them, so the tiles composed around the focus always cover what is on screen, however
+    // fast the flow runs.
     val offset = remember { mutableFloatStateOf(0f) }
     val motion = remember { arrayOfNulls<Job>(1) }
+    // Where the running glide lands (-1: none), so quick repeated presses add up.
+    val glideTarget = remember { mutableIntStateOf(-1) }
+    // The glide outlives a recomposition that brings a new list: it reads the latest one.
+    val gamesNow by rememberUpdatedState(games)
+    val indexNow by rememberUpdatedState(indexById)
     val ch = channel.coerceIn(0, channels.lastIndex)
 
-    fun currentIndex(): Int = indexById[focusedId] ?: 0
+    fun currentIndex(): Int = indexNow[focusedId] ?: 0
 
-    /** Moves focus by [n] tiles keeping the visual position continuous; returns the move. */
-    fun shift(n: Int): Int {
-        val idx = currentIndex()
-        val target = (idx + n).coerceIn(0, games.lastIndex)
-        val moved = target - idx
-        if (moved != 0) {
-            focusedId = games[target].stableId
-            offset.floatValue = (offset.floatValue - moved).coerceIn(-3f, 3f)
-        }
-        return moved
+    fun position(): Float = currentIndex() + offset.floatValue
+
+    /** Puts the flow at [p] tiles, moving the focus along; the two ends give a little. */
+    fun setPosition(p: Float) {
+        val list = gamesNow
+        val clamped = p.coerceIn(-0.35f, list.lastIndex + 0.35f)
+        val idx = clamped.roundToInt().coerceIn(0, list.lastIndex)
+        val id = list[idx].stableId
+        if (id != focusedId) focusedId = id
+        offset.floatValue = clamped - idx
     }
 
-    fun glide(velocity: Float, stiffness: Float) {
+    fun glideTo(index: Int, velocity: Float = 0f, stiffness: Float = 300f) {
+        val dest = index.coerceIn(0, gamesNow.lastIndex)
+        glideTarget.intValue = dest
         motion[0]?.cancel()
         motion[0] = scope.launch {
-            animate(offset.floatValue, 0f, velocity, spring(dampingRatio = 0.9f, stiffness = stiffness)) { v, _ ->
-                offset.floatValue = v
+            animate(position(), dest.toFloat(), velocity, spring(dampingRatio = 0.92f, stiffness = stiffness)) { v, _ ->
+                setPosition(v)
             }
+            glideTarget.intValue = -1
         }
     }
 
-    fun step(n: Int) { if (shift(n) != 0) glide(0f, 320f) }
+    fun step(n: Int) = glideTo((glideTarget.intValue.takeIf { it >= 0 } ?: currentIndex()) + n)
 
     fun activate() {
-        val game = games.getOrNull(currentIndex()) ?: return
+        // A press that lands mid-glide means the game the glide is heading to.
+        val game = games.getOrNull(glideTarget.intValue.takeIf { it >= 0 } ?: currentIndex()) ?: return
         val open = channels[ch].open
         if (open == null) onLaunch(game) else { channel = 0; open(game) }
     }
@@ -369,18 +403,35 @@ fun NxeDashboard(
 
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(takeFocus) { if (takeFocus) runCatching { focusRequester.requestFocus() } }
-    // The backdrop follows the focused game once the stack settles, not every tile of a fling.
+    // The backdrop follows the focused game once the flow settles, not every tile of a fling.
     val backdrop = LocalNxeBackdrop.current
-    val focusedTitleId = games.getOrNull(focused)?.titleId
-    LaunchedEffect(focusedTitleId) {
+    val focusedGame = games.getOrNull(focused)
+    LaunchedEffect(focusedGame?.stableId) {
+        val game = focusedGame ?: return@LaunchedEffect
         delay(160)
-        backdrop?.value = focusedTitleId
+        backdrop?.value = NxeBackdrop(game.stableId, game.titleId, viewModel.iconFileOrFallback(game))
+    }
+    // Box art for the whole library up front (tens of KB each), so a fast run through the flow
+    // finds the covers ready; the large backgrounds only around the focused game.
+    LaunchedEffect(games) {
+        val loader = context.imageLoader
+        for (g in games) GameArt.boxArtRequest(context, g.titleId)?.let(loader::enqueue)
+    }
+    LaunchedEffect(focused, games) {
+        delay(400)
+        val loader = context.imageLoader
+        for (k in -2..2) {
+            val g = games.getOrNull(focused + k) ?: continue
+            GameArt.backgroundPrefetch(context, g.titleId)?.let(loader::enqueue)
+        }
     }
     val flowAlpha by animateFloatAsState(if (ch == 0) 1f else 0.5f, label = "nxeFlowDim")
 
     BoxWithConstraints(modifier.fillMaxSize()) {
         val viewportH = if (constraints.hasBoundedHeight) maxHeight else 520.dp
         val wide = maxWidth >= 600.dp
+        // A phone on its side: width to spare, little height.
+        val landscape = maxWidth > viewportH * 1.25f
         // The vertical scroll never scrolls (content == viewport); it only gives the
         // pull-to-refresh around the library a nested-scroll source to pull from.
         CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
@@ -397,6 +448,7 @@ fun NxeDashboard(
                         channels = channels,
                         current = ch,
                         wide = wide,
+                        compact = landscape,
                         onSelect = { i ->
                             val open = channels[i].open
                             if (open == null) channel = i
@@ -404,96 +456,122 @@ fun NxeDashboard(
                         },
                     )
 
-                    BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                        // Room for the card and its reflection: the pair is centred together.
-                        val tile = minOf(maxHeight / (1f + REFLECTION) * 0.98f, maxWidth * 0.5f / GameArt.BOX_ASPECT, 320.dp)
-                            .coerceAtLeast(80.dp)
-                        val tilePx = with(LocalDensity.current) { tile.toPx() * GameArt.BOX_ASPECT }
-                        val stepPx = tilePx * TILE_SPREAD[1]
-                        val dragState = rememberDraggableState { delta ->
-                            var off = offset.floatValue - delta / stepPx
-                            var idx = currentIndex()
-                            while (off > 0.5f && idx < games.lastIndex) { idx++; off -= 1f }
-                            while (off < -0.5f && idx > 0) { idx--; off += 1f }
-                            if (idx == 0) off = max(off, -0.35f)
-                            if (idx == games.lastIndex) off = min(off, 0.35f)
-                            val id = games[idx].stableId
-                            if (id != focusedId) focusedId = id
-                            offset.floatValue = off
-                        }
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .graphicsLayer { alpha = flowAlpha }
-                                .draggable(
-                                    state = dragState,
-                                    orientation = Orientation.Horizontal,
-                                    onDragStarted = { motion[0]?.cancel() },
-                                    onDragStopped = { velocity ->
-                                        // Fling: project a little ahead, land on a whole tile.
-                                        val v = -velocity / stepPx
-                                        val idx = currentIndex()
-                                        val n = (offset.floatValue + v * 0.22f).roundToInt()
-                                            .coerceIn(-idx, games.lastIndex - idx)
-                                            .coerceIn(-6, 6)
-                                        shift(n)
-                                        glide(v, 170f)
-                                    },
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            for (slot in -TILE_WINDOW..TILE_WINDOW) {
-                                val i = focused + slot
-                                if (i in games.indices) {
-                                    val game = games[i]
-                                    key(game.stableId) {
-                                        NxeTile(
-                                            game = game,
-                                            viewModel = viewModel,
-                                            slot = slot,
-                                            offset = offset,
-                                            tile = tile,
-                                            modifier = Modifier.zIndex(-abs(slot).toFloat()),
-                                            onClick = {
-                                                when {
-                                                    slot == 0 -> { channel = 0; onLaunch(game) }
-                                                    abs(slot) <= TILE_TAPPABLE -> if (shift(slot) != 0) glide(0f, 220f)
-                                                }
-                                            },
-                                            onLongClick = {
-                                                when {
-                                                    slot == 0 -> onGameOptions(game)
-                                                    abs(slot) <= TILE_TAPPABLE -> if (shift(slot) != 0) glide(0f, 220f)
-                                                }
-                                            },
-                                        )
+                    // The cover flow in [mod]: each card and its reflection centred together.
+                    // A phone held upright has height to spare, so the card takes more width.
+                    val flow: @Composable (Modifier, Float) -> Unit = { mod, reflection ->
+                        BoxWithConstraints(mod) {
+                            // Room for the card and its reflection: the pair is centred together.
+                            // A phone held upright has height to spare, so the card takes more width.
+                            val tile = minOf(
+                                maxHeight / (1f + reflection) * 0.98f,
+                                maxWidth * (if (wide) 0.5f else 0.56f) / GameArt.BOX_ASPECT,
+                                340.dp,
+                            ).coerceAtLeast(80.dp)
+                            val tilePx = with(LocalDensity.current) { tile.toPx() * GameArt.BOX_ASPECT }
+                            val stepPx = tilePx * TILE_SPREAD[1]
+                            val dragState = rememberDraggableState { delta -> setPosition(position() - delta / stepPx) }
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer { alpha = flowAlpha }
+                                    .draggable(
+                                        state = dragState,
+                                        orientation = Orientation.Horizontal,
+                                        onDragStarted = {
+                                            motion[0]?.cancel()
+                                            glideTarget.intValue = -1
+                                        },
+                                        onDragStopped = { velocity ->
+                                            // Fling, in tiles per second: a flick moves one game,
+                                            // a long swipe runs through several and lands on one.
+                                            val v = -velocity / stepPx
+                                            val travel = (v * 0.3f).coerceIn(-15f, 15f)
+                                            glideTo((position() + travel).roundToInt(), v, stiffness = 150f)
+                                        },
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                for (slot in -TILE_WINDOW..TILE_WINDOW) {
+                                    val i = focused + slot
+                                    if (i in games.indices) {
+                                        val game = games[i]
+                                        key(game.stableId) {
+                                            NxeTile(
+                                                game = game,
+                                                viewModel = viewModel,
+                                                slot = slot,
+                                                offset = offset,
+                                                tile = tile,
+                                            reflection = reflection,
+                                                modifier = Modifier.zIndex(-abs(slot).toFloat()),
+                                                onClick = {
+                                                    when {
+                                                        slot == 0 -> { channel = 0; onLaunch(game) }
+                                                        abs(slot) <= TILE_TAPPABLE -> glideTo(i, stiffness = 240f)
+                                                    }
+                                                },
+                                                onLongClick = {
+                                                    when {
+                                                        slot == 0 -> onGameOptions(game)
+                                                        abs(slot) <= TILE_TAPPABLE -> glideTo(i, stiffness = 240f)
+                                                    }
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    NxeDots(focused, games.size)
                     val game = games[focused.coerceIn(0, games.lastIndex)]
                     val isContinue = continueGame != null && continueGame.stableId == game.stableId
                     val primaryLabel = channels[ch].actionLabel ?: if (isContinue) l10n("Continue", "Continua") else l10n("Play", "Gioca")
-                    NxeInfo(
-                        game = game,
-                        position = l10n("${focused + 1} of ${games.size}", "${focused + 1} di ${games.size}"),
-                        isContinue = isContinue,
-                        primaryLabel = primaryLabel,
-                        showPrimary = channels[ch].open != null || canLaunch,
-                        wide = wide,
-                        onPrimary = { activate() },
-                        onOptions = { onGameOptions(game) },
-                    )
-                    NxeFooter(
-                        usingPad = usingPad,
-                        wide = wide,
-                        primaryLabel = primaryLabel,
-                        sortLabel = sortLabel,
-                        onToggleSort = onToggleSort,
-                    )
+                    val position = l10n("${focused + 1} of ${games.size}", "${focused + 1} di ${games.size}")
+                    val showPrimary = channels[ch].open != null || canLaunch
+                    if (landscape) {
+                        // On its side the details move to a panel beside the flow, which keeps
+                        // the whole height for the covers.
+                        Row(Modifier.weight(1f).fillMaxWidth()) {
+                            Column(Modifier.weight(1f).fillMaxHeight()) {
+                                flow(Modifier.weight(1f).fillMaxWidth(), REFLECTION_LANDSCAPE)
+                                NxeDots(focused, games.size)
+                            }
+                            NxeSidePanel(
+                                game = game,
+                                position = position,
+                                isContinue = isContinue,
+                                primaryLabel = primaryLabel,
+                                showPrimary = showPrimary,
+                                usingPad = usingPad,
+                                sortLabel = sortLabel,
+                                onToggleSort = onToggleSort,
+                                onPrimary = { activate() },
+                                onOptions = { onGameOptions(game) },
+                                modifier = Modifier.width(if (wide) 330.dp else 290.dp).fillMaxHeight(),
+                            )
+                        }
+                    } else {
+                        flow(Modifier.weight(1f).fillMaxWidth(), REFLECTION)
+                        NxeDots(focused, games.size)
+                        NxeInfo(
+                            game = game,
+                            position = position,
+                            isContinue = isContinue,
+                            primaryLabel = primaryLabel,
+                            showPrimary = showPrimary,
+                            wide = wide,
+                            onPrimary = { activate() },
+                            onOptions = { onGameOptions(game) },
+                        )
+                        NxeFooter(
+                            usingPad = usingPad,
+                            wide = wide,
+                            primaryLabel = primaryLabel,
+                            sortLabel = sortLabel,
+                            onToggleSort = onToggleSort,
+                        )
+                    }
                 }
             }
         }
@@ -507,15 +585,28 @@ private fun NxeChannelRow(
     channels: List<NxeChannel>,
     current: Int,
     wide: Boolean,
+    compact: Boolean,
     onSelect: (Int) -> Unit,
 ) {
     val requesters = remember(channels.size) { List(channels.size) { BringIntoViewRequester() } }
     LaunchedEffect(current) { requesters.getOrNull(current)?.bringIntoView() }
+    val scroll = rememberScrollState()
     Row(
         Modifier
             .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = 4.dp),
+            // Labels that run past the edge fade out there instead of being cut.
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                if (scroll.canScrollForward) {
+                    drawRect(
+                        Brush.horizontalGradient(0.8f to Color.White, 1f to Color.Transparent),
+                        blendMode = BlendMode.DstIn,
+                    )
+                }
+            }
+            .horizontalScroll(scroll)
+            .padding(horizontal = 24.dp, vertical = if (compact) 0.dp else 4.dp),
         horizontalArrangement = Arrangement.spacedBy(if (wide) 36.dp else 26.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
@@ -524,7 +615,7 @@ private fun NxeChannelRow(
             Text(
                 c.label,
                 style = TextStyle(fontFamily = XdFont, shadow = if (on) NxeTextShadow else null),
-                fontSize = if (wide) 30.sp else 27.sp,
+                fontSize = when { compact -> 22.sp; wide -> 30.sp; else -> 26.sp },
                 fontWeight = if (on) FontWeight(350) else FontWeight.Light,
                 color = if (on) NxeInk else NxeInk.copy(alpha = 0.45f),
                 maxLines = 1,
@@ -543,7 +634,7 @@ private fun NxeChannelRow(
                     // Not a focus stop: the pad moves channels with L1/R1 from the dashboard.
                     .focusProperties { canFocus = false }
                     .clickable(interactionSource = null, indication = null, role = Role.Tab) { onSelect(i) }
-                    .padding(bottom = 8.dp),
+                    .padding(bottom = if (compact) 5.dp else 8.dp),
             )
         }
     }
@@ -556,18 +647,26 @@ private fun NxeTile(
     slot: Int,
     offset: MutableFloatState,
     tile: Dp,
+    reflection: Float,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    // The embedded 360 icon shows until (or instead of) the Marketplace box art.
+    // The icon embedded in the game builds the cover until (or instead of) the Marketplace art.
     val iconModel = remember(game.stableId) { viewModel.iconFileOrFallback(game) }
-    val iconRequest = remember(iconModel) { ImageRequest.Builder(context).data(iconModel).build() }
-    val art = rememberAsyncImagePainter(GameArt.url(game.titleId, GameArt.Kind.BoxArt))
-    val hasArt = art.state is AsyncImagePainter.State.Success
+    val icon = rememberAsyncImagePainter(remember(iconModel) { ImageRequest.Builder(context).data(iconModel).build() })
+    // Re-picked when the archive turns out not to have a picture (the PNG box art, the cover).
+    val artVersion = GameArt.missingVersion.intValue
+    val art = rememberAsyncImagePainter(remember(game.titleId, artVersion) { GameArt.boxArtRequest(context, game.titleId) })
     val focused = slot == 0
     val width = tile * GameArt.BOX_ASPECT
+    // Not named density: the graphicsLayer block below reads its own density.
+    val screenDensity = LocalDensity.current
+    val measurer = rememberTextMeasurer()
+    val coverText = remember(game.name, width, screenDensity) {
+        measureCoverText(measurer, game.name, with(screenDensity) { width.toPx() }, screenDensity)
+    }
     Box(
         modifier
             .size(width, tile)
@@ -577,7 +676,7 @@ private fun NxeTile(
                 val s = knot(TILE_SCALE, a)
                 translationX = sign(d) * knot(TILE_SPREAD, a, extend = true) * size.width
                 // Card and reflection are centred together.
-                translationY = -size.height * REFLECTION * 0.5f
+                translationY = -size.height * reflection * 0.5f
                 scaleX = s
                 scaleY = s
                 rotationY = -d.coerceIn(-1f, 1f) * TILE_TURN_DEG
@@ -602,6 +701,9 @@ private fun NxeTile(
                 .then(if (focused) Modifier.drawBehind { drawFocusGlow() } else Modifier)
                 .clip(TileShape)
                 .background(TileBaseBrush)
+                // Every game gets a case: the Marketplace box art over a cover built from the
+                // game's own icon and name, which shows while the art loads or when there is none.
+                .drawBehind { drawCover(size, icon, art, coverText) }
                 // Tiles further from the centre sink into the backdrop.
                 .drawWithContent {
                     drawContent()
@@ -614,28 +716,6 @@ private fun NxeTile(
                     TileShape,
                 ),
         ) {
-            // Coil starts the request when the painter is first drawn, so it is always drawn.
-            if (!hasArt) {
-                AsyncImage(
-                    model = iconRequest,
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .fillMaxWidth(0.62f)
-                        .clip(IconShape),
-                )
-                Text(
-                    game.name,
-                    style = TextStyle(fontFamily = XdFont, fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
-                    color = Color.White,
-                    textAlign = TextAlign.Center,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp),
-                )
-            }
-            Image(art, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
             // Glass highlight across the top corner.
             Spacer(
                 Modifier
@@ -663,33 +743,103 @@ private fun NxeTile(
                 )
             }
         }
-        // Mirror of the bottom of the box art on the floor, fading out.
-        if (hasArt) {
-            Spacer(
-                Modifier
-                    .align(Alignment.TopCenter)
-                    .offset { IntOffset(0, (tile + REFLECTION_GAP_DP.dp).roundToPx()) }
-                    .size(width, tile * REFLECTION)
-                    .graphicsLayer {
-                        compositingStrategy = CompositingStrategy.Offscreen
-                        clip = true
-                    }
-                    .drawWithCache {
-                        val fade = Brush.verticalGradient(
-                            0f to Color.White.copy(alpha = 0.30f), 1f to Color.Transparent,
-                        )
-                        val full = Size(size.width, size.width / GameArt.BOX_ASPECT)
-                        onDrawBehind {
-                            // Image row y lands at full.height - y: its bottom edge on top.
-                            scale(scaleX = 1f, scaleY = -1f, pivot = Offset.Zero) {
-                                translate(top = -full.height) { with(art) { draw(full) } }
-                            }
-                            drawRect(fade, blendMode = BlendMode.DstIn)
+        // Mirror of the bottom of the case on the floor, fading out.
+        Spacer(
+            Modifier
+                .align(Alignment.TopCenter)
+                .offset { IntOffset(0, (tile + REFLECTION_GAP_DP.dp).roundToPx()) }
+                .size(width, tile * reflection)
+                .graphicsLayer {
+                    compositingStrategy = CompositingStrategy.Offscreen
+                    clip = true
+                }
+                .drawWithCache {
+                    val fade = Brush.verticalGradient(
+                        0f to Color.White.copy(alpha = 0.30f), 1f to Color.Transparent,
+                    )
+                    val full = Size(size.width, size.width / GameArt.BOX_ASPECT)
+                    onDrawBehind {
+                        // Case row y lands at full.height - y: its bottom edge on top.
+                        scale(scaleX = 1f, scaleY = -1f, pivot = Offset.Zero) {
+                            translate(top = -full.height) { drawCover(full, icon, art, coverText) }
                         }
-                    },
-            )
-        }
+                        drawRect(fade, blendMode = BlendMode.DstIn)
+                    }
+                },
+        )
     }
+}
+
+/** The two lines a built cover writes: the game's name and the case header. */
+private class CoverText(val title: TextLayoutResult, val header: TextLayoutResult)
+
+private fun measureCoverText(measurer: TextMeasurer, name: String, widthPx: Float, density: Density): CoverText {
+    val titleSize = with(density) { (widthPx * 0.095f).toSp() }
+    val title = measurer.measure(
+        text = name,
+        style = TextStyle(
+            fontFamily = XdFont, fontSize = titleSize, lineHeight = titleSize * 1.12f,
+            fontWeight = FontWeight.SemiBold, color = Color.White, textAlign = TextAlign.Center,
+            shadow = Shadow(Color.Black.copy(alpha = 0.8f), Offset(0f, 2f), 8f),
+        ),
+        overflow = TextOverflow.Ellipsis,
+        maxLines = 3,
+        constraints = Constraints.fixedWidth((widthPx * 0.86f).roundToInt().coerceAtLeast(1)),
+    )
+    val header = measurer.measure(
+        text = "XBOX 360",
+        style = TextStyle(
+            fontFamily = XdFont, fontSize = with(density) { (widthPx * 0.064f).toSp() },
+            fontWeight = FontWeight.SemiBold, color = CoverHeaderInk,
+        ),
+        maxLines = 1,
+    )
+    return CoverText(title, header)
+}
+
+private val CoverHeader = Color(0xFFF2F2F2)
+private val CoverHeaderInk = Color(0xFF5E5E5E)
+
+/** A case at [full] size from the origin: the built cover, and the box art over it once loaded. */
+private fun DrawScope.drawCover(full: Size, icon: Painter, art: Painter, text: CoverText) {
+    drawBuiltCover(full, icon, text)
+    with(art) { draw(full) }
+}
+
+/** A cover in the spirit of a 360 case for a game without Marketplace art: the light header
+ *  with the green rule, the game's icon framed in the middle over its own colours, the name
+ *  across the bottom. */
+private fun DrawScope.drawBuiltCover(full: Size, icon: Painter, text: CoverText) {
+    val w = full.width
+    val h = full.height
+    // The game's colours: its icon stretched over the whole case, then shaded.
+    clipRect(0f, 0f, w, h) {
+        translate(left = (w - h) / 2f) { with(icon) { draw(Size(h, h)) } }
+    }
+    drawRect(
+        Brush.verticalGradient(
+            0f to Color.Black.copy(alpha = 0.30f), 0.5f to Color.Black.copy(alpha = 0.50f),
+            1f to Color.Black.copy(alpha = 0.88f), startY = 0f, endY = h,
+        ),
+        size = full,
+    )
+    val header = h * 0.09f
+    drawRect(CoverHeader, size = Size(w, header))
+    drawRect(NxeGreen, topLeft = Offset(0f, header), size = Size(w, h * 0.012f))
+    drawText(text.header, topLeft = Offset(w * 0.07f, (header - text.header.size.height) / 2f))
+    // The icon itself, framed, in the upper part of the case.
+    val side = w * 0.58f
+    val left = (w - side) / 2f
+    val top = header + (h * 0.62f - header - side) / 2f
+    val corner = CornerRadius(side * 0.12f)
+    drawRoundRect(Color.Black.copy(alpha = 0.35f), topLeft = Offset(left, top + side * 0.04f),
+        size = Size(side, side), cornerRadius = corner)
+    clipPath(Path().apply { addRoundRect(RoundRect(left, top, left + side, top + side, corner)) }) {
+        translate(left = left, top = top) { with(icon) { draw(Size(side, side)) } }
+    }
+    drawRoundRect(Color.White.copy(alpha = 0.55f), topLeft = Offset(left, top), size = Size(side, side),
+        cornerRadius = corner, style = Stroke(w * 0.008f))
+    drawText(text.title, topLeft = Offset((w - text.title.size.width) / 2f, h - text.title.size.height - h * 0.07f))
 }
 
 /** NXE selection: a soft green halo around the focused card and a thin green ring outside
@@ -748,12 +898,7 @@ private fun NxeInfo(
     onPrimary: () -> Unit,
     onOptions: () -> Unit,
 ) {
-    val details = buildString {
-        append(formatBadge(game.format))
-        if (game.isMultiDisc) append(l10n("  •  Disc ${game.discNumber} of ${game.discCount}", "  •  Disco ${game.discNumber} di ${game.discCount}"))
-        if (isContinue) append(l10n("  •  Last launched", "  •  Ultimo avviato"))
-        append("  •  ").append(position)
-    }
+    val details = nxeDetails(game, isContinue, position)
     val title: @Composable (TextAlign) -> Unit = { align ->
         Text(
             game.name,
@@ -803,12 +948,75 @@ private fun NxeInfo(
     }
 }
 
+/** The line under a game's name: container, disc, last launched, place in the library. */
+private fun nxeDetails(game: Game, isContinue: Boolean, position: String): String = buildString {
+    append(formatBadge(game.format))
+    if (game.isMultiDisc) append(l10n("  •  Disc ${game.discNumber} of ${game.discCount}", "  •  Disco ${game.discNumber} di ${game.discCount}"))
+    if (isContinue) append(l10n("  •  Last launched", "  •  Ultimo avviato"))
+    append("  •  ").append(position)
+}
+
+/** The focused game's details on a panel beside the flow, for a screen on its side: name,
+ *  detail line, the buttons, then the pad hints and the sort order. */
 @Composable
-private fun NxePrimaryButton(label: String, onClick: () -> Unit) {
+private fun NxeSidePanel(
+    game: Game,
+    position: String,
+    isContinue: Boolean,
+    primaryLabel: String,
+    showPrimary: Boolean,
+    usingPad: Boolean,
+    sortLabel: String,
+    onToggleSort: () -> Unit,
+    onPrimary: () -> Unit,
+    onOptions: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier.padding(start = 4.dp, end = 22.dp, bottom = 8.dp), verticalArrangement = Arrangement.Center) {
+        Text(
+            game.name,
+            style = TextStyle(fontFamily = XdFont, shadow = NxeTextShadow),
+            fontSize = 25.sp,
+            lineHeight = 29.sp,
+            fontWeight = FontWeight(350),
+            color = NxeInk,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            nxeDetails(game, isContinue, position),
+            style = TextStyle(fontFamily = XdFont, shadow = NxeTextShadow),
+            fontSize = 13.sp,
+            color = NxeInkSoft,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (showPrimary) NxePrimaryButton(primaryLabel, onPrimary, width = 200.dp)
+            NxeRoundButton(onOptions)
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (usingPad) {
+                PadGlyph("A", NxeGreenBright)
+                HintText(primaryLabel)
+                PadGlyph("Y", NxeGlyphY)
+                HintText(l10n("Options", "Opzioni"))
+            }
+            Spacer(Modifier.weight(1f))
+            NxeSortChip(sortLabel, onToggleSort)
+        }
+    }
+}
+
+@Composable
+private fun NxePrimaryButton(label: String, onClick: () -> Unit, width: Dp = 232.dp) {
     Row(
         Modifier
             .height(56.dp)
-            .width(232.dp)
+            .width(width)
             .drawBehind { drawSoftGlow(16.dp.toPx(), 0.45f, 18.dp.toPx()) }
             .clip(PrimaryShape)
             .background(PrimaryBrush)
@@ -895,21 +1103,27 @@ private fun NxeFooter(
             }
         }
         Spacer(Modifier.weight(1f))
-        Text(
-            sortLabel,
-            fontSize = 12.sp,
-            fontFamily = XdFont,
-            color = NxeInk,
-            maxLines = 1,
-            modifier = Modifier
-                .clip(RoundedCornerShape(50))
-                .background(NxeGlass)
-                .border(1.dp, NxeGlassEdge, RoundedCornerShape(50))
-                .focusProperties { canFocus = false }
-                .clickable(role = Role.Button, onClick = onToggleSort)
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-        )
+        NxeSortChip(sortLabel, onToggleSort)
     }
+}
+
+/** The library order as a glass chip; a tap switches it. */
+@Composable
+private fun NxeSortChip(label: String, onClick: () -> Unit) {
+    Text(
+        label,
+        fontSize = 12.sp,
+        fontFamily = XdFont,
+        color = NxeInk,
+        maxLines = 1,
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(NxeGlass)
+            .border(1.dp, NxeGlassEdge, RoundedCornerShape(50))
+            .focusProperties { canFocus = false }
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    )
 }
 
 @Composable
@@ -940,12 +1154,12 @@ private fun HintText(text: String) {
 // ---- backdrop ------------------------------------------------------------------------------
 
 /**
- * The focused game's Marketplace background ([titleId], cross-faded on change) over a dark
- * green wash, under a legibility scrim. Nothing here animates on its own: the dashboard
- * costs no frames while it sits still.
+ * The focused game's theme ([src], cross-faded on change) over a dark green wash, under a
+ * legibility scrim. Nothing here animates on its own: the dashboard costs no frames while it
+ * sits still.
  */
 @Composable
-fun NxeBackground(titleId: String?, modifier: Modifier = Modifier) {
+fun NxeBackground(src: NxeBackdrop?, modifier: Modifier = Modifier) {
     Box(modifier) {
         Spacer(
             Modifier.matchParentSize().drawWithCache {
@@ -957,52 +1171,102 @@ fun NxeBackground(titleId: String?, modifier: Modifier = Modifier) {
                 onDrawBehind { drawRect(wash) }
             },
         )
-        Crossfade(titleId, animationSpec = tween(500), label = "nxeGameTheme") { id ->
-            val url = GameArt.url(id, GameArt.Kind.Background)
-            if (url != null) NxeGameTheme(url)
+        Crossfade(src, animationSpec = tween(500), label = "nxeGameTheme") { s ->
+            if (s != null) NxeGameTheme(s)
         }
         Spacer(Modifier.matchParentSize().background(ScrimBrush))
     }
 }
 
 /**
- * A 16:9 Marketplace background on a screen of any shape: a blurred, slightly enlarged copy
- * fills the screen as colour and light, and the picture itself stays whole across the top,
- * fading into it. Cropping the 16:9 picture to a portrait screen would keep an arbitrary
- * middle slice.
+ * A game's theme on a screen of any shape. Its 16:9 Marketplace background stays whole across
+ * the top, fading into a blurred, slightly enlarged copy that fills the screen as colour and
+ * light (cropping the picture to a portrait screen would keep an arbitrary middle slice).
+ * More than half of the games have no such background: their box art takes its place, out of
+ * focus across the top over its own light, and a game without box art lights the screen
+ * with its embedded icon. Every game gets a themed screen, the same way.
  */
 @Composable
-private fun NxeGameTheme(url: String) {
+private fun NxeGameTheme(src: NxeBackdrop) {
     val context = LocalContext.current
-    // The blurred copy is decoded small: the blur throws the detail away anyway.
-    val ambient = remember(url) { ImageRequest.Builder(context).data(url).size(320, 180).build() }
+    // Re-picked when the archive turns out not to have a picture.
+    val artVersion = GameArt.missingVersion.intValue
+    // Blurred copies are decoded small: the blur throws the detail away anyway.
+    val ambient = rememberAsyncImagePainter(remember(src.titleId, artVersion) {
+        GameArt.backgroundRequest(context, src.titleId, small = true)
+    })
     Box(Modifier.fillMaxSize()) {
-        AsyncImage(
-            model = ambient,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { scaleX = 1.2f; scaleY = 1.2f }
-                .blur(32.dp),
-        )
-        AsyncImage(
-            model = url,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(16f / 9f)
-                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                .drawWithCache {
-                    val fade = Brush.verticalGradient(0.55f to Color.White, 1f to Color.Transparent)
-                    onDrawWithContent {
-                        drawContent()
-                        drawRect(fade, blendMode = BlendMode.DstIn)
-                    }
-                },
-        )
+        // The cover theme stays underneath, so a background arriving later fades in over it.
+        val boxArt = rememberAsyncImagePainter(remember(src.titleId, artVersion) {
+            GameArt.boxArtRequest(context, src.titleId)
+        })
+        if (boxArt.state is AsyncImagePainter.State.Success) {
+            NxeAmbient(boxArt)
+            NxeCoverHero(boxArt)
+        } else {
+            NxeAmbient(rememberAsyncImagePainter(src.icon))
+        }
+        NxeAmbient(ambient)
+        val picture = remember(src.titleId, artVersion) { GameArt.backgroundRequest(context, src.titleId, small = false) }
+        if (picture != null) {
+            AsyncImage(
+                model = picture,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                    .drawWithCache {
+                        val fade = Brush.verticalGradient(0.55f to Color.White, 1f to Color.Transparent)
+                        onDrawWithContent {
+                            drawContent()
+                            drawRect(fade, blendMode = BlendMode.DstIn)
+                        }
+                    },
+            )
+        }
     }
+}
+
+/** The box art itself, slightly out of focus, filling the width from the top and fading out
+ *  below: the theme of a game the Marketplace gave no background. The white header of the
+ *  case is cut off, it would light the top of the screen. */
+@Composable
+private fun NxeCoverHero(painter: Painter) {
+    Spacer(
+        Modifier
+            .fillMaxSize()
+            .blur(9.dp)
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithCache {
+                val art = Size(size.width, size.width / GameArt.BOX_ASPECT)
+                val top = -art.height * GameArt.CASE_HEADER
+                val bottom = (top + art.height).coerceAtMost(size.height)
+                val fade = Brush.verticalGradient(
+                    0f to Color.White, 1f to Color.Transparent,
+                    startY = bottom * 0.55f, endY = bottom,
+                )
+                onDrawBehind {
+                    translate(top = top) { with(painter) { draw(art) } }
+                    drawRect(fade, blendMode = BlendMode.DstIn)
+                }
+            },
+    )
+}
+
+/** A picture as screen-filling colour and light: enlarged and blurred. */
+@Composable
+private fun NxeAmbient(painter: Painter) {
+    Image(
+        painter,
+        contentDescription = null,
+        contentScale = ContentScale.Crop,
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { scaleX = 1.2f; scaleY = 1.2f }
+            .blur(32.dp),
+    )
 }
 
 /** Light status-bar icons over the dark backdrop; the previous look returns on dispose. */

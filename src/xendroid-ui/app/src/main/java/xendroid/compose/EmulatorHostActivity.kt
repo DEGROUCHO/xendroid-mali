@@ -86,6 +86,7 @@ import xendroid.compose.settings.ConfigHandle
 import xendroid.compose.settings.ConfigStore
 import xendroid.compose.ui.pause.QmAction
 import xendroid.compose.ui.pause.QmChoice
+import xendroid.compose.ui.pause.QmSegmented
 import xendroid.compose.ui.pause.QmItem
 import xendroid.compose.ui.pause.QmNote
 import xendroid.compose.ui.pause.QmSection
@@ -1875,7 +1876,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             if (t > 0) parts += String.format(java.util.Locale.US, "%.1f °C", t / 10f)
             val level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
             val scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
-            if (level >= 0 && scale > 0) parts += "battery ${level * 100 / scale}%"
+            if (level >= 0 && scale > 0) parts += l10n("battery ${level * 100 / scale}%", "batteria ${level * 100 / scale}%")
         }
         parts += java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
         return parts.joinToString("  ·  ")
@@ -2030,15 +2031,44 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         )
         val heat = heatOptsState.value
         val heatAtLaunch = heatOptsAtLaunch
-        val heatRecommended = heatOpts.filter { !it.optional }
-        val heatAllOn = heatRecommended.all { heatOptOn(heat, it) }
+        val limiter = heatOpts.first { it.id == "limiter" }
+        val cap30 = heatOpts.first { it.id == "fps30" }
+        // The frame-rate limit has its own control; these are the switches under it.
+        val advanced = heatOpts.filter { !it.optional && it.id != "limiter" }
+        val advancedAllOn = advanced.all { heatOptOn(heat, it) }
         // Only the switches the running game can't take on the fly stay pending.
         val heatPending = heatAtLaunch != null && heatOpts.any {
             !it.live && heatOptOn(heat, it) != heatOptOn(heatAtLaunch, it)
         }
+        val fpsMode = when {
+            heatOptOn(heat, cap30) -> 1
+            heatOptOn(heat, limiter) -> 0
+            else -> 2
+        }
         val stats = buildList {
-            add(QmSection(l10n("Performance and heat", "Prestazioni e calore")))
-            for (o in heatRecommended) {
+            add(QmSection(l10n("Frame rate", "Fluidità")))
+            add(QmSegmented(l10n("FPS limit", "Limite FPS"),
+                when (fpsMode) {
+                    0 -> l10n("Steady pace at the best rate the game can hold. Recommended",
+                        "Ritmo costante al massimo che il gioco regge. Consigliato")
+                    1 -> l10n("Half the work in 60 FPS games: cooler phone, longer battery",
+                        "Metà del lavoro nei giochi a 60: telefono più fresco, batteria più lunga")
+                    else -> l10n("As many FPS as possible. Some games may run too fast",
+                        "Più FPS possibili. Alcuni giochi possono andare troppo veloci")
+                },
+                QmIcons.Chart,
+                options = listOf("Auto", "30", l10n("Free", "Libero")),
+                selected = fpsMode,
+            ) { m ->
+                when (m) {
+                    0 -> setHeatOpts(mapOf(limiter to true, cap30 to false))
+                    1 -> setHeatOpts(mapOf(cap30 to true))
+                    else -> setHeatOpts(mapOf(limiter to false))
+                }
+            })
+            addAll(statsOverlayRows())
+            add(QmSection(l10n("Advanced: all on is best", "Avanzate: meglio tutto acceso")))
+            for (o in advanced) {
                 val on = heatOptOn(heat, o)
                 add(QmToggle(o.title, o.subtitle,
                     if (o.id == "governor") QmIcons.Thermo else QmIcons.Chart,
@@ -2047,24 +2077,18 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         on != heatOptOn(heatAtLaunch, o),
                 ) { v -> setHeatOpts(mapOf(o to v)) })
             }
-            if (!heatAllOn) {
+            if (!advancedAllOn) {
                 add(QmAction(l10n("Turn all on", "Riattiva tutto"), l10n("Recommended setting: all entries on", "Impostazione consigliata: tutte le voci accese"),
-                    Icons.Filled.Refresh) { setHeatOpts(heatRecommended.associateWith { true }) })
+                    Icons.Filled.Refresh) { setHeatOpts(advanced.associateWith { true }) })
             }
             add(QmNote(
                 when {
                     heatPending -> l10n("A change applies from the next launch", "Una modifica vale dal prossimo avvio")
-                    heatAllOn -> l10n("All on (recommended)", "Tutto attivo (consigliato)")
+                    advancedAllOn -> l10n("All on (recommended)", "Tutto attivo (consigliato)")
                     else -> l10n("Some entries are off", "Alcune voci sono spente")
                 },
                 l10n("They apply immediately and to all games", "Si applicano subito e valgono per tutti i giochi"),
                 Icons.Filled.Info))
-            add(QmSection(l10n("Even less heat", "Ancora meno calore")))
-            for (o in heatOpts.filter { it.optional }) {
-                add(QmToggle(o.title, o.subtitle, QmIcons.Thermo,
-                    checked = heatOptOn(heat, o)) { v -> setHeatOpts(mapOf(o to v)) })
-            }
-            addAll(statsOverlayRows())
         }
         val b = screenBrightnessState.floatValue
         val display = buildList {
@@ -2093,18 +2117,31 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     /** The rows that choose what the on-screen statistics box shows. */
-    private fun statsOverlayRows(): List<QmItem> = listOf(
-        QmSection(l10n("On-screen box", "Riquadro sullo schermo")),
-            QmToggle(l10n("Show smoothness (FPS)", "Mostra fluidità (FPS)"), l10n("More FPS make motion smoother", "Più FPS rendono il movimento più fluido"),
-                QmIcons.Chart, checked = showFpsOverlay.value) { setFpsOverlay(it) },
-            QmToggle(l10n("Show usage and temperature", "Mostra utilizzo e temperatura"),
-                l10n("CPU, GPU, memory and battery temperature", "CPU, GPU, memoria e temperatura della batteria"),
-                QmIcons.Thermo, checked = statsDetailedState.value) { v ->
-                statsDetailedState.value = v
-                statsPrefs.edit().putBoolean("detailed", v).apply()
-                if (v && !showFpsOverlay.value) setFpsOverlay(true)
+    private fun statsOverlayRows(): List<QmItem> {
+        val mode = when {
+            !showFpsOverlay.value -> 0
+            !statsDetailedState.value -> 1
+            else -> 2
+        }
+        return listOf(
+            QmSection(l10n("On-screen statistics", "Statistiche sullo schermo")),
+            QmSegmented(l10n("Show", "Mostra"),
+                when (mode) {
+                    0 -> l10n("Nothing over the game. L3 + R3 shows it in game",
+                        "Niente sopra il gioco. L3 + R3 lo mostra in gioco")
+                    1 -> l10n("Frames per second and the time of each frame",
+                        "Fotogrammi al secondo e durata di ogni fotogramma")
+                    else -> l10n("Also CPU, GPU, memory, battery heat and what limits the FPS",
+                        "Anche CPU, GPU, memoria, calore della batteria e cosa limita gli FPS")
+                },
+                QmIcons.Chart,
+                options = listOf(l10n("Off", "No"), "FPS", l10n("All", "Tutto")),
+                selected = mode,
+            ) { m ->
+                setStatsDetailed(m == 2)
+                setFpsOverlay(m != 0)
             },
-            QmToggle(l10n("Show frame graph", "Mostra andamento dei frame"), l10n("Spikes help spot stutters", "I picchi aiutano a riconoscere gli scatti"),
+            QmToggle(l10n("Frame graph", "Andamento dei fotogrammi"), l10n("Spikes in the line are stutters", "I picchi nella linea sono gli scatti"),
                 QmIcons.Chart, checked = statsGraphState.value) { v ->
                 statsGraphState.value = v
                 statsPrefs.edit().putBoolean("graph", v).apply()
@@ -2115,8 +2152,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 statsPrefs.edit().putFloat("x", 0f).putFloat("y", 0f).apply()
                 hudPositionEpoch.intValue++
             },
-            QmNote(l10n("GPU measurement", "Misura della GPU"), l10n("GPU time: average per frame. — when not available", "Tempo GPU: media per fotogramma. — quando non disponibile"), Icons.Filled.Info),
-    )
+        )
+    }
+
+    private fun setStatsDetailed(v: Boolean) {
+        statsDetailedState.value = v
+        statsPrefs.edit().putBoolean("detailed", v).apply()
+    }
 
     /** Same pattern as the controls toggle: flip the live UI state for an immediate effect,
      *  persist the native cvar async so it survives the next boot. */

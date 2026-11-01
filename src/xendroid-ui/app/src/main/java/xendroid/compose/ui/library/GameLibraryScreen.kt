@@ -108,8 +108,8 @@ fun GameLibraryScreen(
     val uiPrefs = remember { context.getSharedPreferences("library_ui", Context.MODE_PRIVATE) }
     var lastPlayedId by remember { mutableStateOf(uiPrefs.getString("last_played", null)) }
     var recentFirst by remember { mutableStateOf(uiPrefs.getBoolean("recent_first", false)) }
-    // NXE-style dashboard is the default face of the library; the grid is one tap away.
-    var dashboardView by remember { mutableStateOf(uiPrefs.getBoolean("dashboard_view", true)) }
+    // NXE-style dashboard is the face of the library; the classic grid is one tap away.
+    var dashboardView by remember { mutableStateOf(LibraryStyle.isDashboard(context)) }
     var query by remember { mutableStateOf("") }
     fun recordLaunch(game: Game) {
         uiPrefs.edit().putString("last_played", game.stableId)
@@ -211,7 +211,7 @@ fun GameLibraryScreen(
                         (state as? LibraryUiState.Loaded)?.let { s ->
                             Text(
                                 if (s.fromCache && isRefreshing)
-                                    l10n("${s.games.size} games saved · Checking…", "${s.games.size} giochi salvati · Verifica in corso…")
+                                    l10n("${s.games.size} games · checking…", "${s.games.size} giochi · verifica…")
                                 else l10n("${s.games.size} games", "${s.games.size} giochi"),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -238,9 +238,9 @@ fun GameLibraryScreen(
                     // The dashboard keeps three discs; its way back to the grid is in the menu.
                     if (!dashboardView) IconButton(onClick = {
                         dashboardView = true
-                        uiPrefs.edit().putBoolean("dashboard_view", true).apply()
+                        LibraryStyle.setDashboard(context, true)
                     }) {
-                        Icon(NxeIcons.Dashboard, contentDescription = l10n("Dashboard view", "Vista dashboard"))
+                        Icon(NxeIcons.Dashboard, contentDescription = l10n("Xbox covers view", "Vista copertine Xbox"))
                     }
                     IconButton(modifier = actionMod, onClick = {
                         if (searching) query = ""
@@ -261,11 +261,11 @@ fun GameLibraryScreen(
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         if (dashboardView) {
                             DropdownMenuItem(
-                                text = { Text(l10n("Grid view", "Vista griglia")) },
+                                text = { Text(l10n("Classic grid view", "Vista a griglia classica")) },
                                 onClick = {
                                     menuOpen = false
                                     dashboardView = false
-                                    uiPrefs.edit().putBoolean("dashboard_view", false).apply()
+                                    LibraryStyle.setDashboard(context, false)
                                 },
                             )
                         }

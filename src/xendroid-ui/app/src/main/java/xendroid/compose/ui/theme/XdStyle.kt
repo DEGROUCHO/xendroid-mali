@@ -45,6 +45,17 @@ object XdType {
     val hudLead = TextStyle(
         fontSize = 16.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold,
         fontFeatureSettings = "tnum")
+    /** The readout's lead figure: frames per second. */
+    val hudBig = TextStyle(
+        fontSize = 24.sp, lineHeight = 26.sp, fontWeight = FontWeight.Bold,
+        fontFeatureSettings = "tnum")
+    /** A readout figure. */
+    val hudValue = TextStyle(
+        fontSize = 14.sp, lineHeight = 17.sp, fontWeight = FontWeight.SemiBold,
+        fontFeatureSettings = "tnum")
+    /** The small name under a readout figure. */
+    val hudLabel = TextStyle(
+        fontSize = 9.sp, lineHeight = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
 }
 
 /**

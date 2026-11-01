@@ -55,6 +55,17 @@ data class QmChoice(
     val onNext: () -> Unit,
 ) : QmItem
 
+/** A few options side by side (the frame-rate limit, the statistics box): tap one, or move
+ *  with left/right; activating the row moves to the next. [subtitle] explains the selected one. */
+data class QmSegmented(
+    override val title: String,
+    override val subtitle: String? = null,
+    override val icon: ImageVector? = null,
+    val options: List<String>,
+    val selected: Int,
+    val onSelect: (Int) -> Unit,
+) : QmItem
+
 /** A group heading inside a tab. Not selectable. */
 data class QmSection(override val title: String) : QmItem {
     override val subtitle: String? get() = null
@@ -93,6 +104,7 @@ fun qmActivate(item: QmItem) = when (item) {
     is QmAction -> item.onClick()
     is QmToggle -> item.onToggle(!item.checked)
     is QmChoice -> item.onNext()
+    is QmSegmented -> if (item.options.isNotEmpty()) item.onSelect((item.selected + 1) % item.options.size) else Unit
     is QmSlider -> Unit                       // a slider only moves with left/right or a drag
     is QmSection, is QmNote -> Unit
 }
@@ -104,8 +116,14 @@ fun qmSliderStep(value: Float, min: Float, max: Float, step: Float, dir: Int): F
     return (min + steps * step).coerceIn(min, max)
 }
 
-/** Left/right on a row: true when the row used it (a slider), false to let it switch tabs. */
+/** Left/right on a row: true when the row used it (a slider or a set of options), false to
+ *  let it switch tabs. */
 fun qmAdjust(item: QmItem, dir: Int): Boolean {
+    if (item is QmSegmented) {
+        val next = (item.selected + dir).coerceIn(0, item.options.lastIndex.coerceAtLeast(0))
+        if (next != item.selected) item.onSelect(next)
+        return true
+    }
     if (item !is QmSlider) return false
     val next = qmSliderStep(item.value, item.min, item.max, item.step, dir)
     if (next != item.value) item.onChange(next)

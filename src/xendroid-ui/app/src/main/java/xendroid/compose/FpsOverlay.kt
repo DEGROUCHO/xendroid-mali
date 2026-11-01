@@ -3,14 +3,18 @@ package xendroid.compose
 import android.content.Context
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -28,16 +32,14 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import xendroid.compose.core.EmulatorSession
 import xendroid.compose.core.EmulatorRuntime
@@ -49,6 +51,10 @@ import xendroid.compose.ui.theme.XdType
 private val HUD_GOOD = XdColors.good
 private val HUD_WARN = XdColors.caution
 private val HUD_BAD = XdColors.bad
+private val HUD_SHAPE = RoundedCornerShape(10.dp)
+private val HUD_FILL = Color.Black.copy(alpha = 0.58f)
+private val HUD_EDGE = Color.White.copy(alpha = 0.14f)
+private val HUD_DIM = Color.White.copy(alpha = 0.72f)
 private const val GRAPH_SAMPLES = 60
 
 /** Readout colour for a frame rate: steady, playable, struggling. */
@@ -67,11 +73,39 @@ fun tempTier(celsius: Float): Int = when {
 
 private fun tierColor(tier: Int) = when (tier) { 0 -> HUD_GOOD; 1 -> HUD_WARN; else -> HUD_BAD }
 
+/** What holds the frame rate back. */
+enum class FpsLimit { GPU, CPU, CAP }
+
+/** Share of each frame the GPU spends working (0..1), from its measured time per frame;
+ *  null without a GPU measurement. */
+fun gpuBusyOf(fps: Double, gpuFrameMs: Double?): Double? =
+    if (gpuFrameMs == null || fps < 1.0) null else (gpuFrameMs * fps / 1000.0).coerceIn(0.0, 1.0)
+
 /**
- * Small, draggable performance readout drawn over the Vulkan SurfaceView. Shows a RenderDoc-
- * style ~1s average fps alongside the INSTANT frame time, polled from the native lock-free
- * frame-stats atomics at [pollHz]; optionally CPU / RAM / GPU / temperature and a frame-time
- * graph.
+ * Pure: what limits the frame rate. A GPU busy for nearly the whole frame is the limit; a
+ * rate sitting on a pace step (30, 40, 60, 120) with the GPU to spare is the frame limiter or
+ * the game's own lock; otherwise the CPU side (game threads, command processor). Null when
+ * there is no GPU measurement to judge by.
+ */
+fun fpsLimitOf(fps: Double, gpuBusy: Double?): FpsLimit? {
+    if (fps < 1.0 || gpuBusy == null) return null
+    val paced = PACE_STEPS.any { abs(fps - it) <= 0.6 }
+    return when {
+        gpuBusy >= 0.9 -> FpsLimit.GPU
+        paced -> FpsLimit.CAP
+        gpuBusy >= 0.85 -> FpsLimit.GPU
+        else -> FpsLimit.CPU
+    }
+}
+
+private val PACE_STEPS = doubleArrayOf(30.0, 40.0, 60.0, 120.0)
+
+/**
+ * Small, draggable performance readout drawn over the Vulkan SurfaceView: the ~1 s average
+ * frame rate in large figures (coloured by how smooth it is) next to the INSTANT frame time,
+ * polled from the native lock-free frame-stats atomics at [pollHz]. [detailed] adds one row
+ * of labelled figures (CPU, GPU, RAM, battery temperature and what limits the frame rate);
+ * [graph] a strip with the last frame times.
  *
  * The user can drag it anywhere; its position is persisted in a :emu-process SharedPreferences (so
  * the same DataStore the main process uses is never touched cross-process). Visibility is owned by
@@ -83,9 +117,7 @@ fun FpsOverlay(
     visible: Boolean,
     modifier: Modifier = Modifier,
     pollHz: Int = 4,
-    // Extra lines: CPU, RAM, GPU (where readable) and battery temperature.
     detailed: Boolean = false,
-    // A strip with the last GRAPH_SAMPLES frame times.
     graph: Boolean = false,
     // Changes when the saved position was rewritten from outside (menu: reset position).
     positionEpoch: Int = 0,
@@ -136,13 +168,13 @@ fun FpsOverlay(
         }
     }
 
-    val dim = Color.White.copy(alpha = 0.72f)
     Box(modifier.fillMaxSize().onSizeChanged { boxSize = it }) {
         Column(
             modifier = Modifier
                 .offset { IntOffset(offset.x.roundToInt(), offset.y.roundToInt()) }
-                .background(Color.Black.copy(alpha = 0.42f), RoundedCornerShape(7.dp))
-                .padding(horizontal = 7.dp, vertical = 3.dp)
+                .background(HUD_FILL, HUD_SHAPE)
+                .border(1.dp, HUD_EDGE, HUD_SHAPE)
+                .padding(horizontal = 10.dp, vertical = 5.dp)
                 .pointerInput(boxSize) {
                     detectDragGestures(
                         onDrag = { change, drag ->
@@ -164,31 +196,53 @@ fun FpsOverlay(
             Row(verticalAlignment = Alignment.Bottom) {
                 Text(
                     String.format(Locale.US, "%.0f", fps),
-                    color = tierColor(fpsTier(fps)), style = XdType.hudLead,
+                    color = tierColor(fpsTier(fps)), style = XdType.hudBig,
                 )
+                Text(" FPS", color = HUD_DIM, style = XdType.hudValue, modifier = Modifier.padding(bottom = 2.dp))
+                // With frame generation: game fps -> fps on screen.
+                if (shownFps > fps + 1.0) {
+                    Text(
+                        String.format(Locale.US, "  → %.0f FG", shownFps),
+                        color = HUD_DIM, style = XdType.hudValue, modifier = Modifier.padding(bottom = 2.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
                 Text(
-                    // With frame generation: game fps -> fps on screen.
-                    text = if (shownFps > fps + 1.0)
-                        String.format(Locale.US, " FPS → %.0f FG  ·  %.1f ms", shownFps, frameMs)
-                    else String.format(Locale.US, " FPS  ·  %.1f ms", frameMs),
-                    color = dim, style = XdType.hud,
+                    String.format(Locale.US, "%.1f ms", frameMs),
+                    color = HUD_DIM, style = XdType.hudValue, modifier = Modifier.padding(bottom = 2.dp),
                 )
             }
-            stats?.let { s ->
-                val line = perfStatsLine(s)
-                if (line.isNotEmpty()) {
-                    Text(line, color = dim, style = XdType.hud)
-                }
-                s.batteryTempC?.let { t ->
-                    Text(
-                        String.format(Locale.US, "%.1f °C", t),
-                        color = tierColor(tempTier(t)), style = XdType.hud,
-                    )
+            if (detailed) {
+                val s = stats
+                val busy = gpuBusyOf(fps, s?.gpuFrameMs)
+                Row(
+                    Modifier.padding(top = 3.dp, bottom = 1.dp),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    HudCell("CPU", s?.cpuPercent?.let { String.format(Locale.US, "%.0f%%", it) } ?: "—")
+                    // Share of each frame the GPU works; the device's own load figure where it
+                    // has one and the frame time is not measured.
+                    HudCell("GPU", busy?.let { String.format(Locale.US, "%.0f%%", it * 100) }
+                        ?: s?.gpuPercent?.let { "$it%" } ?: "—")
+                    HudCell("RAM", s?.ramMb?.let {
+                        if (it >= 1024) String.format(Locale.US, "%.1f GB", it / 1024f) else "$it MB"
+                    } ?: "—")
+                    val temp = s?.batteryTempC
+                    HudCell(l10n("BATTERY", "BATTERIA"),
+                        temp?.let { String.format(Locale.US, "%.0f °C", it) } ?: "—",
+                        temp?.let { tierColor(tempTier(it)) } ?: Color.White)
+                    fpsLimitOf(fps, busy)?.let { limit ->
+                        HudCell(l10n("LIMIT", "LIMITE"), when (limit) {
+                            FpsLimit.GPU -> "GPU"
+                            FpsLimit.CPU -> "CPU"
+                            FpsLimit.CAP -> l10n("Cap", "Tetto")
+                        }, HUD_WARN)
+                    }
                 }
             }
             if (graph) {
                 val now = head                                   // state read: redraw per sample
-                Canvas(Modifier.padding(top = 2.dp, bottom = 2.dp).size(104.dp, 24.dp)) {
+                Canvas(Modifier.padding(top = 3.dp, bottom = 2.dp).size(150.dp, 28.dp)) {
                     // Scale: 0 .. 50 ms; guide lines at 16.7 ms (60 fps) and 33.3 ms (30 fps).
                     fun y(ms: Float) = size.height * (1f - (ms / 50f).coerceIn(0f, 1f))
                     val guide = Color.White.copy(alpha = 0.22f)
@@ -207,6 +261,15 @@ fun FpsOverlay(
                 }
             }
         }
+    }
+}
+
+/** One figure of the readout with its name underneath. */
+@Composable
+private fun HudCell(label: String, value: String, color: Color = Color.White) {
+    Column {
+        Text(value, color = color, style = XdType.hudValue, maxLines = 1)
+        Text(label, color = Color.White.copy(alpha = 0.6f), style = XdType.hudLabel, maxLines = 1)
     }
 }
 

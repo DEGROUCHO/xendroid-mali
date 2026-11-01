@@ -22,7 +22,8 @@ class GameMetadataCacheTest {
 
     @get:Rule val tmp = TemporaryFolder()
 
-    private val freshEntry = Entry(name = "Halo 3", iconCacheName = "abc.png", sizeBytes = 100, lastModified = 200)
+    private val freshEntry = Entry(name = "Halo 3", iconCacheName = "abc.png", sizeBytes = 100, lastModified = 200,
+                                   titleId = "4D5307E6")
     private val matchingSig = Signature(sizeBytes = 100, lastModified = 200)
     private val iconExists: (String) -> Boolean = { true }
     private val iconMissing: (String) -> Boolean = { false }
@@ -42,14 +43,14 @@ class GameMetadataCacheTest {
 
     @Test fun hitWhenEntryAndSignatureMatchAndIconExists() {
         val d = GameMetadataCache.decide(freshEntry, matchingSig, iconExists)
-        assertEquals(Decision.Hit("Halo 3", "abc.png"), d)
+        assertEquals(Decision.Hit("Halo 3", "abc.png", "4D5307E6"), d)
     }
 
     @Test fun hitWithNullIconSkipsIconExistenceCheck() {
         val noIcon = freshEntry.copy(iconCacheName = null)
         // iconMissing must never be consulted for a null-icon entry.
         val d = GameMetadataCache.decide(noIcon, matchingSig, iconMissing)
-        assertEquals(Decision.Hit("Halo 3", null), d)
+        assertEquals(Decision.Hit("Halo 3", null, "4D5307E6"), d)
     }
 
     // ---- decide(): MISS paths ----
@@ -74,6 +75,15 @@ class GameMetadataCacheTest {
         val zeroEntry = Entry("X", "i.png", sizeBytes = 0, lastModified = 0)
         val d = GameMetadataCache.decide(zeroEntry, Signature(0, 0), iconExists)
         assertEquals(Decision.Miss, d)
+    }
+
+    @Test fun missWhenTitleIdMissing() {
+        // A cached failed extraction (no title id) is retried instead of kept forever.
+        val noId = freshEntry.copy(titleId = null)
+        assertEquals(Decision.Miss,
+            GameMetadataCache.decide(noId, matchingSig, iconExists, requireTitleId = true))
+        // The quick publish of the cached library still shows the game.
+        assertEquals(Decision.Hit("Halo 3", "abc.png"), GameMetadataCache.decide(noId, matchingSig, iconExists))
     }
 
     @Test fun missWhenIconFileVanished() {

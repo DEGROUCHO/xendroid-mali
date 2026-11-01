@@ -99,12 +99,12 @@
   </tr>
   <tr>
     <td valign="top">
-      <h3>📱 A modern app</h3>
-      New Jetpack Compose interface. It has a game library with a built-in folder browser, so it works even where HyperOS/MIUI block the system picker. Each game has its own settings, each with an explanation.
+      <h3>📱 An Xbox-style library</h3>
+      Your games as a cover flow with real box art, over each game's own Marketplace theme, in the spirit of the Xbox 360 dashboard. Every game gets a cover and a themed screen, even without downloaded artwork. A classic grid is one tap away. A built-in folder browser works even where HyperOS/MIUI block the system picker.
     </td>
     <td valign="top">
       <h3>🎮 Play comfortably</h3>
-      Xbox controller support and an on-screen performance overlay. The interface is in <b>English and Italian</b>, switchable in Settings → Language. Config migration brings new defaults to existing installs.
+      Xbox controller support, a one-tap FPS limit (Auto / 30 / Free) and a clear statistics box: FPS, frame time, CPU, GPU, RAM, battery temperature and what is limiting the FPS. The interface is in <b>English and Italian</b>, switchable in Settings → Language.
     </td>
   </tr>
 </table>
@@ -126,6 +126,7 @@
 |:--|:--|
 | ✅ **Tested** | POCO X7 Pro: MediaTek Dimensity 8400, Mali-G720 MC7, driver r49p1, Android 16 |
 | 🟡 **Should work** | Other recent Mali GPUs (G615, G710, G715, G925) on Dimensity and Exynos, and Adreno 7xx |
+| 💬 **Reported by players** | POCO X8 Pro works well. Forza Horizon and Forza Horizon 2 boot and run at about 20–24 fps on a POCO X7 Pro |
 | 📝 **Help wanted** | Anything else. [Report your device](../../issues/new/choose): reports from other phones are the most useful contribution right now |
 
 <br>
@@ -205,6 +206,12 @@ It needs Android 10+ on arm64 with a Vulkan driver. It is tuned on Mali-G720, an
 </details>
 
 <details>
+<summary><b>Which game formats does it read?</b></summary>
+<br>
+Disc images (<code>.iso</code>), compressed images (<code>.zar</code>, made by the app itself from an ISO), Games on Demand folders, extracted games with a <code>default.xex</code>, and Xbox Live Arcade packages. An ISO is all a game needs: no BIOS, no keys, no other files.
+</details>
+
+<details>
 <summary><b>Which games work?</b></summary>
 <br>
 The five games in the table above are the ones measured in depth. The changes are in the shared core, not per game, so other titles benefit too. Compatibility reports are welcome.
@@ -280,7 +287,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 24 Oct 2026 | q516 | Zero-copy resolves: −12.6% memory bandwidth |
 | 25 Oct 2026 | q575 | MSAA 4x as 2×2 by default: Reach +30%, Dante dither fixed |
 | 26 Oct 2026 | q607 | GTA IV savestates; Reach GPU −12%; NFS Most Wanted in the library |
-| 29 Oct 2026 | **q636** | GTA IV black flashing fixed; first public release |
+| 29 Oct 2026 | q636 | GTA IV black flashing fixed; first public release |
+| 1 Nov 2026 | **q636.1** | New library: covers and themes for every game, smooth fast scrolling; one-tap FPS limit; clearer statistics |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

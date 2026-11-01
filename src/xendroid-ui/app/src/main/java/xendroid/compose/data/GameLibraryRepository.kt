@@ -12,8 +12,14 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
-/** Backstop for a pathological tree; symlink loops are already cut by canonical paths. */
-private const val MAX_SCAN_DEPTH = 12
+/** How deep the walk goes below the games folder. A game sits at most a few levels down
+ *  (folder / game / disc, or a GOD layout title / 00007000 / container); deeper trees are
+ *  other apps' data, and walking them made every scan take tens of seconds. */
+private const val MAX_SCAN_DEPTH = 5
+
+/** A folder with more entries than this is never a game's: it is listed (for default.xex)
+ *  but not walked. */
+private const val MAX_WALKED_DIR_ENTRIES = 2000
 
 /** Discovers games by walking the real-path games dir and every subdirectory beneath it. */
 class GameLibraryRepository(
@@ -120,6 +126,8 @@ class GameLibraryRepository(
             cached = metadataCache.get(launchUri),
             signature = signature,
             iconFileExists = { iconCache.fileFor(it).exists() },
+            // A cached failed extraction is retried, or the game keeps no box art for good.
+            requireTitleId = true,
         )
         if (decision is GameMetadataCache.Decision.Hit) cacheHits++ else cacheMisses++
         return decision as? GameMetadataCache.Decision.Hit
@@ -165,18 +173,23 @@ class GameLibraryRepository(
      *  on the ROOT (grant revoked) -> [ScanResult.PermissionLost]; an unreadable subdirectory
      *  is skipped. */
     private fun scanRealPathLocked(dirPath: String): ScanResult {
+        val t0 = SystemClock.elapsedRealtime()
         val root = File(dirPath)
         val children = root.listFiles() ?: return ScanResult.PermissionLost
 
         // Load the extraction cache once; mutate during classify; persist once after.
         metadataCache.load()
+        val t1 = SystemClock.elapsedRealtime()
         val games = ArrayList<Game>()
         val visited = HashSet<String>()
         canonicalOf(root)?.let { visited.add(it) }
         collectGames(children, depth = 1, visited, games)
+        val t2 = SystemClock.elapsedRealtime()
         games.sortBy { it.name.lowercase() }
         metadataCache.retainOnly(games.mapTo(HashSet()) { it.launchUri })
         metadataCache.save()
+        Log.i(tag, "scan_stages list_and_load_ms=${t1 - t0} walk_ms=${t2 - t1} " +
+            "save_ms=${SystemClock.elapsedRealtime() - t2}")
         return ScanResult.Games(games)
     }
 
@@ -190,11 +203,21 @@ class GameLibraryRepository(
     ) {
         for (child in children) {
             if (!child.isDirectory) {
+                val startedAt = SystemClock.elapsedRealtime()
                 classifyFile(child)?.let { out.add(it) }
+                // Which kind of entry makes a scan slow (no names: the folder is the player's).
+                val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+                if (elapsedMs > 250) {
+                    Log.i(tag, "slow_entry ms=$elapsedMs format=${GameFormat.fromFileName(child.name)} " +
+                        "bytes=${child.length()} depth=$depth")
+                }
                 continue
             }
             if (!isScannableDir(child)) continue
+            val listedAt = SystemClock.elapsedRealtime()
             val entries = child.listFiles() ?: continue
+            val listMs = SystemClock.elapsedRealtime() - listedAt
+            if (listMs > 250) Log.i(tag, "slow_dir list_ms=$listMs entries=${entries.size} depth=$depth")
             // A folder holding default.xex IS the game; its own subtree is game data.
             val xex = entries.firstOrNull {
                 it.isFile && it.name.equals("default.xex", ignoreCase = true)
@@ -203,8 +226,9 @@ class GameLibraryRepository(
                 out.add(xexFolderGame(child, xex))
                 continue
             }
-            if (depth >= MAX_SCAN_DEPTH) {
-                Log.w(tag, "scan depth $MAX_SCAN_DEPTH reached, not descending: ${child.absolutePath}")
+            if (depth >= MAX_SCAN_DEPTH) continue
+            if (entries.size > MAX_WALKED_DIR_ENTRIES) {
+                Log.i(tag, "not walking a folder of ${entries.size} entries at depth $depth")
                 continue
             }
             val canonical = canonicalOf(child) ?: continue
@@ -228,7 +252,8 @@ class GameLibraryRepository(
             val meta = metadata.readXexMetaPath(xexPath, GameFormat.XEX_FOLDER)
             val displayName = meta?.name?.takeIf { it.isNotEmpty() } ?: dir.name
             val iconName = meta?.iconPng?.let { iconCache.write(xexPath, it) }
-            Extracted(displayName, iconName, meta?.titleId, meta?.mediaId,
+            val titleId = meta?.titleId ?: metadata.readTitleIdPath(xexPath, GameFormat.XEX_FOLDER)
+            Extracted(displayName, iconName, titleId, meta?.mediaId,
                       meta?.discNumber ?: 0, meta?.discCount ?: 0)
         }
     }
@@ -245,7 +270,9 @@ class GameLibraryRepository(
                     val displayName = meta?.name?.takeIf { it.isNotEmpty() }
                         ?: fmt.displayNameFor(name)
                     val iconName = meta?.iconPng?.let { iconCache.write(path, it) }
-                    Extracted(displayName, iconName, meta?.titleId, meta?.mediaId,
+                    // The lighter title-id read still finds the box art when the full one fails.
+                    val titleId = meta?.titleId ?: metadata.readTitleIdPath(path, fmt)
+                    Extracted(displayName, iconName, titleId, meta?.mediaId,
                           meta?.discNumber ?: 0, meta?.discCount ?: 0)
                 }
             }

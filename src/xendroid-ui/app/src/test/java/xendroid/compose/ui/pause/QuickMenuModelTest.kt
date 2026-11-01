@@ -65,4 +65,14 @@ class QuickMenuSectionsTest {
     @org.junit.Test fun nothingSelectable_staysPut() {
         assertEquals(0, qmMoveSelection(listOf(QmSection("x")), 0, 1))
     }
+
+    @Test
+    fun segmented_leftRightMovesWithinTheOptions_andActivateCycles() {
+        var picked = -1
+        val row = QmSegmented("fps", options = listOf("Auto", "30", "Free"), selected = 1) { picked = it }
+        assertTrue(qmAdjust(row, 1)); assertEquals(2, picked)
+        picked = -1
+        assertTrue(qmAdjust(row.copy(selected = 2), 1)); assertEquals(-1, picked)   // already last
+        qmActivate(row.copy(selected = 2)); assertEquals(0, picked)                  // wraps
+    }
 }

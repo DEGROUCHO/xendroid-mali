@@ -171,7 +171,7 @@ private fun Header(gameName: String, statusLine: String, onClose: () -> Unit) {
             Modifier.size(40.dp).clip(RoundedCornerShape(20.dp)).clickable(onClick = onClose),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons.Filled.Close, contentDescription = "Resume", modifier = Modifier.size(20.dp))
+            Icon(Icons.Filled.Close, contentDescription = l10n("Resume", "Riprendi"), modifier = Modifier.size(20.dp))
         }
     }
 }
@@ -206,7 +206,8 @@ private fun TabRail(tabs: List<QmTab>, tabIndex: Int, onSelectTab: (Int) -> Unit
         }
         Spacer(Modifier.weight(1f))
         Text(
-            "LB / RB  change tab\nD-pad  move and adjust\nA  select    B  resume",
+            l10n("LB / RB  change tab\nD-pad  move and adjust\nA  select    B  resume",
+                "LB / RB  cambia scheda\nCroce  muovi e regola\nA  scegli    B  riprendi"),
             style = XdType.caption,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
@@ -262,8 +263,9 @@ private fun QmRow(item: QmItem, focused: Boolean, onFocus: () -> Unit) {
                 },
                 shape,
             )
-            .clickable(enabled = item !is QmSlider && !note) { onFocus(); qmActivate(item) }
-            .padding(horizontal = 10.dp),
+            .clickable(enabled = item !is QmSlider && item !is QmSegmented && !note) { onFocus(); qmActivate(item) }
+            // A choice row explains the selected option on up to two lines: room above and below.
+            .padding(horizontal = 10.dp, vertical = if (item is QmSegmented) 8.dp else 0.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Leading icon: same box on every row, so titles start on one vertical line.
@@ -287,7 +289,8 @@ private fun QmRow(item: QmItem, focused: Boolean, onFocus: () -> Unit) {
                 Text(
                     it,
                     color = if (primary) scheme.onPrimary.copy(alpha = 0.8f) else scheme.onSurfaceVariant,
-                    style = XdType.caption, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = XdType.caption, maxLines = if (item is QmSegmented) 2 else 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
@@ -316,13 +319,40 @@ private fun QmRow(item: QmItem, focused: Boolean, onFocus: () -> Unit) {
             }
             is QmChoice -> {
                 if (item.nextLaunch) {
-                    Text("NEXT LAUNCH", style = XdType.label, color = XdColors.caution,
+                    Text(l10n("NEXT LAUNCH", "DAL PROSSIMO AVVIO"), style = XdType.label, color = XdColors.caution,
                         modifier = Modifier.padding(end = 10.dp))
                 }
                 Text(item.valueLabel, color = scheme.onSurface, style = XdType.value,
                     textAlign = TextAlign.End, maxLines = 1)
                 Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,
                     tint = scheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+            }
+            is QmSegmented -> Row(
+                Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(scheme.surfaceContainerLowest)
+                    .padding(3.dp),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                item.options.forEachIndexed { i, label ->
+                    val on = i == item.selected
+                    Box(
+                        Modifier
+                            .heightIn(min = 34.dp)
+                            .widthIn(min = 58.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (on) scheme.primary else Color.Transparent)
+                            .clickable { onFocus(); if (!on) item.onSelect(i) }
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            label, maxLines = 1,
+                            style = XdType.value.copy(fontWeight = if (on) FontWeight.Bold else FontWeight.Medium),
+                            color = if (on) scheme.onPrimary else scheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
             is QmAction -> if (!primary) {
                 Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,

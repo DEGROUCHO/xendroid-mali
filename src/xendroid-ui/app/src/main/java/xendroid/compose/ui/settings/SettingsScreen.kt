@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.border
 import xendroid.compose.ui.library.NxeSurface
+import xendroid.compose.ui.library.LibraryStyle
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -152,6 +153,7 @@ private fun SettingsIndex(
                 )
             }
             if (query.isBlank()) item(key = "language", span = { GridItemSpan(maxLineSpan) }) { LanguageRow() }
+            if (query.isBlank()) item(key = "library_style", span = { GridItemSpan(maxLineSpan) }) { LibraryStyleRow() }
             if (query.isNotBlank()) {
                 if (results.isEmpty()) item(key = "none", span = { GridItemSpan(maxLineSpan) }) {
                     Text(l10n("No settings contain “${query.trim()}”", "Nessuna impostazione contiene “${query.trim()}”"),
@@ -220,6 +222,33 @@ private fun LanguageRow() {
                 FilterChip(
                     selected = current == value,
                     onClick = { if (value != current) UiLanguage.setAndRestart(activity, value) },
+                    label = { Text(label) },
+                    modifier = Modifier.padding(start = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+/** The library's face: the Xbox dashboard with the game covers, or the classic grid. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LibraryStyleRow() {
+    val context = LocalContext.current
+    var dashboard by remember { mutableStateOf(LibraryStyle.isDashboard(context)) }
+    GlassRow {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(l10n("Library", "Libreria"), style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            listOf(
+                true to l10n("Xbox covers", "Copertine Xbox"),
+                false to l10n("Classic grid", "Griglia classica"),
+            ).forEach { (value, label) ->
+                FilterChip(
+                    selected = dashboard == value,
+                    onClick = { dashboard = value; LibraryStyle.setDashboard(context, value) },
                     label = { Text(label) },
                     modifier = Modifier.padding(start = 6.dp),
                 )

@@ -58,7 +58,8 @@ sealed class UpdateResult {
 
 interface GithubApi {
 
-    @GET("repos/rfandango/XenDroid/releases/latest")
+    // This fork's own releases: upstream builds target Adreno and would replace the Mali work.
+    @GET("repos/DEGROUCHO/xendroid-mali/releases/latest")
     suspend fun latestRelease(): GithubRelease
 }
 
@@ -114,13 +115,12 @@ suspend fun checkForUpdates(): UpdateResult {
 
     Log.d("Updater", "Release tag: ${release.tagName}")
 
-    val currentHash = BuildConfig.VERSION_NAME
+    // Release builds are named after their tag (q636.1); the build type may add a suffix.
+    val currentHash = BuildConfig.VERSION_NAME.removeSuffix("-debug")
 
     Log.d("Updater", "Current: $currentHash")
 
-    val latestHash = release.tagName
-        .removePrefix("XenDroid-")
-        .trim()
+    val latestHash = release.tagName.trim()
 
     Log.d("Updater", "Latest: $latestHash")
 

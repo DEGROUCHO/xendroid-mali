@@ -139,13 +139,19 @@ class GameMetadataCache(cacheDir: File) {
          *  (b) [signature].cacheable AND it matches the cached signature (same sizeBytes &&
          *      lastModified) -- a non-cacheable (0/-1) signature is always a MISS,
          *  (c) if the cached iconCacheName != null, [iconFileExists] is true (the icon File
-         *      survived; covers a partially-cleared cache).
+         *      survived; covers a partially-cleared cache),
+         *  (d) with [requireTitleId], the entry has a title id: one without it is a failed
+         *      extraction (for example a scan that ran before the native core was up), and
+         *      keeping it would leave the game without box art, per-game settings or saves
+         *      until the file changes. The full scan retries those; the quick publish of the
+         *      cached library still shows them.
          * Otherwise [Miss] -> extract as normal.
          */
         fun decide(
             cached: Entry?,
             signature: Signature,
             iconFileExists: (iconCacheName: String) -> Boolean,
+            requireTitleId: Boolean = false,
         ): Decision {
             if (cached == null) return Decision.Miss
             if (!signature.cacheable) return Decision.Miss
@@ -154,6 +160,7 @@ class GameMetadataCache(cacheDir: File) {
             ) {
                 return Decision.Miss
             }
+            if (requireTitleId && cached.titleId.isNullOrBlank()) return Decision.Miss
             val icon = cached.iconCacheName
             if (icon != null && !iconFileExists(icon)) return Decision.Miss
             return Decision.Hit(cached.name, cached.iconCacheName, cached.titleId, cached.mediaId,

@@ -16,6 +16,7 @@ import java.io.File
  * 0000000000000000 (content_manager.cc:108-112); profiles use their account XUID.
  */
 object ContentPaths {
+    const val SAVED_GAME_CONTENT_TYPE = 0x00000001
     const val DLC_CONTENT_TYPE = 0x00000002
     const val TU_CONTENT_TYPE = 0x000B0000
     const val PROFILE_CONTENT_TYPE = 0x00010000
@@ -39,6 +40,11 @@ object ContentPaths {
         COMMUNITY_GAME_CONTENT_TYPE,
     )
 
+    /** Per-game add-on content a player drops next to the game: DLC, title updates, saves. */
+    fun isAddOnType(contentType: Int): Boolean =
+        contentType == DLC_CONTENT_TYPE || contentType == TU_CONTENT_TYPE ||
+            contentType == SAVED_GAME_CONTENT_TYPE
+
     /** content_type -> human label for install UI (XContentType, see content_manager). */
     fun contentTypeLabel(type: Int): String = when (type) {
         0x00000002 -> "DLC"
@@ -55,7 +61,7 @@ object ContentPaths {
      *  absolute external app-data path passed to the core as --storage_root. */
     fun contentRoot(): File = File(Utils.get_storage_root_path(), "content")
 
-    /** content/0000000000000000/<TITLE_ID>/<CONTENT_TYPE 08X> under the machine XUID. */
-    fun contentDir(titleId: String, contentType: Int): File =
-        File(contentRoot(), "$MACHINE_XUID/${titleId.uppercase()}/%08X".format(contentType))
+    /** content/<XUID>/<TITLE_ID>/<CONTENT_TYPE 08X>, under the machine XUID by default. */
+    fun contentDir(titleId: String, contentType: Int, xuid: String = MACHINE_XUID): File =
+        File(contentRoot(), "${xuid.uppercase()}/${titleId.uppercase()}/%08X".format(contentType))
 }

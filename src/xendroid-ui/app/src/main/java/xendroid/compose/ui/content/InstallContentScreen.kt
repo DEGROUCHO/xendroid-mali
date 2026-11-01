@@ -20,9 +20,10 @@ fun InstallContentScreen(
 ) {
     val installState by vm.state.collectAsStateWithLifecycle()
 
-    // Launched for a known source (a disc the library recognised as carrying content):
-    // install it directly instead of asking the user to find the file again.
-    LaunchedEffect(sourcePath) { if (sourcePath != null) vm.install(sourcePath) }
+    // Launched for a known source (a disc the library recognised as carrying content, or
+    // packages found next to a game, one per line): install directly instead of asking the
+    // user to find the files again.
+    LaunchedEffect(sourcePath) { if (sourcePath != null) vm.installAll(sourcePath.split('\n')) }
 
     // Only show the picker while no install is in flight; the dialogs take over after.
     if (sourcePath == null && installState is ContentInstallState.Idle) {

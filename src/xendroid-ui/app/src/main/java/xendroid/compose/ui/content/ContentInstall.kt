@@ -12,7 +12,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import android.content.Context
 import xendroid.compose.core.ContentPaths
+import xendroid.compose.core.EmulatorRuntime
+import xendroid.compose.settings.ConfigStore
 import java.io.File
 
 /** Shared install flow state for both the per-game ContentManager and the global
@@ -24,6 +27,21 @@ sealed interface ContentInstallState {
     data class ConfirmOverwrite(val srcPath: String, val displayName: String) : ContentInstallState
     data class Done(val message: String) : ContentInstallState
     data class Failed(val message: String) : ContentInstallState
+}
+
+/** XUID (hex) of the profile signed in to slot 0, else the first profile, else "".
+ *  Saved-game packages are installed under it: the game only looks for its saves there. */
+fun saveOwnerXuid(appContext: Context): String {
+    val config = ConfigStore(appContext).openLiveSnapshot()
+    val active = try {
+        config.getString("Profiles", "logged_profile_slot_0_xuid") ?: ""
+    } finally {
+        config.closeString()
+    }
+    val profiles = EmulatorRuntime.emulator
+        ?.list_profiles(ContentPaths.contentRoot().absolutePath).orEmpty()
+    return (profiles.firstOrNull { it.xuid.equals(active, ignoreCase = true) }
+        ?: profiles.firstOrNull())?.xuid.orEmpty()
 }
 
 /** Native install_content status -> human message. Shared by both VMs. */

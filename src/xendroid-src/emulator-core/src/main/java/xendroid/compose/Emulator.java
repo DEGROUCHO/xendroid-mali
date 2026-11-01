@@ -74,7 +74,9 @@ public class Emulator extends xendroid.emulator.Emulator{
     // at contentRoot (both REAL host paths). Placement is content-type aware: profiles
     // under their account XUID, everything else under machine XUID 0. Returns X_STATUS
     // (0 == success). Blocking VFS walk -- MUST be called off the main thread.
-    public native int install_content(String srcPath, String contentRoot);
+    // saveXuid: hex XUID of the profile signed in to slot 0; saved-game packages go
+    // under it (empty = machine XUID 0).
+    public native int install_content(String srcPath, String contentRoot, String saveXuid);
     public native DiscContentItem[] list_disc_content(String discPath);
     public native int install_disc_content(String discPath, String innerPath,
                                            String contentRoot, String scratchDir);

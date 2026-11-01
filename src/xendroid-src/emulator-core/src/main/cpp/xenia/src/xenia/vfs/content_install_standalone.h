@@ -24,11 +24,14 @@ struct ContentProgress {
 // kernel-free (no Emulator / kernel_state). Placement is content-type aware:
 // profiles go under kDashboardID with the account XUID as the leaf (so
 // ProfileManager discovers them); everything else (DLC, title updates,
-// arcade/GoD) stays under machine XUID 0. Returns X_STATUS (0 == success).
-// Blocking VFS walk -- caller MUST run off the main thread.
+// arcade/GoD) stays under machine XUID 0. Saved games go under save_xuid, the
+// profile signed in to slot 0 (as Emulator::InstallContentPackage does): a game
+// only looks for its saves under the signed-in profile. Returns X_STATUS
+// (0 == success). Blocking VFS walk -- caller MUST run off the main thread.
 X_STATUS InstallContentPackageStandalone(
     const std::filesystem::path& src_path,
-    const std::filesystem::path& content_root, ContentProgress& progress);
+    const std::filesystem::path& content_root, ContentProgress& progress,
+    uint64_t save_xuid = 0);
 
 struct DiscContentItem {
   std::string inner_path;  // path inside the disc image, e.g. \content\...\pkg

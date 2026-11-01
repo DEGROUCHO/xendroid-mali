@@ -17,6 +17,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import xendroid.compose.core.EmulatorRuntime
 import xendroid.compose.core.ContentPaths
+import xendroid.compose.ui.content.saveOwnerXuid
 import java.io.File
 import xendroid.compose.core.GameMetadataSource
 import xendroid.compose.core.ProfileBootstrap
@@ -211,6 +212,23 @@ class GameLibraryViewModel(
             GameMetadataSource().listDiscContent(game.launchUri).filterNot { item ->
                 val titleId = item.titleId ?: return@filterNot false
                 File(ContentPaths.contentDir(titleId, item.contentType), item.displayName)
+                    .exists()
+            }
+        }
+
+    /** Add-on packages (DLC, title updates, saves) for [game]'s title that the scan found in
+     *  the games folder and that are not installed yet. Off-main. */
+    suspend fun uninstalledAddOns(game: Game): List<GameLibraryRepository.AddOn> =
+        withContext(Dispatchers.IO) {
+            val titleId = game.titleId?.takeIf { it.isNotBlank() && it != "00000000" }
+                ?: return@withContext emptyList()
+            val found = repo.addOnsFor(titleId)
+            if (found.isEmpty()) return@withContext emptyList()
+            val saveOwner by lazy { saveOwnerXuid(appContext).ifEmpty { ContentPaths.MACHINE_XUID } }
+            found.filterNot { addOn ->
+                val owner = if (addOn.contentType == ContentPaths.SAVED_GAME_CONTENT_TYPE) saveOwner
+                    else ContentPaths.MACHINE_XUID
+                File(ContentPaths.contentDir(titleId, addOn.contentType, owner), File(addOn.path).name)
                     .exists()
             }
         }

@@ -1,5 +1,6 @@
 package xendroid.compose.ui.library
 
+import xendroid.compose.data.GameLibraryRepository
 import xendroid.compose.l10n
 
 import android.app.Activity
@@ -84,6 +85,7 @@ fun GameLibraryScreen(
     onOpenSaves: (titleId: String, gameName: String) -> Unit,
     onOpenInstallContent: () -> Unit,
     onInstallFromDisc: (String) -> Unit,
+    onInstallPackages: (List<String>) -> Unit,
     compressVm: GameCompressViewModel,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -94,6 +96,10 @@ fun GameLibraryScreen(
     var pendingGame by remember { mutableStateOf<Game?>(null) }
     // A disc whose content is not installed yet; the launch waits on the answer.
     var pendingDiscInstall by remember { mutableStateOf<Pair<Game, Int>?>(null) }
+    // DLC / title updates found next to the game and not installed yet; same question.
+    var pendingAddOns by remember {
+        mutableStateOf<Pair<Game, List<GameLibraryRepository.AddOn>>?>(null)
+    }
     var compressConfirmFor by remember { mutableStateOf<Game?>(null) }
     val compressState by compressVm.state.collectAsStateWithLifecycle()
     val titleIdState by viewModel.titleIdState.collectAsStateWithLifecycle()
@@ -126,8 +132,11 @@ fun GameLibraryScreen(
             // A mandatory-install disc is still bootable, so this asks
             // rather than diverting the launch on its own.
             val pending = viewModel.uninstalledDiscContent(game)
+            val addOns = if (pending.isEmpty()) viewModel.uninstalledAddOns(game) else emptyList()
             if (pending.isNotEmpty()) {
                 pendingDiscInstall = game to pending.size
+            } else if (addOns.isNotEmpty()) {
+                pendingAddOns = game to addOns
             } else {
                 recordLaunch(game)
                 launchGame(context, viewModel, game)
@@ -468,6 +477,43 @@ fun GameLibraryScreen(
             dismissButton = {
                 TextButton(onClick = {
                     pendingDiscInstall = null
+                    recordLaunch(game)
+                    launchGame(context, viewModel, game)
+                }) { Text(l10n("Launch without installing", "Avvia senza installare")) }
+            },
+        )
+    }
+
+    pendingAddOns?.let { (game, addOns) ->
+        AlertDialog(
+            onDismissRequest = { pendingAddOns = null },
+            title = { Text(l10n("Updates and DLC found", "Aggiornamenti e DLC trovati")) },
+            text = {
+                val names = addOns.take(5).joinToString("\n") { "• " + it.name } +
+                    if (addOns.size > 5) "\n…" else ""
+                val intro = if (addOns.size == 1)
+                    l10n("Your games folder has a package for this game that is not installed yet:",
+                         "Nella cartella dei giochi c'è un pacchetto per questo gioco non ancora installato:")
+                else
+                    l10n("Your games folder has ${addOns.size} packages for this game that are not installed yet:",
+                         "Nella cartella dei giochi ci sono ${addOns.size} pacchetti per questo gioco non ancora installati:")
+                Text(intro + "\n\n" + names + "\n\n" +
+                     l10n("Install now? Then start the game again to use it.",
+                          "Vuoi installarlo adesso? Poi riavvia il gioco per usarlo.").let {
+                         if (addOns.size == 1) it
+                         else l10n("Install them now? Then start the game again to use them.",
+                                   "Vuoi installarli adesso? Poi riavvia il gioco per usarli.")
+                     })
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingAddOns = null
+                    onInstallPackages(addOns.map { it.path })
+                }) { Text(l10n("Install", "Installa")) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    pendingAddOns = null
                     recordLaunch(game)
                     launchGame(context, viewModel, game)
                 }) { Text(l10n("Launch without installing", "Avvia senza installare")) }

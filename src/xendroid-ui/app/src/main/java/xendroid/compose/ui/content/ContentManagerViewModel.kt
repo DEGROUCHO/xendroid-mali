@@ -163,7 +163,7 @@ class ContentManagerViewModel(
         }
         val status = withContext(Dispatchers.IO) {
             val emu = EmulatorRuntime.emulator ?: return@withContext -1
-            emu.install_content(srcPath, ContentPaths.contentRoot().absolutePath)
+            emu.install_content(srcPath, ContentPaths.contentRoot().absolutePath, saveOwnerXuid(appContext))
         }
         poll.cancel()
         if (status == 0) {

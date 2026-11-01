@@ -52,6 +52,36 @@ class InstallContentViewModel(
         }
     }
 
+    /** Installs packages found next to a game one after the other; one path is the plain
+     *  [install] flow. Already installed ones are skipped; stops at the first failure. */
+    fun installAll(paths: List<String>) {
+        if (paths.size == 1) { install(paths[0]); return }
+        viewModelScope.launch {
+            var installed = 0
+            for (path in paths) {
+                _state.value = ContentInstallState.Busy(l10n("Preparing…", "Preparazione…"))
+                when (val pre = withContext(Dispatchers.IO) { validate(path) }) {
+                    is PreCheck.Ok -> if (runInstall(path, pre.name, pre.label)) installed++ else {
+                        val failed = _state.value as? ContentInstallState.Failed
+                        _state.value = ContentInstallState.Failed(
+                            l10n("Installed $installed of ${paths.size}. ", "Installati $installed di ${paths.size}. ") +
+                                (failed?.message ?: ""))
+                        return@launch
+                    }
+                    is PreCheck.Reject -> {
+                        _state.value = ContentInstallState.Failed(
+                            l10n("Installed $installed of ${paths.size}. ", "Installati $installed di ${paths.size}. ") + pre.message)
+                        return@launch
+                    }
+                    else -> {}  // already installed, or not add-on content
+                }
+            }
+            _state.value = ContentInstallState.Done(
+                l10n("Installed $installed package(s). Start the game again to use them.",
+                     "Installati $installed pacchetti. Riavvia il gioco per usarli."))
+        }
+    }
+
     fun confirmOverwrite(srcPath: String, name: String) = viewModelScope.launch {
         val header = withContext(Dispatchers.IO) {
             EmulatorRuntime.ensureLoaded(); metadata.readContentHeader(srcPath)
@@ -107,7 +137,9 @@ class InstallContentViewModel(
         if (meta.contentType == ContentPaths.PROFILE_CONTENT_TYPE)
             return PreCheck.Ok(name, label)
         if (meta.titleId == null) return PreCheck.Ok(name, label)
-        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType), src.name)
+        val owner = if (meta.contentType == ContentPaths.SAVED_GAME_CONTENT_TYPE)
+            saveOwnerXuid(appContext).ifEmpty { ContentPaths.MACHINE_XUID } else ContentPaths.MACHINE_XUID
+        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType, owner), src.name)
         return if (pkgDir.exists()) PreCheck.Overwrite(name) else PreCheck.Ok(name, label)
     }
 
@@ -177,7 +209,7 @@ class InstallContentViewModel(
     private suspend fun gamesDirOrNull(): File? =
         prefs.gameDirPath.firstOrNull()?.takeIf { it.isNotBlank() }?.let { File(it) }
 
-    private suspend fun runInstall(srcPath: String, name: String, label: String?) {
+    private suspend fun runInstall(srcPath: String, name: String, label: String?): Boolean {
         _state.value = ContentInstallState.Busy(l10n("Installing…", "Installazione…"), 0f)
         // Poll native install progress while the VFS walk blocks an IO thread (the
         // getter reads file-static atomics, so concurrent reads are safe).
@@ -192,7 +224,7 @@ class InstallContentViewModel(
         }
         val status = withContext(Dispatchers.IO) {
             val emu = EmulatorRuntime.emulator ?: return@withContext -1
-            emu.install_content(srcPath, ContentPaths.contentRoot().absolutePath)
+            emu.install_content(srcPath, ContentPaths.contentRoot().absolutePath, saveOwnerXuid(appContext))
         }
         poll.cancel()
         if (status == 0) {
@@ -202,6 +234,7 @@ class InstallContentViewModel(
         } else {
             _state.value = ContentInstallState.Failed(installReasonFor(status))
         }
+        return status == 0
     }
 
     /** Copy a full-game container into the games folder so the library scan picks it up.

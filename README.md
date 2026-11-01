@@ -40,7 +40,7 @@
 </p>
 
 > [!NOTE]
-> **New in q651:** **WWE 2K14 is playable**: matches start and run at 39–43 fps, with savestates. **Game patches** work again: the app ships the full community patch catalog, and you can **import** your own `.patch.toml` from the game's Patches screen. Less **audio crackle** when a game runs slightly behind. [Download](../../releases/latest)
+> **New in q652:** **DLC and title updates just work**: put them next to your games and the app offers to install them when you start the game. Imported **saves** now go to your profile, where games find them. Since q651: **WWE 2K14 is playable**, the full **community patch catalog** is built in (with **Import** for your own `.patch.toml`), and less **audio crackle**. [Download](../../releases/latest)
 
 <br>
 
@@ -283,6 +283,7 @@ Verified in Black Ops, Dante's Inferno, Halo: Reach and GTA IV.
 - [x] Bilingual interface (English / Italian)
 - [x] Halo: Reach steady at its 30 fps cap
 - [x] Game patches: built-in community catalog and manual import
+- [x] DLC and title updates: install from the games folder or the Content tab
 - [ ] **60 fps** in Black Ops and GTA IV: needs ≤16.6 ms per frame on both GPU and CPU
 - [ ] Keep the depth buffer across color changes (subpasses): Reach's biggest bandwidth lever
 - [ ] Find the root cause of the bindless-texture GPU faults on Mali r49p1
@@ -316,6 +317,14 @@ See the <a href="#-game-compatibility">compatibility table</a>: six games measur
 <br>
 In the library, open the game's options → <b>Game patches</b>. The app ships the whole <a href="https://github.com/xenia-canary/game-patches">community patch catalog</a>, so most games already list their patches there: switch on the ones you want, and they apply the next time the game starts. A patch only applies when it matches your game version (title update), so a game can show more than one block.<br><br>
 Have a <code>.patch.toml</code> that is not in the catalog? Tap <b>Import</b> on the same screen and pick the file. It must belong to that game (same title ID, the 8 characters at the start of the file name and in its <code>title_id</code> line). The app checks it and copies it next to the others.
+</details>
+
+<details>
+<summary><b>How do I install DLC, title updates or saves?</b></summary>
+<br>
+The easy way: <b>put the files in your games folder</b>, next to the game. When you start the game, the app lists the DLC and updates for it that are not installed yet and offers to <b>Install</b> them. Start the game again and they are active.<br><br>
+Or by hand: the <b>Content</b> tab of the library opens a file picker. It takes any Xbox 360 content package (<code>CON</code>, <code>LIVE</code> or <code>PIRS</code>: DLC, title updates, saves, profiles, arcade games). To see or remove what a game has installed, open the game's options → <b>Manage content</b>.<br><br>
+Title updates apply the next time the game starts: Halo: Reach shows version 1.1 in the corner of its menu after TU1, for example. Saves go to the signed-in profile, which is where games look for them.
 </details>
 
 <details>
@@ -392,7 +401,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 1 Nov 2026 | q636.1 | New library: covers and themes for every game; one-tap FPS limit; clearer statistics; library loads in ~1 s |
 | 1 Nov 2026 | q636.2 | One swipe = one game in the library |
 | 1 Nov 2026 | q646 | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
-| 1 Nov 2026 | **q651** | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
+| 1 Nov 2026 | q651 | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
+| 1 Nov 2026 | **q652** | DLC and title updates found next to a game are offered for install; imported saves go to the signed-in profile |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

@@ -1287,15 +1287,27 @@ static jfloat j_installProgress(JNIEnv* env, jobject self) {
 #endif
 }
 
-// public native int install_content(String srcPath, String contentRoot);
+#if XE_PLATFORM_xendroid
+static bool parse_xuid_hex(const char* s, uint64_t& out);
+#endif
+
+// public native int install_content(String srcPath, String contentRoot, String saveXuid);
 // Extract an STFS/SVOD package into contentRoot. The standalone helper places it
-// by content type: profiles under their account XUID, everything else under XUID
-// 0. Returns X_STATUS (0 == success). Blocking VFS walk -- off the main thread.
+// by content type: profiles under their account XUID, saved games under saveXuid
+// (the profile signed in to slot 0, hex; empty = XUID 0), everything else under
+// XUID 0. Returns X_STATUS (0 == success). Blocking VFS walk -- off the main thread.
 static jint j_install_content(JNIEnv* env, jobject self, jstring srcPath,
-                              jstring contentRoot) {
+                              jstring contentRoot, jstring saveXuid) {
 #if XE_PLATFORM_xendroid
     using namespace xe;  // X_STATUS (xbox.h) so the X_STATUS_* macros resolve.
     if (!srcPath || !contentRoot) return (jint)X_STATUS_INVALID_PARAMETER;
+
+    uint64_t save_xuid = 0;
+    if (saveXuid) {
+        const char* sx = env->GetStringUTFChars(saveXuid, nullptr);
+        if (!parse_xuid_hex(sx, save_xuid)) save_xuid = 0;
+        env->ReleaseStringUTFChars(saveXuid, sx);
+    }
 
     const char* sp = env->GetStringUTFChars(srcPath, nullptr);
     const char* cr = env->GetStringUTFChars(contentRoot, nullptr);
@@ -1307,7 +1319,7 @@ static jint j_install_content(JNIEnv* env, jobject self, jstring srcPath,
     g_content_progress.current.store(0);
     g_content_progress.total.store(0);
     xe::X_STATUS s = xe::vfs::InstallContentPackageStandalone(
-            src, root, g_content_progress);
+            src, root, g_content_progress, save_xuid);
     return (jint)s;
 #else
     return (jint)X_STATUS_UNSUCCESSFUL;
@@ -1850,7 +1862,7 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"set_show_touch_overlay", "(Z)V", (void *) j_set_show_touch_overlay}
             ,{"compressIsoToZar", "(Ljava/lang/String;Ljava/lang/String;)I", (void *) j_compressIsoToZar}
             ,{"compressProgress", "()F", (void *) j_compressProgress}
-            ,{"install_content", "(Ljava/lang/String;Ljava/lang/String;)I", (void *) j_install_content}
+            ,{"install_content", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", (void *) j_install_content}
             ,{"list_disc_content", "(Ljava/lang/String;)[Lxendroid/compose/Emulator$DiscContentItem;", (void *) j_list_disc_content}
             ,{"install_disc_content", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", (void *) j_install_disc_content}
             ,{"installProgress", "()F", (void *) j_installProgress}

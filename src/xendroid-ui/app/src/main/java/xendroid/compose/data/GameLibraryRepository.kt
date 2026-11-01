@@ -40,6 +40,18 @@ class GameLibraryRepository(
     private var xexExtractions = 0
     private var xexExtractionMs = 0L
 
+    /** An add-on package (DLC, title update, save) found in the games folder. */
+    data class AddOn(val path: String, val titleId: String, val contentType: Int, val name: String)
+
+    // Add-ons the last full scan found; replaced as a whole when a scan ends. Only the scan
+    // (under scanMutex) writes scanAddOns.
+    @Volatile private var foundAddOns: List<AddOn> = emptyList()
+    private val scanAddOns = ArrayList<AddOn>()
+
+    /** Add-on packages for [titleId] that the last scan found in the games folder. */
+    fun addOnsFor(titleId: String): List<AddOn> =
+        foundAddOns.filter { it.titleId.equals(titleId, ignoreCase = true) }
+
     sealed interface ScanResult {
         data object NoFolder : ScanResult
         data object PermissionLost : ScanResult
@@ -183,7 +195,9 @@ class GameLibraryRepository(
         val games = ArrayList<Game>()
         val visited = HashSet<String>()
         canonicalOf(root)?.let { visited.add(it) }
+        scanAddOns.clear()
         collectGames(children, depth = 1, visited, games)
+        foundAddOns = scanAddOns.toList()
         val t2 = SystemClock.elapsedRealtime()
         games.sortBy { it.name.lowercase() }
         metadataCache.retainOnly(games.mapTo(HashSet()) { it.launchUri })
@@ -277,9 +291,39 @@ class GameLibraryRepository(
                 }
             }
             GameFormat.GOD -> classifyExtensionless(child, name)
-            GameFormat.STFS, GameFormat.XEX_FOLDER, null -> null
+            // Title updates come named like "TU_xxx.0000000000084". Only such names are
+            // opened: reading every pdf and photo of a Download folder took 12 s per scan.
+            null -> {
+                if (looksLikePackageName(name) && hasContentMagic(child)) {
+                    metadata.readContentHeader(child.absolutePath)?.let { noteAddOn(child.absolutePath, name, it) }
+                }
+                null
+            }
+            GameFormat.STFS, GameFormat.XEX_FOLDER -> null
         }
     }
+
+    /** Players put DLC and title updates next to the game: remember them so launching the
+     *  game can offer to install them. */
+    private fun noteAddOn(path: String, name: String, header: GameMetadataSource.ContentMeta) {
+        val titleId = header.titleId ?: return
+        if (!ContentPaths.isAddOnType(header.contentType)) return
+        scanAddOns.add(AddOn(path, titleId, header.contentType, header.displayName.ifBlank { name }))
+    }
+
+    /** A title update's name ("TU_..."), or an all-hex extension as packages carry. */
+    private fun looksLikePackageName(name: String): Boolean {
+        if (name.startsWith("TU", ignoreCase = true)) return true
+        val ext = name.substringAfterLast('.')
+        return ext.isNotEmpty() && ext.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+    }
+
+    /** CON / LIVE / PIRS: the first four bytes of every Xbox 360 content package. */
+    private fun hasContentMagic(file: File): Boolean = runCatching {
+        val magic = ByteArray(4)
+        file.inputStream().use { if (it.read(magic) != 4) return@runCatching false }
+        String(magic, Charsets.US_ASCII) in setOf("CON ", "LIVE", "PIRS")
+    }.getOrDefault(false)
 
     /** An extensionless file: a GOD container, an STFS launchable-game container, or neither.
      *  Distinguishes "not a game" (null) from a cache miss, and carries the format through the
@@ -296,7 +340,10 @@ class GameLibraryRepository(
         // reader parses it happily and would publish it as a game. An unreadable header is not
         // a rejection - it only means the type is unknown, so those still fall through.
         val header = metadata.readContentHeader(path)
-        if (header != null && !ContentPaths.isLaunchableGameType(header.contentType)) return null
+        if (header != null && !ContentPaths.isLaunchableGameType(header.contentType)) {
+            noteAddOn(path, name, header)
+            return null
+        }
         metadata.readGodPath(path)?.let { meta ->
             val displayName = meta.name.ifEmpty { name }
             val iconName = meta.iconPng?.let { iconCache.write(path, it) }

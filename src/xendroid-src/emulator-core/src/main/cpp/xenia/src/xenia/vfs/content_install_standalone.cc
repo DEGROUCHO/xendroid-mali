@@ -25,7 +25,8 @@ namespace vfs {
 
 X_STATUS InstallContentPackageStandalone(
     const std::filesystem::path& src_path,
-    const std::filesystem::path& content_root, ContentProgress& progress) {
+    const std::filesystem::path& content_root, ContentProgress& progress,
+    uint64_t save_xuid) {
   progress.current.store(0);
   progress.total.store(0);
 
@@ -46,6 +47,8 @@ X_STATUS InstallContentPackageStandalone(
   // Placement is content-type aware so xenia's runtime resolver / ProfileManager
   // find the package. Profiles land under kDashboardID/00010000 with the account
   // XUID as the leaf (ProfileManager scans for that path, no .header sidecar).
+  // Saved games go under the signed-in profile, where the game looks for them
+  // (under XUID 0 an imported save, a PES option file say, is never found).
   // Everything else -- DLC, title updates, arcade/GoD -- lives under machine
   // XUID 0, which is where the per-game manager lists + deletes it.
   uint64_t xuid;
@@ -62,7 +65,9 @@ X_STATUS InstallContentPackageStandalone(
     leaf = fmt::format("{:016X}", pkg_xuid);
     write_header = false;
   } else {
-    xuid = 0ull;
+    xuid = content_type == static_cast<uint32_t>(XContentType::kSavedGame)
+               ? save_xuid
+               : 0ull;
     place_title_id = device->title_id();
     leaf = src_path.filename().string();
     write_header = true;

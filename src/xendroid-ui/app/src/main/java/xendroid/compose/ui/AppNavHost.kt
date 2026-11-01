@@ -105,6 +105,10 @@ fun AppNavHost(container: AppContainer) {
                 onInstallFromDisc = { path ->
                     navigateOnce("${Routes.INSTALL_CONTENT}?src=" + Uri.encode(path))
                 },
+                // Several packages travel as one newline-separated src.
+                onInstallPackages = { paths ->
+                    navigateOnce("${Routes.INSTALL_CONTENT}?src=" + Uri.encode(paths.joinToString("\n")))
+                },
             )
         }
         composable(Routes.SETTINGS) { entry ->

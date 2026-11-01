@@ -14,6 +14,7 @@
   <img src="https://img.shields.io/badge/API-Vulkan-ac162c?style=flat-square&logo=vulkan&logoColor=white" alt="Vulkan">
   <img src="https://img.shields.io/badge/GPU-Arm%20Mali-0091bd?style=flat-square&logo=arm&logoColor=white" alt="Arm Mali">
   <img src="https://img.shields.io/badge/SoC-MediaTek%20Dimensity-ec9430?style=flat-square" alt="MediaTek Dimensity">
+  <img src="https://img.shields.io/badge/runs%20on-POCO%20X7%20Pro%20%7C%20X8%20Pro-ff6900?style=flat-square" alt="Runs on POCO X7 Pro and POCO X8 Pro">
   <img src="https://img.shields.io/badge/UI-English%20%7C%20Italiano-555?style=flat-square" alt="English / Italiano">
 </p>
 
@@ -93,8 +94,25 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Halo: Reach | ✅ Playable | 26–30 | Savestates |
 | Forza Horizon | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 | Forza Horizon 2 | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
+| Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
+| Midnight Club: Los Angeles | 🟡 Runs | ~21 | Steady while driving, no graphical glitches; slower after long sessions · player report [#1](../../issues/1) |
+| WWE 2K14 | ❌ Crashes | – | Menus work; crashes as a match starts · player report [#3](../../issues/3) |
 
-<sub>✅ measured in gameplay · 🟡 boots and plays below 30 fps · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
+<sub>✅ playable · 🟡 boots and plays below 30 fps · ❌ does not reach gameplay · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
+
+<a id="player-screenshots"></a>
+### 📸 From the community
+
+<table>
+  <tr>
+    <td colspan="2"><img src="docs/media/metal-gear-rising-2.jpg" alt="Metal Gear Rising: Revengeance, Metal Gear RAY boss fight"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/metal-gear-rising-1.jpg" alt="Metal Gear Rising: Revengeance, sword combat"></td>
+    <td width="50%"><img src="docs/media/metal-gear-rising-3.jpg" alt="Metal Gear Rising: Revengeance, city street"></td>
+  </tr>
+</table>
+<p align="center"><sub><b>Metal Gear Rising: Revengeance</b> on a POCO X7 Pro with build q636.2, 30–40 fps in the statistics box. Shared by <b>Arist0710</b> in <a href="../../issues/2">#2</a>. Thank you!</sub></p>
 
 <br>
 

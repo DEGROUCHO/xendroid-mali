@@ -2161,6 +2161,10 @@ bool GuestScheduler::BeginSnapshot(std::chrono::milliseconds timeout,
     for (auto& ref : threads) {
       auto* thread = ref.get();
       if (!thread->is_guest_thread()) continue;
+      // An exited thread whose handle the game still holds (WWE 2K14 keeps
+      // one): nothing to park, and XThread::Save/Restore store it without a
+      // context and never restart it.
+      if (!thread->is_running()) continue;
       auto& links = thread->scheduler_links();
       // A native frame cannot be recreated from PPC context alone.
       if (!thread->fiber()) {
@@ -2197,7 +2201,7 @@ bool GuestScheduler::BeginSnapshot(std::chrono::milliseconds timeout,
     }
     for (auto& ref : threads) {
       auto* thread = ref.get();
-      if (!thread->is_guest_thread()) continue;
+      if (!thread->is_guest_thread() || !thread->is_running()) continue;
       thread->Retain();
       snapshot_threads_.push_back(thread);
       thread->scheduler_links().snapshot_pc = 0;
@@ -2221,6 +2225,8 @@ bool GuestScheduler::BeginSnapshot(std::chrono::milliseconds timeout,
       std::lock_guard<std::mutex> guard(lock_);
       for (auto* thread : snapshot_threads_) {
         auto& links = thread->scheduler_links();
+        // Exited while parking: like the ones skipped above.
+        if (!thread->is_running() && !links.running) continue;
         if (links.running) {
           all = false;
           thread->thread_state()->context()->preempt_requested = 1;
@@ -2257,7 +2263,7 @@ bool GuestScheduler::BeginSnapshot(std::chrono::milliseconds timeout,
       size_t guest_count = 0;
       bool unknown = false;
       for (auto& ref : current) {
-        if (!ref->is_guest_thread()) continue;
+        if (!ref->is_guest_thread() || !ref->is_running()) continue;
         ++guest_count;
         if (std::find(snapshot_threads_.begin(), snapshot_threads_.end(),
                       ref.get()) == snapshot_threads_.end()) {

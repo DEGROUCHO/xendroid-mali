@@ -43,6 +43,12 @@ static const Quirk kQuirks[] = {
     // single-sample storage turns all lit geometry into per-pixel noise.
     {0x4D53085B, "vulkan_msaa_single_sample_storage", false,
      "per-sample data in 4x surfaces"},
+    // WWE 2K14 checks that a ranged physical allocation starts exactly at the
+    // low end of the range it asked for; with the 4 KiB offset it crashes as a
+    // match starts (menus work). Same fix as xenia-canary's compatibility
+    // report for this title.
+    {0x545408B2, "ignore_offset_for_ranged_allocations", true,
+     "crash as a match starts"},
     // No vulkan_bindless_textures for GTA IV: with it Mali raises ~15 GPU
     // faults a second (GROUP_ERROR_FATAL, translation faults; the MediaTek
     // driver recreates the queue), shown as black frames and swapchain

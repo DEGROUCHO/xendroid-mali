@@ -1,0 +1,3 @@
+[submodule "src/xendroid-ui/patches/xenia-canary"]
+	path = src/xendroid-ui/patches/xenia-canary
+	url = https://github.com/xenia-canary/game-patches

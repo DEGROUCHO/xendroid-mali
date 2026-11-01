@@ -41,6 +41,30 @@ class GamePatchesViewModel(
         }
     }
 
+    /** Result of the last [importPatch], for a one-shot message; null once shown. */
+    sealed interface ImportResult {
+        data class Added(val file: PatchFile, val forThisGame: Boolean) : ImportResult
+        data object Invalid : ImportResult
+    }
+
+    private val _importResult = MutableStateFlow<ImportResult?>(null)
+    val importResult: StateFlow<ImportResult?> = _importResult.asStateFlow()
+
+    /** Saves a picked .patch.toml (its display name and text) and reloads the list. */
+    fun importPatch(pickedName: String, text: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val file = text?.let { runCatching { store.import(pickedName, it) }.getOrNull() }
+            _importResult.value = if (file == null) {
+                ImportResult.Invalid
+            } else {
+                ImportResult.Added(file, file.titleId.equals(titleId, ignoreCase = true))
+            }
+            _state.value = compute()
+        }
+    }
+
+    fun importResultShown() { _importResult.value = null }
+
     private fun compute(): UiState = runCatching {
         val files = store.patchesForTitle(titleId)
         if (files.isEmpty()) UiState.Empty else UiState.Loaded(files)

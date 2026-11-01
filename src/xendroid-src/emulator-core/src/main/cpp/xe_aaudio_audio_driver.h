@@ -9,12 +9,12 @@
 #ifndef XENDROID_XE_AAUDIO_AUDIO_DRIVER_H
 #define XENDROID_XE_AAUDIO_AUDIO_DRIVER_H
 
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <vector>
 #include <condition_variable>
 #include <mutex>
-#include <queue>
-#include <stack>
 #include <thread>
 
 #include <aaudio/AAudio.h>
@@ -98,9 +98,50 @@ class AAudioAudioDriver : public AudioDriver {
   const uint32_t channel_samples_;
   const uint32_t submit_samples_;
   const uint32_t host_block_samples_;
-  std::queue<float*> frames_queued_ = {};
-  std::stack<float*> frames_unused_ = {};
-  std::mutex frames_mutex_ = {};
+  // Lock-free single-producer single-consumer ring of frame buffers: the
+  // realtime callback must never wait on a mutex the audio worker holds
+  // (priority inversion is an xrun, an audible crackle).
+  class FrameRing {
+   public:
+    static constexpr uint32_t kSize = 64;
+    bool Push(float* frame) {
+      const uint32_t tail = tail_.load(std::memory_order_relaxed);
+      if (tail - head_.load(std::memory_order_acquire) >= kSize) {
+        return false;
+      }
+      slots_[tail % kSize] = frame;
+      tail_.store(tail + 1, std::memory_order_release);
+      return true;
+    }
+    float* Pop() {
+      const uint32_t head = head_.load(std::memory_order_relaxed);
+      if (head == tail_.load(std::memory_order_acquire)) {
+        return nullptr;
+      }
+      float* frame = slots_[head % kSize];
+      head_.store(head + 1, std::memory_order_release);
+      return frame;
+    }
+    uint32_t Size() const {
+      return tail_.load(std::memory_order_acquire) -
+             head_.load(std::memory_order_acquire);
+    }
+
+   private:
+    std::array<float*, kSize> slots_ = {};
+    std::atomic<uint32_t> head_{0};
+    std::atomic<uint32_t> tail_{0};
+  };
+  // Producer SubmitFrame, consumer the callback.
+  FrameRing frames_queued_;
+  // Producer the callback, consumer SubmitFrame.
+  FrameRing frames_unused_;
+
+  // apu_dump_pcm: the submitted guest frames, raw, for offline analysis.
+  // Producer (SubmitFrame) thread only.
+  FILE* dump_file_ = nullptr;
+  uint64_t dump_bytes_ = 0;
+  bool dump_done_ = false;
 
   // Underrun concealment: silence would put a step at both edges of every
   // gap, a ~187Hz click train at a 5.3ms block. Callback thread only.
@@ -112,6 +153,11 @@ class AAudioAudioDriver : public AudioDriver {
   uint32_t gap_blocks_ = 0;
 
   bool fade_in_pending_ = false;
+  // Jitter buffer: after an underrun (and at start) play silence until the
+  // queue holds apu_aaudio_rebuffer_blocks again, then fade back in. A guest
+  // slightly below real time then gives a rare short gap instead of a gap
+  // every few blocks (crackle). Callback thread only.
+  bool rebuffering_ = true;
 
   // Rate control state; callback thread only.
   float rate_ = 1.0f;
@@ -131,6 +177,7 @@ class AAudioAudioDriver : public AudioDriver {
   // atomics only, nothing that could block the callback.
   std::atomic<uint64_t> stat_callbacks_{0};
   std::atomic<uint64_t> stat_gaps_{0};
+  std::atomic<uint64_t> stat_rebuffers_{0};
   std::atomic<uint64_t> stat_queue_depth_sum_{0};
   std::atomic<uint32_t> stat_queue_depth_max_{0};
   // A block size we did not ask for silently changes the drain rate.

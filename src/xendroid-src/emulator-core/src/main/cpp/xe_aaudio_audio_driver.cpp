@@ -31,6 +31,20 @@ DEFINE_bool(apu_aaudio_dynamic_rate, true,
             "Slow playback toward 0.9x as the audio queue drains, so a guest "
             "that cannot keep real time bends pitch instead of popping.",
             "APU");
+DEFINE_uint32(
+    apu_aaudio_rebuffer_blocks, 3,
+    "After the audio queue runs dry (and at start), play silence until this "
+    "many guest blocks (5.3 ms each) are queued again, then fade back in. "
+    "0 restores the old per-block concealment, which turns a guest slightly "
+    "below real time into a click every few blocks.",
+    "APU");
+DEFINE_string(apu_dump_pcm, "",
+              "Debug: write every submitted guest audio frame, raw, to this "
+              "file (16-byte header XPCM, channels, rate, samples per channel; "
+              "then the frames as the guest gave them: 5.1 sequential big "
+              "endian float for games, interleaved stereo for the media "
+              "player). Stops at 256 MB.",
+              "APU");
 DEFINE_bool(apu_aaudio_log_stats, false,
             "Log Android audio callback statistics (gaps, queue depth, "
             "underruns) once a second.",
@@ -43,7 +57,8 @@ namespace aaudio {
 static constexpr uint32_t kStatsIntervalMs = 1000;
 
 // Sink depth, in blocks, below which playback slows to buy the producer time.
-static constexpr uint32_t kRateControlDepth = 3;
+// Just above apu_aaudio_rebuffer_blocks, so a refilled queue is held there.
+static constexpr uint32_t kRateControlDepth = 4;
 
 AAudioAudioDriver::AAudioAudioDriver(Memory* memory,
                                      xe::threading::Semaphore* semaphore,
@@ -62,17 +77,13 @@ AAudioAudioDriver::AAudioAudioDriver(Memory* memory,
 }
 
 AAudioAudioDriver::~AAudioAudioDriver() {
-  assert_true(frames_queued_.empty());
-  assert_true(frames_unused_.empty());
+  assert_true(!frames_queued_.Size());
+  assert_true(!frames_unused_.Size());
 }
 
 bool AAudioAudioDriver::Initialize() {
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    for (int i = 0; i < 2; i++) {
-      float* buffer = new float[submit_samples_];
-      frames_unused_.push(buffer);
-    }
+  for (int i = 0; i < 2; i++) {
+    frames_unused_.Push(new float[submit_samples_]);
   }
 
   {
@@ -179,6 +190,7 @@ void AAudioAudioDriver::Resume() {
   rate_ = 1.0f;
   conceal_gain_ = 1.0f;
   gap_blocks_ = 0;
+  rebuffering_ = true;
   stat_rate_milli_.store(1000, std::memory_order_relaxed);
   if (stream_initialized_ && stream_) {
     AAudioStream_requestStart(stream_);
@@ -186,8 +198,7 @@ void AAudioAudioDriver::Resume() {
 }
 
 size_t AAudioAudioDriver::GetQueuedFrameCount() {
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  return frames_queued_.size();
+  return frames_queued_.Size();
 }
 
 void AAudioAudioDriver::SetVolume(float volume) {
@@ -218,11 +229,7 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
 
   // Queue depth steers the resample rate, slewed to avoid zipper noise: a
   // producer below real time bends pitch instead of gapping.
-  uint32_t depth_now;
-  {
-    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-    depth_now = static_cast<uint32_t>(driver->frames_queued_.size());
-  }
+  const uint32_t depth_now = driver->frames_queued_.Size();
   // Only once the sink is close to running dry, and always below the depth the
   // producer refills to (AudioSystem's top-up line) - bending pitch at a depth
   // the producer is content with leaves the rate permanently modulated.
@@ -274,23 +281,23 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
 }
 
 void AAudioAudioDriver::LoadNextBlock(uint32_t& releases, bool& gapped) {
-  float* buffer = nullptr;
-  uint32_t depth = 0;
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    depth = static_cast<uint32_t>(frames_queued_.size());
-    if (!frames_queued_.empty()) {
-      buffer = frames_queued_.front();
-      frames_queued_.pop();
-    }
-  }
+  const uint32_t depth = frames_queued_.Size();
   stat_queue_depth_sum_.fetch_add(depth, std::memory_order_relaxed);
   if (depth > stat_queue_depth_max_.load(std::memory_order_relaxed)) {
     stat_queue_depth_max_.store(depth, std::memory_order_relaxed);
   }
+  const uint32_t rebuffer = cvars::apu_aaudio_rebuffer_blocks;
+  if (rebuffering_ && depth >= std::max(rebuffer, 1u)) {
+    rebuffering_ = false;
+  }
+  float* buffer = rebuffering_ ? nullptr : frames_queued_.Pop();
   if (!buffer) {
     stat_gaps_.fetch_add(1, std::memory_order_relaxed);
     gapped = true;
+    if (rebuffer && !rebuffering_) {
+      stat_rebuffers_.fetch_add(1, std::memory_order_relaxed);
+      rebuffering_ = true;
+    }
     ConcealNextBlock();
     last_block_pos_ = 0;
     return;
@@ -309,10 +316,8 @@ void AAudioAudioDriver::LoadNextBlock(uint32_t& releases, bool& gapped) {
   last_block_pos_ = 0;
   gap_blocks_ = 0;
   conceal_gain_ = 1.0f;
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    frames_unused_.push(buffer);
-  }
+  // Cannot fail: the ring holds every buffer ever allocated (SubmitFrame).
+  frames_unused_.Push(buffer);
   ++releases;
 }
 
@@ -320,6 +325,22 @@ void AAudioAudioDriver::ConcealNextBlock() {
   // Nothing to repeat yet: startup, or straight after a mute.
   if (!last_block_valid_) {
     std::memset(last_block_.data(), 0, host_block_samples_ * sizeof(float));
+    return;
+  }
+
+  // Jitter buffer on: fade the last block out once, then silence until the
+  // queue has refilled - no repeated block, so no buzz at the block rate.
+  if (cvars::apu_aaudio_rebuffer_blocks) {
+    const int32_t frames = static_cast<int32_t>(channel_samples_);
+    for (int32_t f = 0; f < frames; ++f) {
+      const float g = 1.0f - static_cast<float>(f + 1) / frames;
+      last_block_[f * 2 + 0] *= g;
+      last_block_[f * 2 + 1] *= g;
+    }
+    // The faded block is played once; then plain silence.
+    last_block_valid_ = false;
+    gap_blocks_++;
+    fade_in_pending_ = true;
     return;
   }
 
@@ -351,13 +372,18 @@ void AAudioAudioDriver::ApplyGainAndClamp() {
 
   // The 5.1->2.0 fold peaks at ~2.9 gain, so loud content (gunfire,
   // explosions) exceeds full scale, and hard clipping it sounds like blown
-  // speakers. Limit instead: the gain drops at once to keep the block peak at
-  // kLimit and recovers over ~100 ms, ramped across the block so it doesn't
-  // zipper; the residual overshoot of the ramp start is soft-clipped. Content
-  // below kLimit passes untouched. Count the samples that were over full
+  // speakers. Limit instead: the gain drops within 32 frames to keep the block
+  // peak at kLimit and recovers over ~100 ms, ramped across the block so it
+  // doesn't zipper; the residual overshoot of the attack is soft-clipped.
+  // Content below kLimit passes untouched. Count the samples that were over full
   // scale before limiting.
   constexpr float kLimit = 0.89f;
-  constexpr float kKnee = 0.8f;
+  // Above kLimit: only the attack ramp's overshoot reaches the soft clip, so
+  // loud content below the limit is not saturated (that was audible as grit).
+  constexpr float kKnee = 0.9f;
+  // Gain drops over the first 32 frames instead of across the whole block,
+  // so a peak early in the block is not let through at the old gain.
+  constexpr uint32_t kAttackSamples = 64;
   constexpr float kReleasePerBlock = 0.05f;
   float peak = 0.0f;
   uint32_t clipped = 0;
@@ -371,12 +397,17 @@ void AAudioAudioDriver::ApplyGainAndClamp() {
   limiter_gain_ = wanted < limiter_gain_
                       ? wanted
                       : std::min(wanted, limiter_gain_ + kReleasePerBlock);
-  const float gain_step =
-      (limiter_gain_ - start_gain) / float(std::max(host_block_samples_, 1u));
+  const uint32_t ramp = limiter_gain_ < start_gain
+                            ? std::min(kAttackSamples, host_block_samples_)
+                            : host_block_samples_;
+  const float gain_step = (limiter_gain_ - start_gain) / float(std::max(ramp, 1u));
   float g = start_gain;
   for (uint32_t i = 0; i < host_block_samples_; ++i) {
     float s = last_block_[i] * gain * g;
-    g += gain_step;
+    // Stereo pairs share a gain: step every second sample.
+    if (i < ramp && (i & 1)) {
+      g += 2.0f * gain_step;
+    }
     float a = std::abs(s);
     if (a > kKnee) {
       // Smoothly saturates towards 1.0 instead of a hard corner.
@@ -412,6 +443,8 @@ void AAudioAudioDriver::LogAndResetStats() {
     return;
   }
   const uint64_t gaps = stat_gaps_.exchange(0, std::memory_order_relaxed);
+  const uint64_t rebuffers =
+      stat_rebuffers_.exchange(0, std::memory_order_relaxed);
   const uint64_t depth_sum =
       stat_queue_depth_sum_.exchange(0, std::memory_order_relaxed);
   const uint32_t depth_max =
@@ -430,9 +463,9 @@ void AAudioAudioDriver::LogAndResetStats() {
   }
 
   XELOGI(
-      "AAudio: {} cb, {} gaps ({:.1f}%), queue avg {:.2f} max {}, rate {:.3f}, "
+      "AAudio: {} cb, {} gaps ({:.1f}%), {} rebuffers, queue avg {:.2f} max {}, rate {:.3f}, "
       "xruns {}, clipped {} ({:.3f}%){}",
-      callbacks, gaps, 100.0 * double(gaps) / double(callbacks),
+      callbacks, gaps, 100.0 * double(gaps) / double(callbacks), rebuffers,
       double(depth_sum) / double(callbacks), depth_max,
       stat_rate_milli_.load(std::memory_order_relaxed) / 1000.0, xruns,
       clipped,
@@ -519,22 +552,44 @@ bool AAudioAudioDriver::RestartStream() {
 }
 
 void AAudioAudioDriver::SubmitFrame(float* samples) {
-  float* output_frame;
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    if (frames_unused_.empty()) {
-      output_frame = new float[submit_samples_];
-    } else {
-      output_frame = frames_unused_.top();
-      frames_unused_.pop();
-    }
+  float* output_frame = frames_unused_.Pop();
+  if (!output_frame) {
+    output_frame = new float[submit_samples_];
   }
 
   std::memcpy(output_frame, samples, submit_samples_ * sizeof(float));
 
-  {
-    std::unique_lock<std::mutex> guard(frames_mutex_);
-    frames_queued_.push(output_frame);
+  if (!cvars::apu_dump_pcm.empty() && !dump_done_) {
+    if (!dump_file_) {
+      dump_file_ = std::fopen(cvars::apu_dump_pcm.c_str(), "wb");
+      if (!dump_file_) {
+        XELOGE("AAudio: cannot open apu_dump_pcm {}", cvars::apu_dump_pcm);
+        dump_done_ = true;
+      } else {
+        // Big buffer: the audio worker must not stall on storage.
+        std::setvbuf(dump_file_, nullptr, _IOFBF, 1 << 20);
+        const uint32_t header[4] = {0x4D435058u /* "XPCM" */, frame_channels_,
+                                    frame_frequency_, channel_samples_};
+        std::fwrite(header, sizeof(header), 1, dump_file_);
+      }
+    }
+    if (dump_file_) {
+      std::fwrite(samples, sizeof(float), submit_samples_, dump_file_);
+      dump_bytes_ += submit_samples_ * sizeof(float);
+      if (dump_bytes_ >= (256ull << 20)) {
+        std::fclose(dump_file_);
+        dump_file_ = nullptr;
+        dump_done_ = true;
+        XELOGI("AAudio: apu_dump_pcm complete ({} MB)", dump_bytes_ >> 20);
+      }
+    }
+  }
+
+  if (!frames_queued_.Push(output_frame)) {
+    // Queue full (the worker never queues this deep): drop the frame. Freed
+    // here, not recycled, so at most FrameRing::kSize buffers ever exist and
+    // the callback's push into frames_unused_ cannot fail.
+    delete[] output_frame;
   }
 }
 
@@ -567,15 +622,17 @@ void AAudioAudioDriver::Shutdown() {
     stream_initialized_ = false;
   }
 
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  while (!frames_unused_.empty()) {
-    delete[] frames_unused_.top();
-    frames_unused_.pop();
+  if (dump_file_) {
+    std::fclose(dump_file_);
+    dump_file_ = nullptr;
   }
 
-  while (!frames_queued_.empty()) {
-    delete[] frames_queued_.front();
-    frames_queued_.pop();
+  // The stream is closed: no callback runs any more.
+  while (float* frame = frames_unused_.Pop()) {
+    delete[] frame;
+  }
+  while (float* frame = frames_queued_.Pop()) {
+    delete[] frame;
   }
 }
 

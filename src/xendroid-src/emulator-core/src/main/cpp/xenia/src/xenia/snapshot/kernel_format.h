@@ -50,6 +50,9 @@ enum ThreadResumeKind : uint32_t {
   // Blocked in a restartable kernel wait: resume_pc is the import thunk, the
   // wait is simply executed again with the saved argument registers.
   kResumeReenterExtern = 2,
+  // Already exited, kept alive by handles the title holds: restored as an
+  // object only, never resumed (resume_pc is 0).
+  kResumeExited = 3,
 };
 
 struct KernelSlot {
@@ -531,9 +534,12 @@ struct KernelImage {
           t.stack_limit >= t.stack_base)
         return bad("thread stack/pcr/tls");
       if (t.resume_kind != kResumeCanonicalPc &&
-          t.resume_kind != kResumeReenterExtern)
+          t.resume_kind != kResumeReenterExtern &&
+          t.resume_kind != kResumeExited)
         return bad("thread resume kind");
-      if (!t.resume_pc || (t.resume_pc & 3)) return bad("thread resume pc");
+      if (t.resume_kind == kResumeExited ? t.resume_pc != 0 || t.main_thread
+                                         : !t.resume_pc || (t.resume_pc & 3))
+        return bad("thread resume pc");
       PpcState cpu;
       if (!PpcState::Decode(t.cpu_state, cpu) || cpu.thread_id != t.thread_id)
         return bad("thread cpu state");

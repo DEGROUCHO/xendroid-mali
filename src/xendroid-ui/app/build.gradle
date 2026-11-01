@@ -16,7 +16,17 @@ def syncGamePatches = tasks.register('syncGamePatches', Copy) {
     from("$rootDir/patches/xenia-canary/patches") { include '*.patch.toml' }
 }
 // AGP doesn't honor the assets.srcDir(...).builtBy() hint, so wire the sync in explicitly.
-tasks.named('preBuild').configure { dependsOn(syncGamePatches) }
+// An empty catalog used to ship silently ("No patches included" for every game): fail instead.
+tasks.named('preBuild').configure {
+    dependsOn(syncGamePatches)
+    doFirst {
+        def src = file("$rootDir/patches/xenia-canary/patches")
+        if (!(src.list()?.any { it.endsWith('.patch.toml') })) {
+            throw new GradleException("Game patch catalog missing in $src: run " +
+                "'git submodule update --init src/xendroid-ui/patches/xenia-canary'")
+        }
+    }
+}
 
 android {
     namespace 'xendroid.compose'

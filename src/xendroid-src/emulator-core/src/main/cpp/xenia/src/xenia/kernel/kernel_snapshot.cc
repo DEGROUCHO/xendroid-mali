@@ -247,6 +247,9 @@ bool KernelSnapshot::Capture(KernelState* ks,
 
   std::set<XThread*> barrier(barrier_threads.begin(), barrier_threads.end());
   std::set<XThread*> seen_threads;
+  // Exited threads whose handles the title still holds (WWE 2K14): stored as
+  // objects only, never resumed.
+  std::vector<XThread*> exited_threads;
   std::vector<XObject*> plain_objects;
   {
     auto& table = ks->object_table_;
@@ -285,6 +288,10 @@ bool KernelSnapshot::Capture(KernelState* ks,
           if (!thread->is_guest_thread()) {
             error = "a host thread is registered as a guest object";
             return false;
+          }
+          if (!barrier.count(thread) && !thread->is_running()) {
+            exited_threads.push_back(thread);
+            break;
           }
           if (!barrier.count(thread)) {
             error = fmt::format("guest thread {:08X} is not held by the barrier",
@@ -344,19 +351,7 @@ bool KernelSnapshot::Capture(KernelState* ks,
   }
 
   // Threads.
-  for (XThread* thread : barrier_threads) {
-    auto& links = thread->scheduler_links_;
-    if (thread->reentry_nested_guest_depth_) {
-      error = fmt::format(
-          "thread {:08X} is inside a nested guest call (native frames)",
-          thread->thread_id_);
-      return false;
-    }
-    if (!thread->pending_mutant_acquires_.empty() || !thread->thread_state_) {
-      error = fmt::format("thread {:08X} has not started yet", thread->thread_id_);
-      return false;
-    }
-    KernelThreadRecord record;
+  auto fill_record = [](XThread* thread, KernelThreadRecord& record) {
     record.thread_id = thread->thread_id_;
     record.main_thread = thread->main_thread_ ? 1 : 0;
     record.allocated_guest_object = thread->allocated_guest_object_ ? 1 : 0;
@@ -380,6 +375,21 @@ bool KernelSnapshot::Capture(KernelState* ks,
     record.start_context = thread->creation_params_.start_context;
     record.creation_flags = thread->creation_params_.creation_flags;
     record.guest_process = thread->creation_params_.guest_process;
+  };
+  for (XThread* thread : barrier_threads) {
+    auto& links = thread->scheduler_links_;
+    if (thread->reentry_nested_guest_depth_) {
+      error = fmt::format(
+          "thread {:08X} is inside a nested guest call (native frames)",
+          thread->thread_id_);
+      return false;
+    }
+    if (!thread->pending_mutant_acquires_.empty() || !thread->thread_state_) {
+      error = fmt::format("thread {:08X} has not started yet", thread->thread_id_);
+      return false;
+    }
+    KernelThreadRecord record;
+    fill_record(thread, record);
     if (links.snapshot_parked) {
       record.resume_kind = snapshot::kResumeCanonicalPc;
       record.resume_pc = links.snapshot_pc;
@@ -395,6 +405,28 @@ bool KernelSnapshot::Capture(KernelState* ks,
     }
     record.cpu_state = snapshot::PpcState::Capture(
                            *thread->thread_state_->context(), record.resume_pc)
+                           .Encode();
+    img.threads.push_back(std::move(record));
+  }
+  for (XThread* thread : exited_threads) {
+    if (!thread->thread_state_) {
+      error = fmt::format("exited thread {:08X} has no cpu state",
+                          thread->thread_id_);
+      return false;
+    }
+    KernelThreadRecord record;
+    fill_record(thread, record);
+    record.resume_kind = snapshot::kResumeExited;
+    record.resume_pc = 0;
+    // PpcState needs a valid pc; the start address stands in, never run.
+    const uint32_t placeholder_pc = thread->creation_params_.start_address;
+    if (!placeholder_pc || (placeholder_pc & 3)) {
+      error = fmt::format("exited thread {:08X} has no start address",
+                          thread->thread_id_);
+      return false;
+    }
+    record.cpu_state = snapshot::PpcState::Capture(
+                           *thread->thread_state_->context(), placeholder_pc)
                            .Encode();
     img.threads.push_back(std::move(record));
   }
@@ -812,6 +844,11 @@ bool KernelSnapshot::Restore(KernelState* ks, XThread* fresh_main,
     ks->RegisterThread(thread);
     if (!ApplyThreadRecord(ks, thread, record, error)) {
       return false;
+    }
+    // An exited thread lives on as an object only (running_ stays false):
+    // no fiber, never made ready. Its signaled KTHREAD is in guest memory.
+    if (record.resume_kind == snapshot::kResumeExited) {
+      continue;
     }
     restored.push_back(std::move(holder));
   }

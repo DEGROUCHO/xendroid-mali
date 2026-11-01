@@ -40,7 +40,7 @@
 </p>
 
 > [!NOTE]
-> **New in q646:** Halo: Reach now holds a **steady 30 fps**, its own cap, and stays smooth even when the phone runs hot. Rocks, trees and characters no longer flicker for a frame, in every game. Same app as q636.2: Xbox 360-style library, one-tap FPS limit, clear statistics. [Download](../../releases/latest)
+> **New in q651:** **WWE 2K14 is playable**: matches start and run at 39–43 fps, with savestates. **Game patches** work again: the app ships the full community patch catalog, and you can **import** your own `.patch.toml` from the game's Patches screen. Less **audio crackle** when a game runs slightly behind. [Download](../../releases/latest)
 
 <br>
 
@@ -114,7 +114,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Forza Horizon 2 | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 | Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
 | Midnight Club: Los Angeles | 🟡 Runs | ~21 | Steady while driving, no graphical glitches; slower after long sessions · player report [#1](../../issues/1) |
-| WWE 2K14 | ❌ Crashes | – | Menus work; crashes as a match starts · player report [#3](../../issues/3) |
+| WWE 2K14 | ✅ Playable | 39–43 in the ring | Entrances 24–30 · savestates · [📸 screenshots](#player-screenshots) · fixed after player report [#3](../../issues/3) |
 
 <sub>✅ playable · 🟡 boots and plays below 30 fps · ❌ does not reach gameplay · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
 
@@ -131,6 +131,14 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
   </tr>
 </table>
 <p align="center"><sub><b>Metal Gear Rising: Revengeance</b> on a POCO X7 Pro with build q636.2, 30–40 fps in the statistics box. Shared by <b>Arist0710</b> in <a href="../../issues/2">#2</a>. Thank you!</sub></p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/wwe-2k14-ring.jpg" alt="WWE 2K14, a match in the ring at 39 fps"></td>
+    <td width="50%"><img src="docs/media/wwe-2k14-match.jpg" alt="WWE 2K14, grapple on the ropes at 43 fps"></td>
+  </tr>
+</table>
+<p align="center"><sub><b>WWE 2K14</b> on a POCO X7 Pro with build q651. It used to crash as a match started; reported in <a href="../../issues/3">#3</a>.</sub></p>
 
 <br>
 
@@ -176,7 +184,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
     </td>
     <td valign="top">
       <h3>💾 Savestates</h3>
-      Save and restore the whole machine in game. It works in Black Ops, Dante's Inferno, Halo: Reach and GTA IV, including live XAM enumerators and files that are still open.
+      Save and restore the whole machine in game. It works in Black Ops, Dante's Inferno, Halo: Reach, GTA IV and WWE 2K14, including live XAM enumerators, files that are still open and threads that have already finished.
     </td>
   </tr>
   <tr>
@@ -274,6 +282,7 @@ Verified in Black Ops, Dante's Inferno, Halo: Reach and GTA IV.
 - [x] Savestates
 - [x] Bilingual interface (English / Italian)
 - [x] Halo: Reach steady at its 30 fps cap
+- [x] Game patches: built-in community catalog and manual import
 - [ ] **60 fps** in Black Ops and GTA IV: needs ≤16.6 ms per frame on both GPU and CPU
 - [ ] Keep the depth buffer across color changes (subpasses): Reach's biggest bandwidth lever
 - [ ] Find the root cause of the bindless-texture GPU faults on Mali r49p1
@@ -300,6 +309,13 @@ Disc images (<code>.iso</code>), compressed images (<code>.zar</code>, made by t
 <summary><b>Which games work?</b></summary>
 <br>
 See the <a href="#-game-compatibility">compatibility table</a>: six games measured in depth plus the ones players have reported. The changes are in the shared core, not per game, so other titles benefit too. Compatibility reports are welcome.
+</details>
+
+<details>
+<summary><b>How do I add game patches (60 fps, resolution, fixes)?</b></summary>
+<br>
+In the library, open the game's options → <b>Game patches</b>. The app ships the whole <a href="https://github.com/xenia-canary/game-patches">community patch catalog</a>, so most games already list their patches there: switch on the ones you want, and they apply the next time the game starts. A patch only applies when it matches your game version (title update), so a game can show more than one block.<br><br>
+Have a <code>.patch.toml</code> that is not in the catalog? Tap <b>Import</b> on the same screen and pick the file. It must belong to that game (same title ID, the 8 characters at the start of the file name and in its <code>title_id</code> line). The app checks it and copies it next to the others.
 </details>
 
 <details>
@@ -375,7 +391,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 29 Oct 2026 | q636 | GTA IV black flashing fixed; first public release |
 | 1 Nov 2026 | q636.1 | New library: covers and themes for every game; one-tap FPS limit; clearer statistics; library loads in ~1 s |
 | 1 Nov 2026 | q636.2 | One swipe = one game in the library |
-| 1 Nov 2026 | **q646** | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
+| 1 Nov 2026 | q646 | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
+| 1 Nov 2026 | **q651** | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

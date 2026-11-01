@@ -7,7 +7,7 @@
   <a href="../../releases"><img src="https://img.shields.io/github/downloads/DEGROUCHO/xendroid-mali/total?style=for-the-badge&color=2edc5a&labelColor=0d1117" alt="Downloads"></a>
   <a href="../../stargazers"><img src="https://img.shields.io/github/stars/DEGROUCHO/xendroid-mali?style=for-the-badge&color=2edc5a&labelColor=0d1117" alt="Stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3-2edc5a?style=for-the-badge&labelColor=0d1117" alt="License"></a>
-  <a href="https://donate.stripe.com/28E9AT2BreSAeFx8rn5kk00"><img src="https://img.shields.io/badge/donate-%E2%99%A5-ff5c8a?style=for-the-badge&labelColor=0d1117" alt="Donate"></a>
+  <a href="https://donate.stripe.com/fZucN52Br25Oaph0YV5kk01"><img src="https://img.shields.io/badge/donate-%E2%99%A5-ff5c8a?style=for-the-badge&labelColor=0d1117" alt="Donate"></a>
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/Android-10%2B-3ddc84?style=flat-square&logo=android&logoColor=white" alt="Android 10+">
@@ -401,7 +401,7 @@ XenDroid Ultimate Mali is free, and it will stay free. It is built one game and 
 If it turned your phone into an Xbox 360 and you would like to say thanks, a small donation keeps the work going: more games booting, more fps, cooler phones, better audio. Never required, always appreciated.
 
 <p align="center">
-  <a href="https://donate.stripe.com/28E9AT2BreSAeFx8rn5kk00"><img src="https://img.shields.io/badge/Support%20XenDroid%20Mali-Donate-ff5c8a?style=for-the-badge&logo=stripe&logoColor=white&labelColor=0d1117" alt="Donate to XenDroid Ultimate Mali" height="38"></a>
+  <a href="https://donate.stripe.com/fZucN52Br25Oaph0YV5kk01"><img src="https://img.shields.io/badge/Support%20XenDroid%20Mali-Donate-ff5c8a?style=for-the-badge&logo=stripe&logoColor=white&labelColor=0d1117" alt="Donate to XenDroid Ultimate Mali" height="38"></a>
 </p>
 <p align="center"><sub>Secure payment through Stripe. Starring the repo and sending device reports help just as much. Thank you! 🙏</sub></p>
 

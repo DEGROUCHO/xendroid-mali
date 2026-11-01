@@ -339,6 +339,8 @@ fun NxeDashboard(
     val motion = remember { arrayOfNulls<Job>(1) }
     // Where the running glide lands (-1: none), so quick repeated presses add up.
     val glideTarget = remember { mutableIntStateOf(-1) }
+    // Where the flow was when the finger came down.
+    val dragFrom = remember { floatArrayOf(0f) }
     // The glide outlives a recomposition that brings a new list: it reads the latest one.
     val gamesNow by rememberUpdatedState(games)
     val indexNow by rememberUpdatedState(indexById)
@@ -363,7 +365,7 @@ fun NxeDashboard(
         glideTarget.intValue = dest
         motion[0]?.cancel()
         motion[0] = scope.launch {
-            animate(position(), dest.toFloat(), velocity, spring(dampingRatio = 0.92f, stiffness = stiffness)) { v, _ ->
+            animate(position(), dest.toFloat(), velocity, spring(dampingRatio = 1f, stiffness = stiffness)) { v, _ ->
                 setPosition(v)
             }
             glideTarget.intValue = -1
@@ -480,13 +482,24 @@ fun NxeDashboard(
                                         onDragStarted = {
                                             motion[0]?.cancel()
                                             glideTarget.intValue = -1
+                                            dragFrom[0] = position()
                                         },
                                         onDragStopped = { velocity ->
-                                            // Fling, in tiles per second: a flick moves one game,
-                                            // a long swipe runs through several and lands on one.
+                                            // A quick swipe moves exactly one game, however long or fast;
+                                            // a slower drag follows the finger and settles on the nearest
+                                            // game. No momentum: the flow never runs past games the
+                                            // player did not choose. Velocity in tiles per second.
                                             val v = -velocity / stepPx
-                                            val travel = (v * 0.3f).coerceIn(-15f, 15f)
-                                            glideTo((position() + travel).roundToInt(), v, stiffness = 150f)
+                                            val pos = position()
+                                            val moved = pos - dragFrom[0]
+                                            val sameWay = abs(moved) < 0.05f || sign(moved) == sign(v)
+                                            val dest = when {
+                                                abs(v) > 2.5f && sameWay -> dragFrom[0].roundToInt() + sign(v).toInt()
+                                                abs(v) > 0.6f && sameWay ->
+                                                    dragFrom[0].roundToInt() + sign(v).toInt() * max(1, abs(moved).roundToInt())
+                                                else -> pos.roundToInt()
+                                            }
+                                            glideTo(dest, v.coerceIn(-4f, 4f), stiffness = 260f)
                                         },
                                     ),
                                 contentAlignment = Alignment.Center,

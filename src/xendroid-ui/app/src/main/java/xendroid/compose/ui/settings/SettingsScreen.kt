@@ -209,11 +209,10 @@ private fun LanguageRow() {
     val activity = LocalContext.current as? Activity ?: return
     val current = remember { UiLanguage.get(activity) }
     GlassRow {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Language / Lingua", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+        // The name sits above the choices: beside them it was squeezed onto three lines.
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text("Language / Lingua", style = MaterialTheme.typography.titleSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
             listOf(
                 UiLanguage.SYSTEM to l10n("System", "Sistema"),
                 UiLanguage.ENGLISH to "English",
@@ -223,8 +222,9 @@ private fun LanguageRow() {
                     selected = current == value,
                     onClick = { if (value != current) UiLanguage.setAndRestart(activity, value) },
                     label = { Text(label) },
-                    modifier = Modifier.padding(start = 6.dp),
+                    modifier = Modifier.padding(end = 6.dp),
                 )
+            }
             }
         }
     }
@@ -237,11 +237,9 @@ private fun LibraryStyleRow() {
     val context = LocalContext.current
     var dashboard by remember { mutableStateOf(LibraryStyle.isDashboard(context)) }
     GlassRow {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(l10n("Library", "Libreria"), style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text(l10n("Library", "Libreria"), style = MaterialTheme.typography.titleSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
             listOf(
                 true to l10n("Xbox covers", "Copertine Xbox"),
                 false to l10n("Classic grid", "Griglia classica"),
@@ -250,8 +248,9 @@ private fun LibraryStyleRow() {
                     selected = dashboard == value,
                     onClick = { dashboard = value; LibraryStyle.setDashboard(context, value) },
                     label = { Text(label) },
-                    modifier = Modifier.padding(start = 6.dp),
+                    modifier = Modifier.padding(end = 6.dp),
                 )
+            }
             }
         }
     }

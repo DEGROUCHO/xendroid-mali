@@ -28,11 +28,16 @@
 <p align="center">
   <a href="../../releases/latest"><b>⬇️ Download the APK</b></a>
   &nbsp;·&nbsp; <a href="#-performance">📊 Performance</a>
+  &nbsp;·&nbsp; <a href="#-game-compatibility">🎮 Games</a>
+  &nbsp;·&nbsp; <a href="#%EF%B8%8F-the-app">🕹️ The app</a>
   &nbsp;·&nbsp; <a href="#-features">✨ Features</a>
   &nbsp;·&nbsp; <a href="#-quick-start">🚀 Quick start</a>
   &nbsp;·&nbsp; <a href="#-faq">❓ FAQ</a>
   &nbsp;·&nbsp; <a href="../../discussions">💬 Discussions</a>
 </p>
+
+> [!NOTE]
+> **New in q636.2:** an Xbox 360-style library where every game gets its cover and theme, one swipe = one game, library loading in about a second instead of up to a minute, a one-tap FPS limit (Auto / 30 / Free) and a clearer statistics box. Same fast q636 emulator core. [Download](../../releases/latest)
 
 <br>
 
@@ -48,7 +53,7 @@
     <td align="center"><b>Halo: Reach</b><br><sub>26–30 fps · clean image</sub></td>
   </tr>
 </table>
-<p align="center"><sub>Real in-game screenshots on a POCO X7 Pro, with the built-in overlay (fps, frame time, GPU time, RAM, temperature).</sub></p>
+<p align="center"><sub>Real in-game screenshots on a POCO X7 Pro, with the built-in statistics box.</sub></p>
 
 <br>
 
@@ -65,12 +70,53 @@
 | Call of Duty: Black Ops | 5–10 fps | **42–60 fps** | Global guest lock removed; memory coherency rebuilt |
 | Grand Theft Auto IV | 24 fps | **33–42 fps** | Fewer 4x transfers; black flashing fixed |
 | Halo: Reach | ~20 fps, rainbow artifacts | **26–30 fps** | MSAA 2×2 layout (+30%); rainbow fixed |
-| Dante's Inferno | blocks + dither artifacts | **60 fps** (locked) | Mali erratum workaround; dither fixed |
+| Dante's Inferno | blocks + dither artifacts | **60 fps** locked · **~110 fps** with the limit off | Mali erratum workaround; dither fixed |
 | Need for Speed: Most Wanted | crashed ~40% of boots | **44–51 fps** | Lock-free atomics fixed |
 
 </div>
 
 <sub>Measured on a POCO X7 Pro (Dimensity 8400, Mali-G720), in gameplay, with the guest refresh capped to the game's own vblank. Phones throttle when hot, so the ranges show cool vs warm runs. The MediaTek driver can also cap the GPU clock while charging.</sub>
+
+Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with the GPU busy for **41–66%** of each frame and the CPU at **24–29%**, battery at 29–32 °C.
+
+<br>
+
+## 🎮 Game compatibility
+
+| Game | Status | FPS on a POCO X7 Pro | Notes |
+|:--|:--:|:--:|:--|
+| Dante's Inferno | ✅ Great | 60 locked · ~110 free | Savestates |
+| Call of Duty: Black Ops | ✅ Playable | 42–60 | Savestates · occasional square artifacts |
+| Need for Speed: Most Wanted | ✅ Playable | 44–51 | Also runs well in races on a **POCO X8 Pro** (player report) |
+| Call of Duty: Modern Warfare 2 | ✅ Playable | 44–57 | Measured on an October build |
+| Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing |
+| Halo: Reach | ✅ Playable | 26–30 | Savestates |
+| Forza Horizon | 🟡 Runs | 20–24 | Player report: stable |
+| Forza Horizon 2 | 🟡 Runs | 20–24 | Player report: stable |
+
+<sub>✅ measured in gameplay · 🟡 boots and plays below 30 fps · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
+
+<br>
+
+## 🕹️ The app
+
+<p align="center">
+  <img src="docs/media/library.jpg" width="270" alt="The library: an Xbox 360-style cover flow over the game's own theme">
+  &nbsp;&nbsp;
+  <img src="docs/media/library-theme.jpg" width="270" alt="A game without a Marketplace background gets its own box art as theme">
+</p>
+<p align="center"><sub>The library opens on a cover flow, Xbox 360 style. Right: a game the Marketplace gave no background gets its own box art as theme.</sub></p>
+
+<p align="center"><img src="docs/media/library-landscape.jpg" width="820" alt="The library in landscape"></p>
+<p align="center"><sub>On its side: bigger covers, details on a panel.</sub></p>
+
+<p align="center"><img src="docs/media/stats.jpg" width="820" alt="The statistics box in game"></p>
+<p align="center"><sub>The statistics box in game: Dante's Inferno at its 60 fps lock, GPU busy 65% of each frame.</sub></p>
+
+- **Library.** Your games as a cover flow with real box art over each game's own theme. One swipe moves one game; the D-pad and a controller work too. The classic grid is in Settings → Library.
+- **Every game looks right.** The Marketplace background when the game has one; otherwise its box art becomes the theme; a game with no artwork at all gets a cover built from its own icon and name.
+- **Fast.** The library is ready in about a second, even with a crowded Download folder.
+- **In game.** Tap ≡ at the top (or press the Xbox button) for the menu: savestates, screenshots, touch controls, the **FPS limit** (Auto / 30 / Free) and the **statistics box** (Off / FPS / All). "All" shows CPU, GPU, RAM, battery temperature and what is limiting the FPS. L3 + R3 shows or hides it.
 
 <br>
 
@@ -126,7 +172,7 @@
 |:--|:--|
 | ✅ **Tested** | POCO X7 Pro: MediaTek Dimensity 8400, Mali-G720 MC7, driver r49p1, Android 16 |
 | 🟡 **Should work** | Other recent Mali GPUs (G615, G710, G715, G925) on Dimensity and Exynos, and Adreno 7xx |
-| 💬 **Reported by players** | POCO X8 Pro works well. Forza Horizon and Forza Horizon 2 boot and run at about 20–24 fps on a POCO X7 Pro |
+| ✅ **Reported working** | **POCO X8 Pro**: Need for Speed: Most Wanted runs well in races (player report) |
 | 📝 **Help wanted** | Anything else. [Report your device](../../issues/new/choose): reports from other phones are the most useful contribution right now |
 
 <br>
@@ -193,6 +239,7 @@ Verified in Black Ops, Dante's Inferno, Halo: Reach and GTA IV.
 - [ ] **60 fps** in Black Ops, GTA IV and Reach: needs ≤16.6 ms per frame on both GPU and CPU
 - [ ] Keep the depth buffer across color changes (subpasses): Reach's biggest bandwidth lever
 - [ ] Find the root cause of the bindless-texture GPU faults on Mali r49p1
+- [ ] Forza Horizon and Forza Horizon 2 above 30 fps
 - [ ] Test on more Mali and Dimensity devices ([your reports help](../../issues/new/choose))
 
 <br>
@@ -214,7 +261,7 @@ Disc images (<code>.iso</code>), compressed images (<code>.zar</code>, made by t
 <details>
 <summary><b>Which games work?</b></summary>
 <br>
-The five games in the table above are the ones measured in depth. The changes are in the shared core, not per game, so other titles benefit too. Compatibility reports are welcome.
+See the <a href="#-game-compatibility">compatibility table</a>: six games measured in depth plus the ones players have reported. The changes are in the shared core, not per game, so other titles benefit too. Compatibility reports are welcome.
 </details>
 
 <details>
@@ -288,7 +335,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 25 Oct 2026 | q575 | MSAA 4x as 2×2 by default: Reach +30%, Dante dither fixed |
 | 26 Oct 2026 | q607 | GTA IV savestates; Reach GPU −12%; NFS Most Wanted in the library |
 | 29 Oct 2026 | q636 | GTA IV black flashing fixed; first public release |
-| 1 Nov 2026 | **q636.1** | New library: covers and themes for every game, smooth fast scrolling; one-tap FPS limit; clearer statistics |
+| 1 Nov 2026 | q636.1 | New library: covers and themes for every game; one-tap FPS limit; clearer statistics; library loads in ~1 s |
+| 1 Nov 2026 | **q636.2** | One swipe = one game in the library |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

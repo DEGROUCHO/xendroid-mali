@@ -46,6 +46,20 @@ static constexpr uint32_t A64_RESERVE_GRANULE_SHIFT = 7;
 static constexpr uint32_t A64_RESERVE_NUM_ENTRIES = 1u << 20;
 static constexpr uint32_t A64_RESERVE_ENTRY_MASK = A64_RESERVE_NUM_ENTRIES - 1;
 
+// a64_reserve_spread_generations: neighbouring granules on different cache
+// lines - (granule << 4) | (granule >> 16) over the 20 index bits, a
+// permutation, so the 16 counters of a 64-byte line belong to granules 8 MB
+// apart instead of to one 2 KB block whose separate locks then ping-pong the
+// same line between cores on every paired compare-and-swap.
+inline uint32_t ReserveEntryIndex(uint32_t guest_address, bool spread) {
+  const uint32_t granule =
+      (guest_address >> A64_RESERVE_GRANULE_SHIFT) & A64_RESERVE_ENTRY_MASK;
+  return spread ? ((granule << 4) | (granule >> 16)) & A64_RESERVE_ENTRY_MASK
+                : granule;
+}
+// Read once (the JIT and the helpers must agree for the whole run).
+bool ReserveSpreadGenerations();
+
 struct ReserveHelper {
   std::atomic<uint32_t> generations[A64_RESERVE_NUM_ENTRIES];
 

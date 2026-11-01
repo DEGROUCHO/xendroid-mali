@@ -204,6 +204,13 @@ DEFINE_bool(vulkan_resolve_texture_copy_partial, true,
             "of the texture is up to date, instead of reloading the whole "
             "texture from guest memory.",
             "GPU");
+DEFINE_bool(vulkan_resolve_texture_copy_norm16, false,
+            "With vulkan_resolve_texture_copy, also fill k_16_16 and "
+            "k_16_16_16_16 textures that the device samples as half floats "
+            "(no filterable norm16, as on Mali) straight from the resolve, "
+            "converting in the resolve shader exactly like their loader, "
+            "instead of reloading them from guest memory.",
+            "GPU");
 DEFINE_uint32(log_resolve_texture_copy_rejects, 0,
               "Diagnostic: every this many resolves, log why the textures at "
               "their destinations were not filled straight from the resolve "
@@ -2217,7 +2224,8 @@ uint32_t VulkanTextureCache::ResolveTextureBytesPerPixel(
           ? pair.format_signed
           : pair.format_unsigned;
   // Check the actual device fallback, not the nominal guest format. Norm16
-  // conversion loaders on Mali must keep running; their output isn't raw bits.
+  // conversion loaders (Mali) aren't raw bits: the resolve shader converts
+  // like them only with vulkan_resolve_texture_copy_norm16.
   switch (format.load_shader) {
     case kLoadShaderIndex8bpb:
       return 1;
@@ -2232,6 +2240,33 @@ uint32_t VulkanTextureCache::ResolveTextureBytesPerPixel(
     case kLoadShaderIndexDepthUnorm:
     case kLoadShaderIndexDepthFloat:
       return 4;
+    case kLoadShaderIndexRG16UNormToFloat:
+    case kLoadShaderIndexRG16SNormToFloat:
+      return cvars::vulkan_resolve_texture_copy_norm16 ? 4 : 0;
+    case kLoadShaderIndexRGBA16UNormToFloat:
+    case kLoadShaderIndexRGBA16SNormToFloat:
+      return cvars::vulkan_resolve_texture_copy_norm16 ? 8 : 0;
+    default:
+      return 0;
+  }
+}
+
+uint32_t VulkanTextureCache::ResolveTextureLinearDestFlags(
+    const TextureKey& key) const {
+  // Host bits of the resolve's RB_COPY_DEST_INFO (resolve.xesli,
+  // XeResolveLinearWord): the loader's norm16 -> half float conversion.
+  const HostFormatPair& pair = GetHostFormatPair(key);
+  const HostFormat& format =
+      key.signed_separate || pair.format_unsigned.format == VK_FORMAT_UNDEFINED
+          ? pair.format_signed
+          : pair.format_unsigned;
+  switch (format.load_shader) {
+    case kLoadShaderIndexRG16UNormToFloat:
+    case kLoadShaderIndexRGBA16UNormToFloat:
+      return UINT32_C(0x40000000);
+    case kLoadShaderIndexRG16SNormToFloat:
+    case kLoadShaderIndexRGBA16SNormToFloat:
+      return UINT32_C(0x20000000);
     default:
       return 0;
   }
@@ -2373,6 +2408,11 @@ VulkanTextureCache::PrepareResolveTextureCopy(
     }
     const uint32_t bpp = ResolveTextureBytesPerPixel(key);
     if (!bpp) continue;
+    // One linear buffer per resolve: every target takes the same conversion.
+    const uint32_t linear_dest_flags = ResolveTextureLinearDestFlags(key);
+    if (!copy.targets.empty() && linear_dest_flags != copy.linear_dest_flags) {
+      continue;
+    }
     const VkDeviceSize size = VkDeviceSize(width) * sx * height * sy * bpp;
     if (size > command_processor_.GetVulkanDevice()
                    ->properties()
@@ -2395,6 +2435,7 @@ VulkanTextureCache::PrepareResolveTextureCopy(
                                  std::min(height, key.GetHeight() - y) * sy, 1};
     texture.MarkAsUsed();
     copy.size = size;
+    copy.linear_dest_flags = linear_dest_flags;
     copy.targets.push_back(target);
   }
   if (copy.targets.empty() && reject == kRcNoTexture &&

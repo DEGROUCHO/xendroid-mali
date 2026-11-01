@@ -107,7 +107,9 @@ struct XeResolveInfo {
 
 // Vulkan-only mirror of the final guest packing. The CPU offers this only
 // for an exact loader match and binds a valid set 3 even when disabled. Bit 31
-// is host metadata in sanitized RB_COPY_DEST_INFO, never a guest register bit.
+// is host metadata in sanitized RB_COPY_DEST_INFO, never a guest register bit,
+// as are bits 30 and 29: the texture is norm16 loaded as half floats (the
+// RG16UNorm/RG16SNorm to RG16Float loaders), unsigned or signed.
 #if SHADING_LANGUAGE_GLSL_XE && !defined(XE_RESOLVE_CLEAR) && !defined(XE_RESOLVE_INPASS)
 layout(set = 3, binding = 0, std430) writeonly buffer XeResolveLinearOutput {
   uint xe_resolve_linear_words[];
@@ -118,6 +120,13 @@ uint XeResolveLinearWord(XeResolveInfo info, uint word) {
   }
   if (info.dest_format == kXenosFormat_24_8_FLOAT) {
     return XeFloat20e4To32(uint2_xe(word >> 8u)).x;
+  }
+  uint dest_info = push_const_xe(xe_resolve_dest_info);
+  if ((dest_info & 0x40000000u) != 0u) {
+    return XeRG16UNormToRG16Float(uint_x4_xe(word)).x;
+  }
+  if ((dest_info & 0x20000000u) != 0u) {
+    return XeRG16SNormToRG16Float(uint_x4_xe(word)).x;
   }
   return word;
 }

@@ -1480,11 +1480,17 @@ static void LoadReserveAddress(A64Emitter& e, const I64Op& guest) {
 // x2 = the generation counter of the granule of the guest address in w1 (the
 // software helpers' ReserveGranule). Clobbers |scratch|.
 static void LoadReserveGranule(A64Emitter& e, const XReg& scratch) {
+  const WReg index(scratch.getIdx());
+  e.ubfx(index, e.w1, A64_RESERVE_GRANULE_SHIFT, kReserveEntryBits);
+  if (ReserveSpreadGenerations()) {
+    // ReserveEntryIndex: (granule << 4) | (granule >> 16), 20 bits.
+    e.lsr(e.w2, index, 16);
+    e.orr(index, e.w2, index, Xbyak_aarch64::LSL, 4);
+    e.and_(index, index, uint64_t(A64_RESERVE_ENTRY_MASK));
+  }
   e.ldr(e.x2, ptr(LoadBackendCtxPtr(e),
                   static_cast<uint32_t>(
                       offsetof(A64BackendContext, reserve_helper_))));
-  e.ubfx(WReg(scratch.getIdx()), e.w1, A64_RESERVE_GRANULE_SHIFT,
-         kReserveEntryBits);
   e.add(e.x2, e.x2, scratch, Xbyak_aarch64::LSL, 2);
 }
 

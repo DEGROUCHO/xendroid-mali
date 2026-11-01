@@ -228,6 +228,23 @@ DEFINE_bool(
     "the whole page from RAM that never received the exported bytes (Black Ops "
     "texture blocks).",
     "Vulkan");
+DEFINE_bool(
+    vulkan_memexport_ram_mirror_dedup, true,
+    "Copy each page of the completed memory export ranges to guest RAM once "
+    "per pass instead of once per queued range: every memexport draw queues "
+    "its stream's whole range, so draws exporting to the same buffer (Halo "
+    "Reach particles) copied the same pages again and again with the same "
+    "bytes.",
+    "Vulkan");
+// Default since q644: Halo Reach copied 24-34 MB/frame for 0.1-0.3 MB of
+// exported pages; with the dedup 30.0 fps and 57 instead of 309 frames over
+// 36 ms in gameplay at the same heat (REACH-MX0b/MX1b).
+UPDATE_from_bool(vulkan_memexport_ram_mirror_dedup, 2026, 11, 1, 12, false);
+DEFINE_bool(
+    log_memexport_ram_mirror, false,
+    "Log the memexport RAM mirror's work per frame every 5 seconds: ranges "
+    "completed, pages visited, pages copied and bytes copied.",
+    "Vulkan");
 
 DEFINE_bool(
     vulkan_memexport_vs_compute, true,
@@ -3441,6 +3458,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       }
       s = VkFrameSyncStats();
       s.last_report_ns = now;
+    }
+  }
+
+  if (cvars::log_memexport_ram_mirror) {
+    MemexportMirrorStats& m = memexport_mirror_stats_;
+    ++m.frames;
+    static auto last_report = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::seconds(5)) {
+      last_report = now;
+      const double f = double(m.frames);
+      XELOGI(
+          "MemexportMirror: per frame ranges {:.1f} pages visited {:.1f} "
+          "copied {:.1f} bytes {:.0f} KB (dedup {})",
+          m.ranges / f, m.pages / f, m.copied / f, m.bytes / f / 1024.0,
+          cvars::vulkan_memexport_ram_mirror_dedup);
+      m = MemexportMirrorStats();
     }
   }
 
@@ -10691,47 +10725,37 @@ void VulkanCommandProcessor::ProcessMemexportRamMirror(
   // The guest's write watches take the global lock, so under it a page still
   // marked GPU-written has not been written by the CPU since the export.
   auto global_lock = global_critical_region::Acquire();
+  // vulkan_memexport_ram_mirror_dedup: the pages of every completed range,
+  // each visited once (sorted, unique).
+  const bool dedup = cvars::vulkan_memexport_ram_mirror_dedup;
+  memexport_mirror_pages_scratch_.clear();
   while (!memexport_mirror_pending_.empty() &&
          memexport_mirror_pending_.front().submission <= completed_submission) {
     const MemexportMirrorRange range = memexport_mirror_pending_.front();
     memexport_mirror_pending_.pop_front();
+    ++memexport_mirror_stats_.ranges;
     const uint32_t end = uint32_t(std::min(uint64_t(range.address) + range.length,
                                            uint64_t(SharedMemory::kBufferSize)));
+    if (dedup) {
+      for (uint32_t page = range.address & ~(page_size - 1); page < end;
+           page += page_size) {
+        memexport_mirror_pages_scratch_.push_back(page);
+      }
+      continue;
+    }
     for (uint32_t page = range.address & ~(page_size - 1); page < end;
          page += page_size) {
-      // A newer export to this page still in flight would be read half-done -
-      // its own completion copies the page.
-      bool newer_in_flight = false;
-      for (const MemexportMirrorRange& pending : memexport_mirror_pending_) {
-        if (pending.submission > completed_submission &&
-            pending.address < page + page_size &&
-            uint64_t(pending.address) + pending.length > page) {
-          newer_in_flight = true;
-          break;
-        }
-      }
-      if (newer_in_flight ||
-          !shared_memory_->IsRangeGpuWritten(page, page_size)) {
-        ++memexport_mirror_pages_skipped_;
-        continue;
-      }
-      // Only the bytes the GPU wrote: the rest of a partly exported page is
-      // CPU-owned and may be newer in RAM than in the buffer.
-      std::pair<uint32_t, uint32_t>
-          ranges[SharedMemory::kGpuWrittenPartialRanges];
-      const uint32_t count = shared_memory_->GpuWrittenPageRanges(page, ranges);
-      bool copied = false;
-      for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t first = std::max(ranges[i].first, page);
-        const uint32_t last = std::min(ranges[i].second, page + page_size);
-        if (first < last &&
-            shared_memory_->ReadHostMapped(first, last - first,
-                                           memory_->TranslatePhysical(first))) {
-          copied = true;
-        }
-      }
-      if (copied) {
-        ++memexport_mirror_pages_copied_;
+      MirrorMemexportPage(page, completed_submission);
+    }
+  }
+  if (dedup && !memexport_mirror_pages_scratch_.empty()) {
+    std::sort(memexport_mirror_pages_scratch_.begin(),
+              memexport_mirror_pages_scratch_.end());
+    uint32_t previous = UINT32_MAX;
+    for (uint32_t page : memexport_mirror_pages_scratch_) {
+      if (page != previous) {
+        MirrorMemexportPage(page, completed_submission);
+        previous = page;
       }
     }
   }
@@ -10744,6 +10768,48 @@ void VulkanCommandProcessor::ProcessMemexportRamMirror(
       XELOGI("[MEMEXPORT] RAM mirror: {} pages copied, {} skipped",
              memexport_mirror_pages_copied_, memexport_mirror_pages_skipped_);
     }
+  }
+}
+
+void VulkanCommandProcessor::MirrorMemexportPage(
+    uint32_t page, uint64_t completed_submission) {
+  const uint32_t page_size = 4096;
+  ++memexport_mirror_stats_.pages;
+  // A newer export to this page still in flight would be read half-done -
+  // its own completion copies the page.
+  bool newer_in_flight = false;
+  for (const MemexportMirrorRange& pending : memexport_mirror_pending_) {
+    if (pending.submission > completed_submission &&
+        pending.address < page + page_size &&
+        uint64_t(pending.address) + pending.length > page) {
+      newer_in_flight = true;
+      break;
+    }
+  }
+  if (newer_in_flight ||
+      !shared_memory_->IsRangeGpuWritten(page, page_size)) {
+    ++memexport_mirror_pages_skipped_;
+    return;
+  }
+  // Only the bytes the GPU wrote: the rest of a partly exported page is
+  // CPU-owned and may be newer in RAM than in the buffer.
+  std::pair<uint32_t, uint32_t>
+      ranges[SharedMemory::kGpuWrittenPartialRanges];
+  const uint32_t count = shared_memory_->GpuWrittenPageRanges(page, ranges);
+  bool copied = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t first = std::max(ranges[i].first, page);
+    const uint32_t last = std::min(ranges[i].second, page + page_size);
+    if (first < last &&
+        shared_memory_->ReadHostMapped(first, last - first,
+                                       memory_->TranslatePhysical(first))) {
+      copied = true;
+      memexport_mirror_stats_.bytes += last - first;
+    }
+  }
+  if (copied) {
+    ++memexport_mirror_pages_copied_;
+    ++memexport_mirror_stats_.copied;
   }
 }
 

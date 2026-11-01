@@ -67,6 +67,15 @@ DEFINE_bool(guest_display_refresh_cap, true,
             "GPU");
 
 DEFINE_uint32(
+    cp_wait_reg_mem_poll_us, 0,
+    "With fixed rate vblanks, poll an unmatched WAIT_REG_MEM every this many "
+    "microseconds instead of sleeping the guest's wait/0x100 milliseconds. "
+    "The console's CP re-reads memory every few hundred GPU clocks, so a 1 ms "
+    "sleep delays the CP by up to 1 ms each time the guest's render thread "
+    "writes the value right after the poll. 0 keeps the millisecond sleeps.",
+    "GPU");
+
+DEFINE_uint32(
     framerate_limit, 60,
     "Host frame rate limit in FPS. 0 = unlimited.\n"
     "Throttles presentation without affecting guest vblank timing.\n"
@@ -138,13 +147,21 @@ DEFINE_bool(
     "when MSAA is used with fullscreen passes.",
     "GPU");
 
-DEFINE_int32(occlusion_query_fake_lower_threshold, 0,
+DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
              "Lower end of the fake sample count value written on "
-             "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"
+             "EVENT_WRITE_ZPD when real occlusion queries are disabled: the "
+             "count walks down from the upper end and wraps here.\n"
              "-1 writes nothing, resulting in some games that sit and hang.\n"
-             "0 means the fake result stays fully occluded.",
+             "0 lets the walk reach 0, so now and then an object reads as "
+             "(almost) occluded for one frame: Halo: Reach then draws it with "
+             "its low-detail model or not at all (one-frame flicker of rocks, "
+             "trees, characters).",
              "GPU");
 UPDATE_from_int32(occlusion_query_fake_lower_threshold, 2026, 10, 5, 12, 80);
+// Back to 80 since q646: with 0 the fake count walked down to 0 and Halo
+// Reach drew rocks, trees and characters with their low-detail model for one
+// frame.
+UPDATE_from_int32(occlusion_query_fake_lower_threshold, 2026, 11, 1, 13, 0);
 DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
              "Upper end of the fake sample count value written on "
              "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"

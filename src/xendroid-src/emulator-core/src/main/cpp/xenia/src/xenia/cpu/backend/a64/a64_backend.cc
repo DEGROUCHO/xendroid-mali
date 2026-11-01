@@ -46,6 +46,13 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
 
+DEFINE_bool(a64_reserve_spread_generations, false,
+            "Lay the lwarx/stwcx. reservation generation counters out so that "
+            "neighbouring 128-byte granules use different cache lines: "
+            "otherwise the counters of a 2 KB block share one line, and "
+            "threads taking different locks in it bounce that line between "
+            "cores on every store-conditional (Halo Reach's main thread).",
+            "a64");
 DEFINE_bool(a64_vmx_direct_registers, true,
             "Emit VMX FP operations directly in allocated NEON registers "
             "when NaN fixups are disabled and hardware FZ handles denormals. "
@@ -787,6 +794,11 @@ void* A64HelperEmitter::EmitColdPathThunk(ColdPath path) {
 // cross-thread stores invalidate other threads' reservations. A CAS on the
 // value alone would be ABA-vulnerable.
 // ==========================================================================
+bool ReserveSpreadGenerations() {
+  static const bool spread = cvars::a64_reserve_spread_generations;
+  return spread;
+}
+
 namespace {
 
 A64BackendContext* BackendContextFromRawContext(void* raw_context) {
@@ -796,8 +808,8 @@ A64BackendContext* BackendContextFromRawContext(void* raw_context) {
 
 std::atomic<uint32_t>& ReserveGranule(ReserveHelper* reserve_helper,
                                       uint32_t guest_address) {
-  const uint32_t granule = guest_address >> A64_RESERVE_GRANULE_SHIFT;
-  return reserve_helper->generations[granule & A64_RESERVE_ENTRY_MASK];
+  return reserve_helper->generations[ReserveEntryIndex(
+      guest_address, ReserveSpreadGenerations())];
 }
 
 extern "C" uint64_t TryAcquireReservationHelper(void* raw_context,

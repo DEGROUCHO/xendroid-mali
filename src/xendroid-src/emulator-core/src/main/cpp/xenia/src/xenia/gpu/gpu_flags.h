@@ -20,6 +20,7 @@ DECLARE_bool(trace_gpu_texture_ram_always);
 DECLARE_path(dump_shaders);
 
 DECLARE_bool(guest_display_refresh_cap);
+DECLARE_uint32(cp_wait_reg_mem_poll_us);
 
 DECLARE_uint32(framerate_limit);
 DECLARE_bool(framerate_limit_adaptive);

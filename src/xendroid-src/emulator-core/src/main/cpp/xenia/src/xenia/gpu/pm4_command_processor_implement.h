@@ -999,7 +999,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
       if (wait >= 0x100) {
         cp_wait_stats::FenceSiteScope fence_site(cp_wait_stats::kFenceRegMem);
         PrepareForWait();
-        if (cvars::guest_display_refresh_cap) {
+        if (cvars::guest_display_refresh_cap && cvars::cp_wait_reg_mem_poll_us) {
+          // Fine polling: memory written by a guest thread, not the counter.
+          xe::threading::Sleep(
+              std::chrono::microseconds(cvars::cp_wait_reg_mem_poll_us));
+        } else if (cvars::guest_display_refresh_cap) {
           // Fixed rate vblank mode - sleep since counter updates at 50/60Hz
           xe::threading::Wait(write_ptr_index_event_.get(), false,
                               std::chrono::milliseconds(HasMemoryProviders()

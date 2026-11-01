@@ -55,6 +55,11 @@ const_buffer_begin_xe(xe_resolve_host_color, 0, 1, b1, space0)
   uint xe_resolve_host_color_flags;
 const_buffer_end_xe(xe_resolve_host_color)
 
+// Bit-exact copies from EDRAM owned by a render target of another 32bpp
+// format: its texels are packed as the owner's format (bits 8:11), like the
+// EDRAM dump writes them.
+#define XE_RESOLVE_HOST_COLOR_FLAG_OWNER_FORMAT (1u << 2u)
+
 #define XE_RESOLVE_HOST_COLOR_CONSTANTS_BINDING \
     const_buffer_binding_xe(xe_resolve_host_color, buffer(2))
 
@@ -420,6 +425,38 @@ void XeResolveHostColorApplyHalfPixelOffset64(
   }
 }
 
+// The format the source texels are packed as: the owner's for a foreign
+// owner (XE_RESOLVE_HOST_COLOR_FLAG_OWNER_FORMAT), else the resolve's.
+uint XeResolveHostColorSourceFormat(
+    XeResolveInfo resolve_info
+    param_next_after_const_buffer_xe
+    param_const_buffer_xe(xe_resolve_host_color)) {
+  uint flags = constant_xe(xe_resolve_host_color, xe_resolve_host_color_flags);
+  return (flags & XE_RESOLVE_HOST_COLOR_FLAG_OWNER_FORMAT) != 0u
+             ? (flags >> 8u) & 0xFu
+             : resolve_info.edram_format;
+}
+
+// The EDRAM bits of a texel of the source: k_8_8_8_8_GAMMA (only reached as a
+// foreign owner) is kept linear in unorm16 on the host, so it's encoded back
+// to the PWL curve first, like the EDRAM dump does.
+uint XeResolveHostColorPackOwner32Float(float4_xe color, uint format) {
+  if (format == kXenosColorRenderTargetFormat_8_8_8_8_GAMMA) {
+    // SpirvShaderTranslator::LinearToPWLGamma: segments at 64/128/512 of 1023,
+    // scales 1023/2^n, offsets 16/255 * 2^n past the first one.
+    float3_xe linear_value = saturate_xe(color.rgb);
+    float3_xe past_first =
+        step(float_x3_xe(64.0f / 1023.0f), linear_value);
+    float3_xe segment = past_first +
+                        step(float_x3_xe(128.0f / 1023.0f), linear_value) +
+                        step(float_x3_xe(512.0f / 1023.0f), linear_value);
+    color.rgb = trunc(linear_value * (float_x3_xe(1023.0f) * exp2(-segment))) *
+                    float_x3_xe(1.0f / 255.0f) +
+                float_x3_xe(16.0f / 255.0f) * exp2(segment) * past_first;
+  }
+  return XeResolveHostColorPack32Float(color, format);
+}
+
 #ifdef XE_RESOLVE_HOST_COLOR_FULL_DEST_BPP
 
 uint XeResolveHostColorFetchPacked32(
@@ -428,6 +465,10 @@ uint XeResolveHostColorFetchPacked32(
     param_const_buffer_xe(xe_resolve_host_color)
     param_next_after_texture_xe
     param_texture_xe(xe_resolve_host_color_source)) {
+  uint source_format = XeResolveHostColorSourceFormat(
+      resolve_info
+      pass_next_after_const_buffer_xe
+      pass_const_buffer_xe(xe_resolve_host_color));
   #if XE_RESOLVE_HOST_COLOR_SOURCE_UINT
     return XeResolveHostColorPack32Uint(
         XeResolveHostColorFetchUint(
@@ -436,16 +477,16 @@ uint XeResolveHostColorFetchPacked32(
             pass_const_buffer_xe(xe_resolve_host_color)
             pass_next_after_texture_xe
             pass_texture_xe(xe_resolve_host_color_source)),
-        resolve_info.edram_format);
+        source_format);
   #else
-    return XeResolveHostColorPack32Float(
+    return XeResolveHostColorPackOwner32Float(
         XeResolveHostColorFetchFloat(
             resolve_info, source_sample
             pass_next_after_const_buffer_xe
             pass_const_buffer_xe(xe_resolve_host_color)
             pass_next_after_texture_xe
             pass_texture_xe(xe_resolve_host_color_source)),
-        resolve_info.edram_format);
+        source_format);
   #endif
 }
 
@@ -1183,6 +1224,10 @@ void XeResolveHostColorMain(
           pass_const_buffer_xe(xe_resolve_host_color))) {
     return;
   }
+  uint source_format = XeResolveHostColorSourceFormat(
+      resolve_info
+      pass_next_after_const_buffer_xe
+      pass_const_buffer_xe(xe_resolve_host_color));
 
   #if XE_RESOLVE_HOST_COLOR_BPP == 64
     uint2_xe packed_0, packed_1, packed_2, packed_3;
@@ -1196,7 +1241,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_1 = XeResolveHostColorPack64Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1206,7 +1251,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_2 = XeResolveHostColorPack64Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1216,7 +1261,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_3 = XeResolveHostColorPack64Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1226,7 +1271,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
     #else
       packed_0 = XeResolveHostColorPack64Float(
           XeResolveHostColorFetchFloat(
@@ -1237,7 +1282,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_1 = XeResolveHostColorPack64Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
@@ -1247,7 +1292,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_2 = XeResolveHostColorPack64Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
@@ -1257,7 +1302,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       packed_3 = XeResolveHostColorPack64Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
@@ -1267,7 +1312,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
     #endif
     uint4_xe pixels_01 =
         uint4_xe(packed_0.x, packed_0.y, packed_1.x, packed_1.y);
@@ -1302,7 +1347,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_0123.y = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1312,7 +1357,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_0123.z = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1322,7 +1367,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_0123.w = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1332,7 +1377,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_4567.x = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1342,7 +1387,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_4567.y = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1352,7 +1397,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_4567.z = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1362,7 +1407,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
       pixels_4567.w = XeResolveHostColorPack32Uint(
           XeResolveHostColorFetchUint(
               resolve_info,
@@ -1372,9 +1417,9 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
     #else
-      pixels_0123.x = XeResolveHostColorPack32Float(
+      pixels_0123.x = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1383,8 +1428,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_0123.y = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_0123.y = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1393,8 +1438,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_0123.z = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_0123.z = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1403,8 +1448,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_0123.w = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_0123.w = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1413,8 +1458,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_4567.x = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_4567.x = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1423,8 +1468,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_4567.y = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_4567.y = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1433,8 +1478,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_4567.z = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_4567.z = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1443,8 +1488,8 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
-      pixels_4567.w = XeResolveHostColorPack32Float(
+          source_format);
+      pixels_4567.w = XeResolveHostColorPackOwner32Float(
           XeResolveHostColorFetchFloat(
               resolve_info,
               XeResolveHostColorSourceSampleForLane(resolve_info, pixel_index,
@@ -1453,7 +1498,7 @@ void XeResolveHostColorMain(
               pass_const_buffer_xe(xe_resolve_host_color)
               pass_next_after_texture_xe
               pass_texture_xe(xe_resolve_host_color_source)),
-          resolve_info.edram_format);
+          source_format);
     #endif
     XeResolveHostColorApplyHalfPixelOffset32(resolve_info, pixel_index,
                                              pixels_0123);

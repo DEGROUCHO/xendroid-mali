@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/API-Vulkan-ac162c?style=flat-square&logo=vulkan&logoColor=white" alt="Vulkan">
   <img src="https://img.shields.io/badge/GPU-Arm%20Mali-0091bd?style=flat-square&logo=arm&logoColor=white" alt="Arm Mali">
   <img src="https://img.shields.io/badge/SoC-MediaTek%20Dimensity-ec9430?style=flat-square" alt="MediaTek Dimensity">
-  <img src="https://img.shields.io/badge/runs%20on-POCO%20X7%20Pro%20%7C%20X8%20Pro-ff6900?style=flat-square" alt="Runs on POCO X7 Pro and POCO X8 Pro">
+  <img src="https://img.shields.io/badge/runs%20on-POCO%20X7%20Pro%20%7C%20X8%20Pro%20%7C%20Xiaomi%2015T-ff6900?style=flat-square" alt="Runs on POCO X7 Pro, POCO X8 Pro and Xiaomi 15T">
   <img src="https://img.shields.io/badge/UI-English%20%7C%20Italiano-555?style=flat-square" alt="English / Italiano">
 </p>
 
@@ -38,7 +38,7 @@
 </p>
 
 > [!NOTE]
-> **New in q636.2:** an Xbox 360-style library where every game gets its cover and theme, one swipe = one game, library loading in about a second instead of up to a minute, a one-tap FPS limit (Auto / 30 / Free) and a clearer statistics box. Same fast q636 emulator core. [Download](../../releases/latest)
+> **New in q646:** Halo: Reach now holds a **steady 30 fps**, its own cap, and stays smooth even when the phone runs hot. Rocks, trees and characters no longer flicker for a frame, in every game. Same app as q636.2: Xbox 360-style library, one-tap FPS limit, clear statistics. [Download](../../releases/latest)
 
 <br>
 
@@ -51,7 +51,7 @@
   <tr>
     <td align="center"><b>Call of Duty: Black Ops</b><br><sub>42–60 fps</sub></td>
     <td align="center"><b>Grand Theft Auto IV</b><br><sub>33–42 fps · no black flashing</sub></td>
-    <td align="center"><b>Halo: Reach</b><br><sub>26–30 fps · clean image</sub></td>
+    <td align="center"><b>Halo: Reach</b><br><sub>steady 30 fps · clean image</sub></td>
   </tr>
 </table>
 <p align="center"><sub>Real in-game screenshots on a POCO X7 Pro, with the built-in statistics box.</sub></p>
@@ -70,7 +70,7 @@
 |:--|:--:|:--:|:--|
 | Call of Duty: Black Ops | 5–10 fps | **42–60 fps** | Global guest lock removed; memory coherency rebuilt |
 | Grand Theft Auto IV | 24 fps | **33–42 fps** | Fewer 4x transfers; black flashing fixed |
-| Halo: Reach | ~20 fps, rainbow artifacts | **26–30 fps** | MSAA 2×2 layout (+30%); rainbow fixed |
+| Halo: Reach | ~20 fps, rainbow artifacts | **30 fps** steady | MSAA 2×2 layout (+30%); rainbow fixed; GPU export copies cut from 24–34 MB to 0.3 MB per frame |
 | Dante's Inferno | blocks + dither artifacts | **60 fps** locked · **~110 fps** with the limit off | Mali erratum workaround; dither fixed |
 | Need for Speed: Most Wanted | crashed ~40% of boots | **44–51 fps** | Lock-free atomics fixed |
 
@@ -91,7 +91,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Need for Speed: Most Wanted | ✅ Playable | 44–51 | Also runs well in races on a **POCO X8 Pro** (player report) |
 | Call of Duty: Modern Warfare 2 | ✅ Playable | 44–57 | Measured on an October build |
 | Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing |
-| Halo: Reach | ✅ Playable | 26–30 | Savestates |
+| Halo: Reach | ✅ Great | 30 locked | Steady at its own cap, even hot · savestates |
 | Forza Horizon | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 | Forza Horizon 2 | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 | Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
@@ -191,6 +191,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | ✅ **Tested** | POCO X7 Pro: MediaTek Dimensity 8400, Mali-G720 MC7, driver r49p1, Android 16 |
 | 🟡 **Should work** | Other recent Mali GPUs (G615, G710, G715, G925) on Dimensity and Exynos, and Adreno 7xx |
 | ✅ **Reported working** | **POCO X8 Pro** (player reports): Need for Speed: Most Wanted runs well in races; Forza Horizon and Forza Horizon 2 at about 24 fps |
+| ✅ **Same hardware** | **Xiaomi 15T**: the same Dimensity 8400-Ultra and Mali-G720 MC7 as the POCO X7 Pro, so it runs the same build |
 | 📝 **Help wanted** | Anything else. [Report your device](../../issues/new/choose): reports from other phones are the most useful contribution right now |
 
 <br>
@@ -254,7 +255,8 @@ Verified in Black Ops, Dante's Inferno, Halo: Reach and GTA IV.
 - [x] Black Ops, Dante's Inferno, GTA IV, Halo: Reach and NFS Most Wanted playable
 - [x] Savestates
 - [x] Bilingual interface (English / Italian)
-- [ ] **60 fps** in Black Ops, GTA IV and Reach: needs ≤16.6 ms per frame on both GPU and CPU
+- [x] Halo: Reach steady at its 30 fps cap
+- [ ] **60 fps** in Black Ops and GTA IV: needs ≤16.6 ms per frame on both GPU and CPU
 - [ ] Keep the depth buffer across color changes (subpasses): Reach's biggest bandwidth lever
 - [ ] Find the root cause of the bindless-texture GPU faults on Mali r49p1
 - [ ] Forza Horizon and Forza Horizon 2 above 30 fps
@@ -354,7 +356,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 26 Oct 2026 | q607 | GTA IV savestates; Reach GPU −12%; NFS Most Wanted in the library |
 | 29 Oct 2026 | q636 | GTA IV black flashing fixed; first public release |
 | 1 Nov 2026 | q636.1 | New library: covers and themes for every game; one-tap FPS limit; clearer statistics; library loads in ~1 s |
-| 1 Nov 2026 | **q636.2** | One swipe = one game in the library |
+| 1 Nov 2026 | q636.2 | One swipe = one game in the library |
+| 1 Nov 2026 | **q646** | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

@@ -28,6 +28,11 @@
 
 #define XE_RESOLVE_HOST_DEPTH_FLAG_HAS_STENCIL (1u << 0u)
 #define XE_RESOLVE_HOST_DEPTH_FLAG_ROUND_DEPTH (1u << 1u)
+// A color resolve of EDRAM owned by this depth buffer: color addressing has no
+// depth half-tile swap, so the samples are fetched swapped, and the format in
+// the resolve info is the color one, so 20e4 comes from FLAG_FLOAT24.
+#define XE_RESOLVE_HOST_DEPTH_FLAG_COLOR_VIEW (1u << 2u)
+#define XE_RESOLVE_HOST_DEPTH_FLAG_FLOAT24 (1u << 3u)
 
 const_buffer_begin_xe(xe_resolve_host_depth, 0, 1, b1, space0)
   uint xe_resolve_host_depth_dispatch_offset;
@@ -167,6 +172,13 @@ uint2_xe XeResolveHostDepthSourceSampleToTexel(
   uint source_tile_y = source_sample.y / tile_size_y;
   uint sample_in_tile_x = source_sample.x - source_tile_x * tile_size_x;
   uint sample_in_tile_y = source_sample.y - source_tile_y * tile_size_y;
+  if ((constant_xe(xe_resolve_host_depth, xe_resolve_host_depth_flags) &
+       XE_RESOLVE_HOST_DEPTH_FLAG_COLOR_VIEW) != 0u) {
+    uint tile_width_half = tile_size_x >> 1u;
+    sample_in_tile_x = sample_in_tile_x >= tile_width_half
+                           ? sample_in_tile_x - tile_width_half
+                           : sample_in_tile_x + tile_width_half;
+  }
   uint source_local_tile =
       source_tile_y *
           constant_xe(xe_resolve_host_depth,
@@ -317,11 +329,16 @@ uint XeResolveHostDepthPack(
       pass_next_after_stencil_texture_xe
       pass_stencil_texture_xe(xe_resolve_host_depth_stencil));
 
+  uint depth_flags =
+      constant_xe(xe_resolve_host_depth, xe_resolve_host_depth_flags);
+  bool depth_float24 =
+      (depth_flags & XE_RESOLVE_HOST_DEPTH_FLAG_COLOR_VIEW) != 0u
+          ? (depth_flags & XE_RESOLVE_HOST_DEPTH_FLAG_FLOAT24) != 0u
+          : resolve_info.edram_format == kXenosDepthRenderTargetFormat_D24FS8;
   uint depth24;
-  if (resolve_info.edram_format == kXenosDepthRenderTargetFormat_D24FS8) {
+  if (depth_float24) {
     bool round_depth =
-        (constant_xe(xe_resolve_host_depth, xe_resolve_host_depth_flags) &
-         XE_RESOLVE_HOST_DEPTH_FLAG_ROUND_DEPTH) != 0u;
+        (depth_flags & XE_RESOLVE_HOST_DEPTH_FLAG_ROUND_DEPTH) != 0u;
     depth24 = XeFloat32To20e4(float_bits_to_uint_xe(depth * 2.0f),
                               round_depth);
   } else {

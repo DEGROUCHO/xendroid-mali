@@ -180,6 +180,22 @@ DEFINE_bool(
     "surface whose pitch is wider, clears in strips), transfer only the "
     "pixels outside that rectangle when changing EDRAM ownership.",
     "GPU");
+DEFINE_bool(
+    rt_cache_prebind_learned_color, false,
+    "When a render pass starts with a depth / stencil render target, also "
+    "bind the color render targets that were last seen added to a pass with "
+    "the same depth render target (write-masked until the guest enables "
+    "them). Deferred lighting (stencil volume pass with color writes off, "
+    "then the light pass with color on) otherwise ends the pass when color "
+    "writes are enabled, storing and reloading the whole depth / stencil "
+    "buffer on tile-based GPUs. A hint is dropped after the color render "
+    "target stays unused in two passes.",
+    "GPU");
+DEFINE_int32(log_rt_cache_prebind, 0,
+             "Diagnostic: log this many color render target prebinds and "
+             "hint updates (rt_cache_prebind_learned_color), plus totals every "
+             "4096 prebinds.",
+             "GPU");
 DEFINE_int32(log_draw_overwrite_cutouts, 0,
              "Diagnostic: log this many ownership changes whose transfers "
              "skip the rectangle overwritten by the draw "
@@ -1705,6 +1721,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rts[0]->AddStencilMaybeSetBits(stencil_bits);
   }
   if (are_accumulated_render_targets_valid_) {
+    if (cvars::rt_cache_prebind_learned_color) {
+      LearnPrebindHint(last_update_used_render_targets_);
+    }
     // Check if the only re-enabling a previously bound render target.
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       RenderTarget* current_rt =
@@ -1763,13 +1782,170 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
   }
   if (!are_accumulated_render_targets_valid_) {
+    if (prebind_pending_slots_) {
+      FinishPrebindPass();
+    }
     std::memcpy(last_update_accumulated_render_targets_,
                 last_update_used_render_targets_,
                 sizeof(last_update_accumulated_render_targets_));
     are_accumulated_render_targets_valid_ = true;
+    if (cvars::rt_cache_prebind_learned_color) {
+      PrebindLearnedColor(pitch_tiles_at_32bpp, msaa_samples);
+    }
+  } else if (prebind_pending_slots_) {
+    // A prebound render target written by this draw - the pass is kept.
+    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(prebind_pending_slots_ & (uint32_t(1) << i)) ||
+          !last_update_used_render_targets_[i]) {
+        continue;
+      }
+      prebind_pending_slots_ &= ~(uint32_t(1) << i);
+      if (prebind_pending_hint_ &&
+          prebind_pending_hint_->depth_key == prebind_pending_depth_key_) {
+        prebind_pending_hint_->misses[i - 1] = 0;
+      }
+      ++prebind_stats_[1];
+    }
   }
 
   return true;
+}
+
+RenderTargetCache::PrebindHint* RenderTargetCache::FindPrebindHint(
+    RenderTargetKey depth_key, bool create) {
+  for (PrebindHint& hint : prebind_hints_) {
+    if (hint.depth_key == depth_key) {
+      return &hint;
+    }
+  }
+  if (!create) {
+    return nullptr;
+  }
+  PrebindHint& hint = prebind_hints_[prebind_hint_next_];
+  prebind_hint_next_ = (prebind_hint_next_ + 1) % kPrebindHintCount;
+  hint = PrebindHint();
+  hint.depth_key = depth_key;
+  return &hint;
+}
+
+void RenderTargetCache::LearnPrebindHint(RenderTarget* const* used_rts) {
+  // Only a pass that would have continued if the added color render targets
+  // had been bound from its beginning: the same depth, and every other slot
+  // either unchanged or not written.
+  const RenderTarget* depth = last_update_accumulated_render_targets_[0];
+  if (!depth || used_rts[0] != depth) {
+    return;
+  }
+  uint32_t added_slots = 0;
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const RenderTarget* accumulated = last_update_accumulated_render_targets_[i];
+    if (!used_rts[i]) {
+      continue;
+    }
+    if (!accumulated) {
+      added_slots |= uint32_t(1) << i;
+    } else if (accumulated != used_rts[i]) {
+      return;
+    }
+  }
+  if (!added_slots) {
+    return;
+  }
+  PrebindHint* hint = FindPrebindHint(depth->key(), true);
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(added_slots & (uint32_t(1) << i))) {
+      continue;
+    }
+    RenderTargetKey color_key = used_rts[i]->key();
+    if (hint->color_keys[i - 1] != color_key && PrebindLogAllowed()) {
+      XELOGI("RtPrebind: learned depth {} -> color{} {}",
+             depth->key().GetDebugName(), i - 1, color_key.GetDebugName());
+    }
+    hint->color_keys[i - 1] = color_key;
+    hint->misses[i - 1] = 0;
+  }
+}
+
+void RenderTargetCache::FinishPrebindPass() {
+  bool hint_valid = prebind_pending_hint_ &&
+                    prebind_pending_hint_->depth_key == prebind_pending_depth_key_;
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(prebind_pending_slots_ & (uint32_t(1) << i))) {
+      continue;
+    }
+    ++prebind_stats_[2];
+    if (hint_valid && ++prebind_pending_hint_->misses[i - 1] >= 2) {
+      if (PrebindLogAllowed()) {
+        XELOGI("RtPrebind: dropped depth {} -> color{} {} (unused twice)",
+               prebind_pending_depth_key_.GetDebugName(), i - 1,
+               prebind_pending_hint_->color_keys[i - 1].GetDebugName());
+      }
+      prebind_pending_hint_->color_keys[i - 1] = RenderTargetKey();
+      prebind_pending_hint_->misses[i - 1] = 0;
+    }
+  }
+  prebind_pending_slots_ = 0;
+  prebind_pending_hint_ = nullptr;
+}
+
+void RenderTargetCache::PrebindLearnedColor(uint32_t pitch_tiles_at_32bpp,
+                                            xenos::MsaaSamples msaa_samples) {
+  RenderTarget** accumulated = last_update_accumulated_render_targets_;
+  if (!accumulated[0]) {
+    return;
+  }
+  RenderTargetKey depth_key = accumulated[0]->key();
+  PrebindHint* hint = FindPrebindHint(depth_key, false);
+  if (!hint) {
+    return;
+  }
+  for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    RenderTargetKey color_key = hint->color_keys[i - 1];
+    if (color_key.IsEmpty() || accumulated[i] ||
+        color_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
+        color_key.msaa_samples != msaa_samples) {
+      continue;
+    }
+    auto it = render_targets_.find(color_key);
+    if (it == render_targets_.end() || !it->second) {
+      continue;
+    }
+    RenderTarget* render_target = it->second;
+    // Not in another slot, and not read by an ownership transfer of this
+    // update (sources are sampled outside the pass).
+    bool conflict = false;
+    for (uint32_t j = 0; j < 1 + xenos::kMaxColorRenderTargets && !conflict;
+         ++j) {
+      if (accumulated[j] == render_target) {
+        conflict = true;
+      }
+      for (const Transfer& transfer : last_update_transfers_[j]) {
+        if (transfer.source == render_target ||
+            transfer.host_depth_source == render_target) {
+          conflict = true;
+          break;
+        }
+      }
+    }
+    if (conflict) {
+      continue;
+    }
+    accumulated[i] = render_target;
+    prebind_pending_slots_ |= uint32_t(1) << i;
+    ++prebind_stats_[0];
+    if (PrebindLogAllowed()) {
+      XELOGI("RtPrebind: depth {} prebinds color{} {}",
+             depth_key.GetDebugName(), i - 1, color_key.GetDebugName());
+    }
+    if (!(prebind_stats_[0] & 4095)) {
+      XELOGI("RtPrebind: prebound {}, written later {}, unused {}",
+             prebind_stats_[0], prebind_stats_[1], prebind_stats_[2]);
+    }
+  }
+  if (prebind_pending_slots_) {
+    prebind_pending_hint_ = hint;
+    prebind_pending_depth_key_ = depth_key;
+  }
 }
 
 uint32_t RenderTargetCache::GetFullyOverwrittenRenderTargets(

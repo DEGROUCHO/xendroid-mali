@@ -1899,6 +1899,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t memexport_mirror_pages_skipped_ = 0;
   void QueueMemexportRamMirror(bool route_to_host);
   void ProcessMemexportRamMirror(uint64_t completed_submission);
+  void MirrorMemexportPage(uint32_t page, uint64_t completed_submission);
+  std::vector<uint32_t> memexport_mirror_pages_scratch_;
+  // log_memexport_ram_mirror, reset every report.
+  struct MemexportMirrorStats {
+    uint64_t ranges = 0, pages = 0, copied = 0, bytes = 0;
+    uint32_t frames = 0;
+  } memexport_mirror_stats_;
 
   // Backend-agnostic resolve-to-guest-RAM copy decisions and read-watch
   // consumption tracking, shared with the D3D12 backend.

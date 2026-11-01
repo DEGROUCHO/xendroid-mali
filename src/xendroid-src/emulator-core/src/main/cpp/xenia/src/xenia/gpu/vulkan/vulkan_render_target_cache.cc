@@ -292,6 +292,17 @@ DEFINE_bool(
 UPDATE_from_bool(vulkan_direct_host_resolve_2x2, 2026, 10, 25, 22, false);
 
 DEFINE_bool(
+    vulkan_direct_host_resolve_foreign_owner, true,
+    "With vulkan_direct_host_resolve: also resolve color directly when the "
+    "EDRAM is owned by a 32bpp color render target of another format, or by a "
+    "depth buffer (bit-exact copies), packing the owner's texels as the EDRAM "
+    "dump would, instead of dumping them through the EDRAM buffer first.",
+    "Vulkan");
+// Default since q640: Halo Reach 4 -> 0 EDRAM dumps per frame (depth, gamma and
+// other-format owners), same bytes, same image.
+UPDATE_from_bool(vulkan_direct_host_resolve_foreign_owner, 2026, 11, 1, 11, false);
+
+DEFINE_bool(
     vulkan_depth_unorm24, true,
     "Use the native D24_UNORM_S8_UINT format for guest 24-bit depth when the "
     "driver supports it. Disable to force the float32 depth emulation path "
@@ -3462,6 +3473,9 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
   };
   constexpr uint32_t kDirectHostResolveDepthFlagHasStencil = 1u << 0;
   constexpr uint32_t kDirectHostResolveDepthFlagRoundDepth = 1u << 1;
+  constexpr uint32_t kDirectHostResolveDepthFlagColorView = 1u << 2;
+  constexpr uint32_t kDirectHostResolveDepthFlagFloat24 = 1u << 3;
+  constexpr uint32_t kDirectHostResolveColorFlagOwnerFormat = 1u << 2;
 
   struct DirectHostResolveSource {
     RenderTargetKey key;
@@ -3519,8 +3533,30 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
              uint32_t(key.msaa_samples), key.resource_format, rect.rows,
              rect.row_first_start, rect.row_last_end);
     }
+    auto owner_fail = [&](const char* reason) {
+      if (cvars::log_inpass_texture_loads) {
+        std::string detail = fmt::format(
+            "owner={}{} msaa={} pitch={}", key.is_depth ? "depth" : "color",
+            uint32_t(key.resource_format), uint32_t(key.msaa_samples),
+            key.GetPitchTiles());
+        LogResolveSiteOnce(resolve_info, reason, detail.c_str());
+      }
+      return false;
+    };
+    // A color resolve of EDRAM owned by a depth buffer (bit-exact copies only)
+    // or by a 32bpp color target of another format: the source texels are
+    // packed as the owner's EDRAM bits, like the dump writes them, and the
+    // resolve then reads those bits as its own format.
+    bool owner_depth_as_color = false;
+    bool owner_foreign_color = false;
     if (key.is_depth != resolve_is_depth) {
-      return debug_fail("owner-kind");
+      if (!cvars::vulkan_direct_host_resolve_foreign_owner || resolve_is_depth ||
+          !copy_shader_is_fast ||
+          xenos::IsColorRenderTargetFormat64bpp(resolve_color_format) ||
+          key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
+        return owner_fail("owner-kind");
+      }
+      owner_depth_as_color = true;
     }
 
     {
@@ -3543,7 +3579,18 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     uint32_t source_flags = 0;
     bool is_64bpp = false;
     xenos::MsaaSamples source_msaa = key.msaa_samples;
-    if (resolve_is_depth) {
+    if (owner_depth_as_color) {
+      if (!depth_float24_convert_in_pixel_shader_ && depth_float24_round_) {
+        source_flags |= kDirectHostResolveDepthFlagRoundDepth;
+      }
+      if (key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8) {
+        source_flags |= kDirectHostResolveDepthFlagFloat24;
+      }
+      source_flags |= kDirectHostResolveDepthFlagHasStencil |
+                      kDirectHostResolveDepthFlagColorView;
+      pipeline = GetDirectHostDepthResolvePipeline(key.msaa_samples,
+                                                   IsDrawResolutionScaled());
+    } else if (resolve_is_depth) {
       if (key.GetDepthFormat() != resolve_depth_format ||
           key.msaa_samples != resolve_info.depth_edram_info.msaa_samples) {
         return debug_fail("depth-format-or-msaa");
@@ -3569,11 +3616,24 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
                                        ? GetColorResourceFormat(
                                              resolve_color_format)
                                        : resolve_color_format)) {
-        return debug_fail("color-format");
+        // A k_8_8_8_8_GAMMA owner is kept linear on the host: the shader
+        // encodes it back to the PWL curve like the dump.
+        if (!cvars::vulkan_direct_host_resolve_foreign_owner ||
+            key.Is64bpp() ||
+            xenos::IsColorRenderTargetFormat64bpp(resolve_color_format) ||
+            (key.GetColorFormat() !=
+                 xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
+             !IsResolveDirectHostRTFullColorSourcePackable(
+                 key.GetColorFormat()))) {
+          return owner_fail("color-format");
+        }
+        owner_foreign_color = true;
+        source_flags |= kDirectHostResolveColorFlagOwnerFormat |
+                        (uint32_t(key.GetColorFormat()) << 8);
       }
       if (key.msaa_samples != resolve_info.color_edram_info.msaa_samples &&
           !source_2x2) {
-        return debug_fail("color-msaa");
+        return owner_fail("color-msaa");
       }
       if (source_2x2) {
         source_msaa = xenos::MsaaSamples::k4X;
@@ -3607,10 +3667,10 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
         rect.GetDispatches(dump_pitch, dump_row_length_used, source.dispatches);
     source.flags = source_flags;
     source.pixels_per_thread = DirectHostResolvePixelsPerThread(
-        copy_shader, is_64bpp, resolve_is_depth, source_msaa);
+        copy_shader, is_64bpp, key.is_depth, source_msaa);
     source.msaa_samples = source_msaa;
     source.is_64bpp = is_64bpp;
-    source.is_depth = resolve_is_depth;
+    source.is_depth = key.is_depth;
     source.source_is_uint = source_is_uint;
     if (!source.dispatch_count) {
       return debug_fail("no-dispatch");
@@ -3626,6 +3686,14 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
       if (dispatch_pixel_width % source.pixels_per_thread) {
         return debug_fail("dispatch-width");
       }
+    }
+    // One pipeline layout (depth or color sources) per resolve.
+    if (!sources.empty() && sources.front().is_depth != source.is_depth) {
+      return debug_fail("mixed-owner-kind");
+    }
+    if (owner_depth_as_color || owner_foreign_color) {
+      LogResolveSiteOnce(resolve_info, "direct-foreign-owner",
+                         owner_depth_as_color ? "depth" : "color");
     }
     sources.push_back(source);
   }
@@ -3798,13 +3866,14 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     push_constants.dest_base -=
         uint32_t(write_descriptor_set_dest_buffer_info.offset);
   }
-  // Bit 31 is host-only, explicitly cleared even if the guest set padding.
-  push_constants.dest_relative.dest_info.value &= ~UINT32_C(0x80000000);
+  // Bits 29:31 are host-only, explicitly cleared even if the guest set padding.
+  push_constants.dest_relative.dest_info.value &= ~UINT32_C(0xE0000000);
   if (texture_copy.size)
-    push_constants.dest_relative.dest_info.value |= UINT32_C(0x80000000);
+    push_constants.dest_relative.dest_info.value |=
+        UINT32_C(0x80000000) | texture_copy.linear_dest_flags;
   VkPipelineLayout pipeline_layout =
-      resolve_is_depth ? direct_host_resolve_pipeline_layout_depth_
-                       : direct_host_resolve_pipeline_layout_color_;
+      sources.front().is_depth ? direct_host_resolve_pipeline_layout_depth_
+                               : direct_host_resolve_pipeline_layout_color_;
   if (IsDrawResolutionScaled()) {
     command_buffer.CmdVkPushConstants(
         pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -6163,10 +6232,10 @@ bool VulkanRenderTargetCache::Resolve(
             }
           }
           copy_shader_constants.dest_relative.dest_info.value &=
-              ~UINT32_C(0x80000000);
+              ~UINT32_C(0xE0000000);
           if (texture_copy.size)
             copy_shader_constants.dest_relative.dest_info.value |=
-                UINT32_C(0x80000000);
+                UINT32_C(0x80000000) | texture_copy.linear_dest_flags;
           // Fully native resolves use the unscaled shader variant with the
           // full push constant layout.
           VkPipelineLayout copy_pipeline_layout =

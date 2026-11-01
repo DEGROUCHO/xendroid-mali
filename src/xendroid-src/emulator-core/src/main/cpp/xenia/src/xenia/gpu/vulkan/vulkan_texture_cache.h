@@ -43,6 +43,8 @@ class VulkanTextureCache final : public TextureCache {
       bool publish;
     };
     VkDeviceSize size = 0;
+    // Host bits for RB_COPY_DEST_INFO of the resolve filling the buffer.
+    uint32_t linear_dest_flags = 0;
     std::vector<Target> targets;
   };
   // The caller holds the shared-memory watch lock from preparation through
@@ -129,6 +131,7 @@ class VulkanTextureCache final : public TextureCache {
   // Removed by the image destructor before it can become a dangling pointer.
   std::unordered_multimap<uint32_t, VulkanTexture*> resolve_textures_;
   uint32_t ResolveTextureBytesPerPixel(const TextureKey& key) const;
+  uint32_t ResolveTextureLinearDestFlags(const TextureKey& key) const;
   // Whether the texture's mips are generated on the host from its base level
   // (vulkan_generate_texture_mips) instead of loaded from guest memory.
   bool ShouldGenerateTextureMips(const TextureKey& key) const;

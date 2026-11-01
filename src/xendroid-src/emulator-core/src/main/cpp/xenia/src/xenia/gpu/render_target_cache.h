@@ -35,6 +35,7 @@ DECLARE_bool(draw_resolution_scaled_texture_offsets);
 DECLARE_bool(gamma_render_target_as_unorm16);
 DECLARE_bool(native_2x_msaa);
 DECLARE_bool(native_stencil_value_output);
+DECLARE_int32(log_rt_cache_prebind);
 DECLARE_bool(snorm16_render_target_full_range);
 
 namespace xe {
@@ -1114,6 +1115,32 @@ class RenderTargetCache {
   // last_update_accumulated_render_targets_ - it's not beneficial or even
   // incorrect to keep the previously bound render targets.
   bool are_accumulated_render_targets_valid_ = false;
+  // rt_cache_prebind_learned_color: per depth render target, the color render
+  // targets last added (in an empty slot) to a pass already holding it.
+  struct PrebindHint {
+    RenderTargetKey depth_key;
+    RenderTargetKey color_keys[xenos::kMaxColorRenderTargets];
+    uint8_t misses[xenos::kMaxColorRenderTargets] = {};
+  };
+  static constexpr size_t kPrebindHintCount = 8;
+  PrebindHint prebind_hints_[kPrebindHintCount];
+  size_t prebind_hint_next_ = 0;
+  // Accumulated color slots (bits 1...4) bound by a hint and not yet written
+  // by a draw, and the hint they came from.
+  uint32_t prebind_pending_slots_ = 0;
+  PrebindHint* prebind_pending_hint_ = nullptr;
+  // The hint entry may be reused for another depth render target meanwhile.
+  RenderTargetKey prebind_pending_depth_key_;
+  uint64_t prebind_stats_[3] = {};  // Prebound, used later, unused.
+  int32_t prebind_logs_ = 0;
+  bool PrebindLogAllowed() {
+    return prebind_logs_ < cvars::log_rt_cache_prebind && ++prebind_logs_;
+  }
+  PrebindHint* FindPrebindHint(RenderTargetKey depth_key, bool create);
+  void LearnPrebindHint(RenderTarget* const* used_rts);
+  void FinishPrebindPass();
+  void PrebindLearnedColor(uint32_t pitch_tiles_at_32bpp,
+                           xenos::MsaaSamples msaa_samples);
   bool rt_trace_claims_ = false;
   // After an update (for simplicity, even an unsuccessful update invalidates
   // this), contains needed ownership transfer sources for each of the current

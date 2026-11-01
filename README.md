@@ -68,6 +68,7 @@
 
 | Game | Early Mali builds | **This release** | What changed |
 |:--|:--:|:--:|:--|
+| Call of Duty: Modern Warfare 2 | ~20 fps, striped picture | **44–57 fps** | The first game of this fork: stripes and rainbow textures fixed; its tuning became the default for every game |
 | Call of Duty: Black Ops | 5–10 fps | **42–60 fps** | Global guest lock removed; memory coherency rebuilt |
 | Grand Theft Auto IV | 24 fps | **33–42 fps** | Fewer 4x transfers; black flashing fixed |
 | Halo: Reach | ~20 fps, rainbow artifacts | **30 fps** steady | MSAA 2×2 layout (+30%); rainbow fixed; GPU export copies cut from 24–34 MB to 0.3 MB per frame |
@@ -77,6 +78,21 @@
 </div>
 
 <sub>Measured on a POCO X7 Pro (Dimensity 8400, Mali-G720), in gameplay, with the guest refresh capped to the game's own vblank. Phones throttle when hot, so the ranges show cool vs warm runs. The MediaTek driver can also cap the GPU clock while charging.</sub>
+
+<details>
+<summary><b>🎯 Where it all started: Modern Warfare 2</b></summary>
+<br>
+
+Modern Warfare 2 was the first game this fork ran on a Mali phone, and most of the Mali work began there.
+
+- **The picture.** At first, gameplay was covered by horizontal stripes: rows of old frames that never went away. The cause was how rectangle lists were expanded on Mali. They now go through the vertex shader, and the stripes are gone. The rainbow-noise textures and particles were fixed next.
+- **The speed.** Profiling MW2 showed that the command processor, not the GPU, was the limit. A quarter of its time went into `mprotect` page watching. Pages the game rewrites every frame are now left unwatched, which cut CPU time per frame by 13–18%.
+- **The rest of the library.** The settings tuned on MW2 (and then Halo) became the defaults for every game. That single change took Black Ops from 5–10 fps to over 30, before any Black Ops-specific work.
+- **Heat matters.** MW2 also showed how hard a hot phone throttles: when the Mali cooling cap kicks in, MW2 drops from 57 to 27 fps. Since then, every change is judged on heat and CPU time per frame, not on fps alone.
+
+<sub>MW2 numbers come from an October build. It has no savestate yet, so it is not part of the current savestate bench.</sub>
+
+</details>
 
 Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with the GPU busy for **41–66%** of each frame and the CPU at **24–29%**, battery at 29–32 °C.
 

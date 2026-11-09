@@ -26,6 +26,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 DEFINE_int32(
@@ -73,6 +74,12 @@ DEFINE_bool(log_image_compression, false,
             "compressed by the driver (AFBC on Mali), per format and creation "
             "flags.",
             "GPU");
+DEFINE_string(
+    vulkan_hide_extensions, "",
+    "Diagnostic: device extensions (comma or space separated, like "
+    "VK_EXT_extended_dynamic_state3) treated as unsupported, to run the "
+    "fallback paths of GPUs and drivers that lack them.",
+    "Vulkan");
 DEFINE_double(vulkan_emulation_queue_priority, 1.0,
               "Priority (0 to 1) of queue 0 of each queue family, used for "
               "emulation, when a second queue (frame generation painting) is "
@@ -594,11 +601,31 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       if (cvars::vulkan_log_capability_audit && with_gpu_emulation) {
         LogCapabilityAudit(vulkan_instance, physical_device, supported_extensions);
       }
+      std::unordered_set<std::string> hidden_extensions;
+      {
+        std::string name;
+        for (char ch : cvars::vulkan_hide_extensions + ",") {
+          if (ch == ',' || ch == ' ') {
+            if (!name.empty()) {
+              hidden_extensions.insert(name);
+            }
+            name.clear();
+          } else {
+            name += ch;
+          }
+        }
+      }
       for (const VkExtensionProperties& supported_extension :
            supported_extensions) {
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
         if (requested_extension_it == requested_extensions.cend()) {
+          continue;
+        }
+        if (!hidden_extensions.empty() &&
+            hidden_extensions.count(supported_extension.extensionName)) {
+          XELOGI("Vulkan device extension {} hidden by vulkan_hide_extensions",
+                 supported_extension.extensionName);
           continue;
         }
         assert_not_null(requested_extension_it->second);

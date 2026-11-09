@@ -27,8 +27,10 @@ class GameSettingsRepository(private val store: ConfigStore, private val titleId
     private var globalValues: Map<String, String?> = emptyMap()
     private var opened = false
 
+    /** adrenotools loads a custom driver on Adreno (kgsl) and on Mali (kbase, e.g. PanVK). */
     val isCustomDriverSupported: Boolean
-        get() = runCatching { File("/dev/kgsl-3d0").exists() }.getOrDefault(false)
+        get() = runCatching { File("/dev/kgsl-3d0").exists() || File("/dev/mali0").exists() }
+            .getOrDefault(false)
 
     @Synchronized
     fun open() {

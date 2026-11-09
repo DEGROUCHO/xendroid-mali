@@ -13,22 +13,23 @@ class SettingsSchemaTest {
 
     private val all = SettingsSchema.allSettings
 
-    // 130 Bool + 20 IntRange + 25 ListChoice + 2 Action = 177 (140 legacy entries + the 9
+    // 131 Bool + 20 IntRange + 25 ListChoice + 2 Action = 178 (140 legacy entries + the 9
     // emulator-wide GPU load / heat controls added on 2026-10-10 + thermal_governor,
-    // framerate_limit_adaptive and the two spin-park times added on 2026-10-11).
+    // framerate_limit_adaptive and the two spin-park times added on 2026-10-11, and
+    // vulkan_compatibility_rendering on 2026-11-02).
     // Display|host_present_from_non_ui_thread
     // is intentionally absent (forced true natively; not a valid user choice).
-    @Test fun total_entry_count_is_177() {
-        assertEquals(177, all.size)
+    @Test fun total_entry_count_is_178() {
+        assertEquals(178, all.size)
         assertEquals(
-            177,
+            178,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(130, all.count { it is Setting.Bool })
+        assertEquals(131, all.count { it is Setting.Bool })
         assertEquals(20, all.count { it is Setting.IntRange })
         assertEquals(25, all.count { it is Setting.ListChoice })
         assertEquals(2, all.count { it is Setting.Action })

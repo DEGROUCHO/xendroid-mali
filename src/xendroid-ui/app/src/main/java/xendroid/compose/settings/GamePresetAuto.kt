@@ -3,6 +3,12 @@ package xendroid.compose.settings
 private fun k(section: String, name: String) = "$section|$name"
 
 /**
+ * Adreno only (kgsl). Not isCustomDriverSupported: custom drivers also load on Mali (kbase),
+ * and Mali must keep the performance preset.
+ */
+fun hostIsAdreno(): Boolean = runCatching { java.io.File("/dev/kgsl-3d0").exists() }.getOrDefault(false)
+
+/**
  * Builds the "Auto" quick preset from the detected GPU vendor.
  *
  * Adreno -> quality-oriented: 2x/2x resolution, MSAA on, fast occlusion queries,

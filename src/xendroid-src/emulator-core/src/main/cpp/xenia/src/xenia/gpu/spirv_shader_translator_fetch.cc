@@ -399,18 +399,21 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
             builder_->createUnaryOp(spv::OpConvertUToF, result_type, words);
       }
       if (!instr.attributes.is_integer) {
+        spv::Op scale_mul_op = used_format_component_count > 1
+                                   ? spv::OpVectorTimesScalar
+                                   : spv::OpFMul;
         if (instr.attributes.is_signed) {
           switch (instr.attributes.signed_rf_mode) {
             case xenos::SignedRepeatingFractionMode::kZeroClampMinusOne:
               result = builder_->createNoContractionBinOp(
-                  spv::OpVectorTimesScalar, result_type, result,
+                  scale_mul_op, result_type, result,
                   builder_->makeFloatConstant(1.0f / 2147483647.0f));
               // No need to clamp to -1 if signed - 1/(2^31-1) is rounded to
               // 1/(2^31) as float32.
               break;
             case xenos::SignedRepeatingFractionMode::kNoZero: {
               result = builder_->createNoContractionBinOp(
-                  spv::OpVectorTimesScalar, result_type, result,
+                  scale_mul_op, result_type, result,
                   builder_->makeFloatConstant(1.0f / 2147483647.5f));
               spv::Id const_no_zero =
                   builder_->makeFloatConstant(0.5f / 2147483647.5f);
@@ -430,7 +433,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
           }
         } else {
           result = builder_->createNoContractionBinOp(
-              spv::OpVectorTimesScalar, result_type, result,
+              scale_mul_op, result_type, result,
               builder_->makeFloatConstant(1.0f / 4294967295.0f));
         }
       }
@@ -592,8 +595,11 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   if (result != spv::NoResult) {
     // Apply the exponent bias.
     if (instr.attributes.exp_adjust) {
+      spv::Id adjusted_type = builder_->getTypeId(result);
       result = builder_->createNoContractionBinOp(
-          spv::OpVectorTimesScalar, builder_->getTypeId(result), result,
+          builder_->isVectorType(adjusted_type) ? spv::OpVectorTimesScalar
+                                                : spv::OpFMul,
+          adjusted_type, result,
           builder_->makeFloatConstant(
               std::ldexp(1.0f, instr.attributes.exp_adjust)));
     }

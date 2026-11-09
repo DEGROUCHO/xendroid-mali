@@ -31,8 +31,10 @@ class SettingsRepository(private val store: ConfigStore) {
     /** Set by close(): after teardown, ensureOpen() must not resurrect the handle. */
     private var terminated = false
 
+    /** adrenotools loads a custom driver on Adreno (kgsl) and on Mali (kbase, e.g. PanVK). */
     val isCustomDriverSupported: Boolean
-        get() = runCatching { File("/dev/kgsl-3d0").exists() }.getOrDefault(false)
+        get() = runCatching { File("/dev/kgsl-3d0").exists() || File("/dev/mali0").exists() }
+            .getOrDefault(false)
 
     /** Open the live config + read template defaults. Call once per screen entry.
      *  @Synchronized so the off-main load() and the lifecycle pause/resume flush can't

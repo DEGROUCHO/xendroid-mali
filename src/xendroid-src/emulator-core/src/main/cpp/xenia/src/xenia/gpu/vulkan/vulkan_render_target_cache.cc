@@ -46,6 +46,7 @@ DECLARE_bool(rt_cache_transfer_known_constants);
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/render_target_retirement.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_compatibility.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
@@ -278,6 +279,15 @@ DEFINE_bool(
     "render-pass break and a DRAM round-trip on the resolve path. Ineligible "
     "cases (gamma, unsupported formats, multi-sample selects) fall back to the "
     "EDRAM dump path. Disable to always use the EDRAM dump path.",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_compatibility_rendering, false,
+    "Compatibility rendering: turns off the render target -> texture shortcuts "
+    "(vulkan_texture_from_render_target, vulkan_direct_host_resolve, "
+    "vulkan_resolve_texture_copy, vulkan_color_surface_resolve, "
+    "vulkan_in_pass_transfers), so resolves take the plain compute path. For "
+    "drivers that show a black image with them (Mali-G615 r44p1). Costs GPU "
+    "time (Halo Reach on Mali-G720: about 6 ms per frame).",
     "Vulkan");
 
 DEFINE_bool(
@@ -5635,7 +5645,7 @@ bool VulkanRenderTargetCache::TryDeferredDepthSurfaceResolve(
     VulkanTextureCache& texture_cache) {
   const bool depth = info.IsCopyingDepth();
   if (!shared_memory.CanPublishDepthSurface() ||
-      (!depth && !cvars::vulkan_color_surface_resolve) ||
+      (!depth && !RenderTargetShortcut(cvars::vulkan_color_surface_resolve)) ||
       IsDrawResolutionScaled() ||
       GetPath() != Path::kHostRenderTargets || !info.copy_dest_extent_length) {
     ++depth_surface_stats_.fallback_schema;
@@ -5956,7 +5966,7 @@ bool VulkanRenderTargetCache::Resolve(
                                      dump_pitch)) {
         return false;
       }
-      if (cvars::vulkan_texture_from_render_target &&
+      if (RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
           !command_processor_.deferred_resolve_recording_ &&
           TryDeferredDepthSurfaceResolve(resolve_info, shared_memory,
                                         texture_cache)) {
@@ -5969,7 +5979,8 @@ bool VulkanRenderTargetCache::Resolve(
       // must not materialize it first (with a GPU wait) for nothing.
       // Publication happens at record time for a resolve recorded for the
       // end of the pass too, so a complete overwrite may retire records then.
-      if (!copied && cvars::vulkan_texture_from_render_target &&
+      if (!copied &&
+          RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
           copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
         DiscardSurfaceOverwrittenByResolve(
             resolve_info, shared_memory,
@@ -6016,7 +6027,7 @@ bool VulkanRenderTargetCache::Resolve(
           }
         }
       }
-      if (!copied && cvars::vulkan_direct_host_resolve &&
+      if (!copied && RenderTargetShortcut(cvars::vulkan_direct_host_resolve) &&
           copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
         copied = TryDirectHostResolveCopy(
             resolve_info, copy_shader_constants, copy_shader, dump_base,
@@ -6574,7 +6585,7 @@ void VulkanRenderTargetCache::LogResolveDetailsOnFrameEnd() {
     in_pass_transfer_verdicts_ = {};
     in_pass_transfer_frames_ = 0;
   }
-  if (cvars::vulkan_texture_from_render_target) {
+  if (RenderTargetShortcut(cvars::vulkan_texture_from_render_target)) {
     auto& d = depth_surface_stats_;
     const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -7140,7 +7151,7 @@ bool VulkanRenderTargetCache::Update(
       // Clear chains this draw starts (their sources get readable below).
       uint32_t clear_chains_started = 0;
       if (any_transfers) {
-        if (cvars::vulkan_in_pass_transfers) {
+        if (RenderTargetShortcut(cvars::vulkan_in_pass_transfers)) {
           // Try to queue each render target's transfers for in-pass execution;
           // transfers that can't be merged into the active pass fall back to
           // the immediate (pass-breaking) path.

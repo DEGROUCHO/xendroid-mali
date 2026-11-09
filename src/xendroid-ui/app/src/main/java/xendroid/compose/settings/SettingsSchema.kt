@@ -26,6 +26,7 @@ object SettingsSchema {
             b("Vulkan", "vulkan_async_skip_draws", l10n("Skip async draws", "Salta draw asincroni"), true),
             b("Vulkan", "vulkan_placeholder_pipelines", l10n("Placeholder pipelines", "Pipeline sostitutive"), false),
             b("Vulkan", "vulkan_dynamic_pipeline_state", l10n("Extended dynamic state", "Stato dinamico esteso"), true),
+            b("Vulkan", "vulkan_compatibility_rendering", l10n("Compatibility rendering", "Rendering di compatibilità"), false),
             // A slider, not a dropdown: 0 = synchronous, 1..5 = explicit. The native cvar also
             // accepts -1 (auto), but a 0..5 slider is the intended UX.
             i("Vulkan", "vulkan_pipeline_creation_threads", l10n("Pipeline creation threads", "Thread di creazione pipeline"), 4, 0, 5),

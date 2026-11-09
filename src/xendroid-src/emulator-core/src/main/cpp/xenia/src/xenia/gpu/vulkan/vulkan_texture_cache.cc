@@ -29,6 +29,7 @@
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_compatibility.h"
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -1676,10 +1677,11 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
   }
   bool depth_surface_renderable = false;
   // Resolve destinations the render target cache can draw straight into.
-  const bool color_surface = cvars::vulkan_color_surface_resolve &&
-                             key.format == xenos::TextureFormat::k_8_8_8_8 &&
-                             formats[0] == VK_FORMAT_R8G8B8A8_UNORM;
-  if (cvars::vulkan_texture_from_render_target &&
+  const bool color_surface =
+      RenderTargetShortcut(cvars::vulkan_color_surface_resolve) &&
+      key.format == xenos::TextureFormat::k_8_8_8_8 &&
+      formats[0] == VK_FORMAT_R8G8B8A8_UNORM;
+  if (RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
       ((key.format == xenos::TextureFormat::k_24_8_FLOAT &&
         formats[0] == VK_FORMAT_R32_SFLOAT &&
         formats[1] == VK_FORMAT_UNDEFINED) ||
@@ -2303,7 +2305,7 @@ VulkanTextureCache::PrepareResolveTextureCopy(
     const global_unique_lock_type& lock) {
   assert_true(lock.owns_lock());
   ResolveTextureCopy copy;
-  if (!cvars::vulkan_resolve_texture_copy ||
+  if (!RenderTargetShortcut(cvars::vulkan_resolve_texture_copy) ||
       info.copy_dest_info.copy_dest_array ||
       uint32_t(info.copy_dest_info.copy_dest_endian) >= 4) {
     NoteResolveCopy(kRcArrayOrEndian);

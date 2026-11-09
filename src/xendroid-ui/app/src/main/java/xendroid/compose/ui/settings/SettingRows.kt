@@ -179,7 +179,7 @@ private fun ExportLogsRow(s: Setting.Action) {
 
 @Composable
 private fun DriverActionRow(host: SettingsHost, s: Setting.Action, modified: Boolean, raw: String?) {
-    if (!host.isCustomDriverSupported) return  // gated: not an Adreno/kgsl device
+    if (!host.isCustomDriverSupported) return  // gated: no kgsl (Adreno) or kbase (Mali) device
     val context = LocalContext.current
     val current = raw ?: host.currentDriverPath(s)   // snapshot-backed; recomposes on change
     // .zip picker -> install via Utils on the host Activity (see note below).

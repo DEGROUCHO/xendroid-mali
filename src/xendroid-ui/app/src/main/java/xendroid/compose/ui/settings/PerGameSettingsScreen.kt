@@ -25,6 +25,7 @@ import xendroid.compose.settings.GameSettingsViewModel
 import xendroid.compose.settings.PerGamePresets
 import xendroid.compose.settings.SettingsCategory
 import xendroid.compose.settings.autoPreset
+import xendroid.compose.settings.hostIsAdreno
 
 /**
  * The per-game override editor: the same two-level INDEX -> DETAIL shape as
@@ -123,7 +124,7 @@ private fun PerGameIndex(
                         FilterChip(
                             selected = appliedPreset == "auto",
                             onClick = {
-                                vm.applyPreset(autoPreset(vm.isCustomDriverSupported))
+                                vm.applyPreset(autoPreset(hostIsAdreno()))
                                 vm.flush()
                                 appliedPreset = "auto"
                             },

@@ -115,6 +115,8 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
 | Midnight Club: Los Angeles | 🟡 Runs | ~21 | Steady while driving, no graphical glitches; slower after long sessions · player report [#1](../../issues/1) |
 | WWE 2K14 | ✅ Playable | 39–43 in the ring | Entrances 24–30 · savestates · [📸 screenshots](#player-screenshots) · fixed after player report [#3](../../issues/3) |
+| Armored Core: For Answer | ✅ Playable | 30 | Steady on battery at default settings; only a little warm after 20–25 minutes · player report [#11](../../issues/11) |
+| GRID 2 | 🟡 Runs | 20–30 | 29–30 on clean laps, 19–23 during crashes · player report [#8](../../issues/8) |
 
 <sub>✅ playable · 🟡 boots and plays below 30 fps · ❌ does not reach gameplay · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
 
@@ -328,6 +330,24 @@ Title updates apply the next time the game starts: Halo: Reach shows version 1.1
 </details>
 
 <details>
+<summary><b>Black screen, but the game runs and sound plays (Mali-G615 and other older Mali drivers)?</b></summary>
+<br>
+Turn on <b>Settings → Vulkan → Compatibility rendering</b>. It turns off the shortcuts that pass rendered images straight on as textures, which some older Mali drivers (for example Mali-G615 with driver r44p1) turn into a black picture. It can cost a few fps, so leave it off if your picture is fine. Please tell us in an <a href="../../issues/new/choose">issue</a> whether it worked on your phone, with the logs (<b>Settings → Logging → Export session logs to Downloads</b>).
+</details>
+
+<details>
+<summary><b>Can I use a custom Vulkan driver (PanVK, Turnip)?</b></summary>
+<br>
+Yes: <b>Settings → Vulkan → Custom Vulkan driver</b> installs a driver <code>.zip</code>, and <b>Use default driver</b> goes back. It shows on Adreno and on Mali. On Mali the phone's own driver is what this project is tuned and tested on. PanVK crashed the GPU on our Mali-G720, but other Mali generations may behave differently.
+</details>
+
+<details>
+<summary><b>Why is a game stuck at 30 fps?</b></summary>
+<br>
+Many Xbox 360 games are locked to 30 fps on the console itself, and the emulator keeps that lock so they run at the right speed. On top of that, <b>Heat: steady 30 FPS when 60 can't be held</b> (Settings → GPU) is on by default. When a 60 fps game can't hold 60, it plays at a steady 30 instead of jumping between 35 and 50, which keeps the phone much cooler. Turn it off if you prefer the higher, uneven frame rate, and check that <b>Frame rate limit</b> is 60.
+</details>
+
+<details>
 <summary><b>Why does the fps drop after a while?</b></summary>
 <br>
 Heat. Every phone lowers its GPU and CPU clocks when it gets hot, and some drivers also cap the GPU while charging. A cooler or a fan makes a large difference.
@@ -402,7 +422,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 1 Nov 2026 | q636.2 | One swipe = one game in the library |
 | 1 Nov 2026 | q646 | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
 | 1 Nov 2026 | q651 | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
-| 1 Nov 2026 | **q652** | DLC and title updates found next to a game are offered for install; imported saves go to the signed-in profile |
+| 1 Nov 2026 | q652 | DLC and title updates found next to a game are offered for install; imported saves go to the signed-in profile |
+| 9 Nov 2026 | **q655** | **Compatibility rendering** switch for black screens on older Mali drivers (Mali-G615); **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

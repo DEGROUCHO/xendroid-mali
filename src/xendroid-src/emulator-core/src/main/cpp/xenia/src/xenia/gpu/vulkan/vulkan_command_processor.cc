@@ -43,6 +43,7 @@
 #include "xenia/gpu/spirv_fsi_system_constants.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/texture_util.h"
+#include "xenia/gpu/vulkan/vulkan_compatibility.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
@@ -9555,7 +9556,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   // Depth resolves go to the surface path when it's on (no compute at all),
   // which a deferred recording would skip.
   const bool depth_to_surface =
-      cvars::vulkan_texture_from_render_target &&
+      RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
       register_file_->Get<reg::RB_COPY_CONTROL>().copy_src_select >=
           xenos::kMaxColorRenderTargets;
   const bool try_defer = cvars::vulkan_resolve_defer && in_render_pass_ &&

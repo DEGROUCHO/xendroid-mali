@@ -28,6 +28,11 @@
 </p>
 
 <p align="center">
+  <a href="https://donate.stripe.com/fZucN52Br25Oaph0YV5kk01"><img src="https://img.shields.io/badge/%F0%9F%92%96%20Support%20the%20project-Donate-ff5c8a?style=for-the-badge&logo=stripe&logoColor=white&labelColor=0d1117" alt="Donate to XenDroid Ultimate Mali" height="52"></a>
+</p>
+<p align="center"><sub>Free forever, built on a real phone in spare hours. If it runs your games, a small donation pays for more games, more fps and cooler phones.</sub></p>
+
+<p align="center">
   <a href="../../releases/latest"><b>⬇️ Download the APK</b></a>
   &nbsp;·&nbsp; <a href="#-performance">📊 Performance</a>
   &nbsp;·&nbsp; <a href="#-game-compatibility">🎮 Games</a>
@@ -40,7 +45,7 @@
 </p>
 
 > [!NOTE]
-> **New in q652:** **DLC and title updates just work**: put them next to your games and the app offers to install them when you start the game. Imported **saves** now go to your profile, where games find them. Since q651: **WWE 2K14 is playable**, the full **community patch catalog** is built in (with **Import** for your own `.patch.toml`), and less **audio crackle**. [Download](../../releases/latest)
+> **New in q655:** black screen on **Mali-G615** (Xiaomi 14T, POCO X6 Pro, Tecno Pova 7 Ultra) while the game runs? Turn on **Settings → Vulkan → Compatibility rendering**. **Custom Vulkan drivers** (e.g. PanVK) can now be installed on Mali too. Since q652: DLC and title updates next to your games are offered for install.
 
 <br>
 
@@ -102,23 +107,41 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 
 ## 🎮 Game compatibility
 
-| Game | Status | FPS on a POCO X7 Pro | Notes |
+| Game | Status | FPS (POCO X7 Pro unless noted) | Notes |
 |:--|:--:|:--:|:--|
 | Dante's Inferno | ✅ Great | 60 locked · ~110 free | Savestates |
 | Call of Duty: Black Ops | ✅ Playable | 42–60 | Savestates · occasional square artifacts |
 | Need for Speed: Most Wanted | ✅ Playable | 44–51 | Also runs well in races on a **POCO X8 Pro** (player report) |
 | Call of Duty: Modern Warfare 2 | ✅ Playable | 44–57 | Measured on an October build |
-| Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing |
+| Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing · also runs smoothly on a Dimensity 8400+ (player report) |
 | Halo: Reach | ✅ Great | 30 locked | Steady at its own cap, even hot · savestates |
 | Forza Horizon | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
 | Forza Horizon 2 | 🟡 Runs | ~24 | Player reports on POCO X7 Pro and POCO X8 Pro: stable |
-| Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
+| Metal Gear Rising: Revengeance | ✅ Playable | 30–45 | Smooth combat and boss fights, 30 fps at default settings (player reports) · [📸 screenshots](#player-screenshots) · player report [#2](../../issues/2) |
 | Midnight Club: Los Angeles | 🟡 Runs | ~21 | Steady while driving, no graphical glitches; slower after long sessions · player report [#1](../../issues/1) |
 | WWE 2K14 | ✅ Playable | 39–43 in the ring | Entrances 24–30 · savestates · [📸 screenshots](#player-screenshots) · fixed after player report [#3](../../issues/3) |
 | Armored Core: For Answer | ✅ Playable | 30 | Steady on battery at default settings; only a little warm after 20–25 minutes · player report [#11](../../issues/11) |
 | GRID 2 | 🟡 Runs | 20–30 | 29–30 on clean laps, 19–23 during crashes · player report [#8](../../issues/8) |
+| UFC Undisputed 3 | ✅ Playable | 40–50 | No rendering or audio issues; lock 30 for long sessions without a cooler (player review) |
+| Forza Motorsport 2 | ✅ Playable | ~50 | No graphical glitches, smooth (player review) |
+| Mirror's Edge | ✅ Playable | 35–45 outdoors · ~56 indoors | With the community patches on; some shadow flicker and late streaming in two cutscenes (player review) |
+| Fight Night Champion | ✅ Playable | 30 locked | Clean rendering; audio sometimes slows down and crackles (player review) |
+| Fallout 3 | ✅ Playable | 30 | Menus, character creation and early game fine; faces render black in the opening birth scene, fix in progress |
+| Lost Planet 2 | ✅ Playable | — | Offline mode works; some textures load in visibly (player report) |
+| DiRT 2 | ✅ Playable | — | Runs perfectly on a **Dimensity 9400+**; race loading takes a while (player report) |
+| Resident Evil: Revelations | ✅ Playable | — | Running well so far (early player report) |
+| Import Tuner Challenge | ✅ Playable | — | Turn on its community patch: without it the screen goes black after the first race (player report, POCO X8 Pro) |
+| Spider-Man: Web of Shadows | 🟡 Runs | 19–27 | Some faces and Central Park walls don't render (player review) |
+| Forza Motorsport 3 | 🟠 Issues | 40–45 | Broken shadows, flickering lighting, late textures, audio crackle (player review) |
+| Forza Motorsport 4 | 🟠 Issues | 40–45 | Same as Forza Motorsport 3 (player review) |
+| FIFA 16 | 🟠 Issues | 38–45 | Player physics broken in matches, fix in progress; menus above 150 fps, clean audio (player review) |
+| Dead or Alive Xtreme 2 | ❌ Crashes | — | Crashes on the main menu or entering Zack Island (player review) |
 
-<sub>✅ playable · 🟡 boots and plays below 30 fps · ❌ does not reach gameplay · player reports come from people running this build on their own phones. Tried another game? [Tell us how it runs](../../issues/new?template=device-report.yml).</sub>
+<p><b>Also reported running:</b> Pro Evolution Soccer 2017 and International Cricket 2010 (Tecno Camon 30 Pro, Dimensity 8200). The "player review" rows come from a detailed test of eight games on a POCO X7 Pro by <b>tsukyo25</b> on Reddit. Thank you!</p>
+
+<p>✅ playable · 🟡 boots and plays below 30 fps · 🟠 plays with major bugs · ❌ does not reach gameplay · — not measured · player reports come from people running this build on their own phones. Tried another game? <a href="../../issues/new?template=device-report.yml">Tell us how it runs</a>.</p>
+
+<p align="center"><b>Your game runs?</b> ⭐ <a href="../../stargazers">Star the repo</a> · 💖 <a href="https://donate.stripe.com/fZucN52Br25Oaph0YV5kk01">Donate</a> · 📝 <a href="../../issues/new?template=device-report.yml">Report it</a></p>
 
 <a id="player-screenshots"></a>
 ### 📸 From the community

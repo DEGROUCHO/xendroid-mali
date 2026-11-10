@@ -764,6 +764,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void PostTranslation() override;
 
   void ProcessLabel(uint32_t cf_index) override;
+  // Forward-only control flow: each label starts a one-pass do-while(false)
+  // segment, entered when no pending jump targets a later label.
+  void OpenForwardSegment(uint32_t cf_index);
+  void CloseForwardSegment();
 
   void ProcessExecInstructionBegin(const ParsedExecInstruction& instr) override;
   void ProcessExecInstructionEnd(const ParsedExecInstruction& instr) override;
@@ -1562,6 +1566,24 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Block* main_switch_header_;
   std::unique_ptr<spv::Instruction> main_switch_op_;
   spv::Block* main_switch_merge_;
+  // Forward jump segments (instead of the main switch, for shaders whose jumps
+  // all go forward). The int variable holds the label a taken jump goes to
+  // (0 when none, INT32_MAX after exece); a segment runs if it is <= its label.
+  bool main_forward_segments_ = false;
+  spv::Id var_main_forward_target_ = spv::NoResult;
+  spv::Block* main_segment_loop_header_ = nullptr;
+  spv::Block* main_segment_continue_ = nullptr;
+  spv::Block* main_segment_merge_ = nullptr;
+  spv::Block* main_segment_guard_merge_ = nullptr;
+  // Guest loops translated as SPIR-V loops in the forward segment mode.
+  struct ForwardGuestLoop {
+    uint32_t skip_address;  // endloop + 1
+    spv::Block* header;
+    spv::Block* continue_target;
+    spv::Block* merge;
+    spv::Block* guard_merge;
+  };
+  std::vector<ForwardGuestLoop> main_forward_guest_loops_;
   std::vector<spv::Id> main_switch_next_pc_phi_operands_;
 
   // If the exec bool constant / predicate conditional is open, block after it

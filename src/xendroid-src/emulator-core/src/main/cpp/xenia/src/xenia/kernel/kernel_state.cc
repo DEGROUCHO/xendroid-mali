@@ -859,6 +859,8 @@ const object_ref<UserModule> KernelState::LoadTitleUpdate(
   auto patch_module = object_ref<UserModule>(new UserModule(this));
 
   X_RESULT result = patch_module->LoadFromFile(patch_path);
+  // Nothing looks the patch up by handle so the last reference frees it.
+  patch_module->ReleaseHandle();
   if (result != X_STATUS_SUCCESS) {
     XELOGE("Failed to load XEX patch, code: {}", result);
     return nullptr;
@@ -1085,6 +1087,15 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(kXNotificationLiveConnectionChanged,
                                   0x001510F1L);
     listener->EnqueueNotification(kXNotificationLiveLinkStateChanged, 0);
+  }
+
+  if (!has_notified_xmp_startup_ && listener->mask() & kXNotifyXmp) {
+    has_notified_xmp_startup_ = true;
+    // Playback state is idle until the media player broadcasts a transition
+    // of its own, so only the controller is worth priming.
+    listener->EnqueueNotification(
+        kXNotificationXmpPlaybackControllerChanged,
+        emulator()->audio_media_player()->IsTitleInPlaybackControl());
   }
 }
 

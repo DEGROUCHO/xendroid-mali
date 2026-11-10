@@ -22,6 +22,10 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/ring_buffer.h"
 
+#if XE_ARCH_ARM64
+#include <arm_neon.h>
+#endif
+
 extern "C" {
 #if XE_COMPILER_MSVC
 #pragma warning(push)
@@ -59,6 +63,18 @@ void XmaContext::DumpRaw(AVFrame* frame, int id) {
   }
   fclose(outfile);
 }
+
+#if XE_ARCH_ARM64
+// FCVTNS saturates (NaN -> 0, positive overflow -> INT32_MAX); x86's CVTPS2DQ
+// yields the integer indefinite value instead, which PACKSSDW turns into
+// -32768. Substitute it so both backends produce identical samples.
+static inline int32x4_t ConvertToInt32X64(float32x4_t v) {
+  // |v| < 2^31 is false for NaN and the infinities. v == -2^31 also reports
+  // false, but its in-range conversion is INT32_MIN too, so this stays exact.
+  const uint32x4_t representable = vcaltq_f32(v, vdupq_n_f32(2147483648.0f));
+  return vbslq_s32(representable, vcvtnq_s32_f32(v), vdupq_n_s32(INT32_MIN));
+}
+#endif  // XE_ARCH_ARM64
 
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
                               uint8_t* output_buffer) {

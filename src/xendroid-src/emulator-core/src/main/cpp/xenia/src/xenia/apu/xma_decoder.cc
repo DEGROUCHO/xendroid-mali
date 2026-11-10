@@ -74,6 +74,7 @@ DEFINE_bool(use_dedicated_xma_thread, true,
             "Enables XMA decoding on separate thread. Disabled should produce "
             "better results, but decrease performance a bit.",
             "APU");
+UPDATE_from_bool(use_dedicated_xma_thread, 2026, 8, 21, 0, true);
 
 DEFINE_bool(xma_kick_decode_on_caller, true,
             "With the dedicated XMA thread and the new decoder, a context kick "
@@ -426,6 +427,8 @@ uint32_t XmaDecoder::AllocateContext() {
   XmaContext& context = *contexts_[index];
   assert_false(context.is_allocated());
   context.set_is_allocated(true);
+  std::memset(memory()->TranslateVirtual(context.guest_ptr()), 0,
+              sizeof(XMA_CONTEXT_DATA));
   return context.guest_ptr();
 }
 

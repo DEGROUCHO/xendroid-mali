@@ -45,7 +45,7 @@
 </p>
 
 > [!NOTE]
-> **New in q655:** black screen on **Mali-G615** (Xiaomi 14T, POCO X6 Pro, Tecno Pova 7 Ultra) while the game runs? Turn on **Settings → Vulkan → Compatibility rendering**. **Custom Vulkan drivers** (e.g. PanVK) can now be installed on Mali too. Since q652: DLC and title updates next to your games are offered for install.
+> **New in q664:** **FIFA 16** plays properly (players no longer freeze or teleport on the ball, the whole pitch is lit) and **Dead or Alive Xtreme 2** gets past the main menu to Zack Island. Both were reported by players. Since q655: black screen on **Mali-G615** while the game runs? Turn on **Settings → Vulkan → Compatibility rendering**; **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too.
 
 <br>
 
@@ -131,13 +131,13 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | DiRT 2 | ✅ Playable | — | Runs perfectly on a **Dimensity 9400+**; race loading takes a while (player report) |
 | Resident Evil: Revelations | ✅ Playable | — | Running well so far (early player report) |
 | Import Tuner Challenge | ✅ Playable | — | Turn on its community patch: without it the screen goes black after the first race (player report, POCO X8 Pro) |
+| FIFA 16 | ✅ Playable | 47–60 | **Fixed in q664:** players froze and slid forward when touching the ball, and half of the pitch was black. Both gone; clean audio (reported in a player review) |
+| Dead or Alive Xtreme 2 | ✅ Playable | 30 | **Fixed in q664:** it hung on the main menu and in cutscenes. Now reaches Zack Island and its shops (reported in a player review) |
 | Spider-Man: Web of Shadows | 🟡 Runs | 19–27 | Some faces and Central Park walls don't render (player review) |
 | Forza Motorsport 3 | 🟠 Issues | 40–45 | Broken shadows, flickering lighting, late textures, audio crackle (player review) |
 | Forza Motorsport 4 | 🟠 Issues | 40–45 | Same as Forza Motorsport 3 (player review) |
-| FIFA 16 | 🟠 Issues | 38–45 | Player physics broken in matches, fix in progress; menus above 150 fps, clean audio (player review) |
-| Dead or Alive Xtreme 2 | ❌ Crashes | — | Crashes on the main menu or entering Zack Island (player review) |
 
-<p><b>Also reported running:</b> Pro Evolution Soccer 2017 and International Cricket 2010 (Tecno Camon 30 Pro, Dimensity 8200). The "player review" rows come from a detailed test of eight games on a POCO X7 Pro by <b>tsukyo25</b> on Reddit. Thank you!</p>
+<p><b>Also reported running:</b> Pro Evolution Soccer 2017 and International Cricket 2010 (Tecno Camon 30 Pro, Dimensity 8200). The "player review" rows come from a detailed test of eight games on a POCO X7 Pro by <b>tsukyo25</b> on Reddit: two of the games that review found broken, FIFA 16 and Dead or Alive Xtreme 2, are fixed in q664. Thank you!</p>
 
 <p>✅ playable · 🟡 boots and plays below 30 fps · 🟠 plays with major bugs · ❌ does not reach gameplay · — not measured · player reports come from people running this build on their own phones. Tried another game? <a href="../../issues/new?template=device-report.yml">Tell us how it runs</a>.</p>
 
@@ -164,6 +164,14 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
   </tr>
 </table>
 <p align="center"><sub><b>WWE 2K14</b> on a POCO X7 Pro with build q651. It used to crash as a match started; reported in <a href="../../issues/3">#3</a>.</sub></p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/fifa-16.jpg" alt="FIFA 16, a match at 60 fps with the whole pitch lit"></td>
+    <td width="50%"><img src="docs/media/doax2-zack-island.jpg" alt="Dead or Alive Xtreme 2, the accessory shop on Zack Island at 30 fps"></td>
+  </tr>
+</table>
+<p align="center"><sub><b>FIFA 16</b> and <b>Dead or Alive Xtreme 2</b> on a POCO X7 Pro with build q664. Both were broken in <b>tsukyo25</b>'s review on Reddit: FIFA's players froze on the ball, Dead or Alive hung on its menu. Thank you for the report!</sub></p>
 
 <br>
 
@@ -446,7 +454,8 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 1 Nov 2026 | q646 | Halo: Reach steady at 30 fps; no more one-frame flicker of rocks, trees and characters |
 | 1 Nov 2026 | q651 | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
 | 1 Nov 2026 | q652 | DLC and title updates found next to a game are offered for install; imported saves go to the signed-in profile |
-| 9 Nov 2026 | **q655** | **Compatibility rendering** switch for black screens on older Mali drivers (Mali-G615); **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too |
+| 9 Nov 2026 | q655 | **Compatibility rendering** switch for black screens on older Mali drivers (Mali-G615); **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too |
+| 10 Nov 2026 | **q664** | **FIFA 16** player physics and black pitch fixed; **Dead or Alive Xtreme 2** no longer hangs on its menu: shaders with branches and loops are translated without the big dispatch loop that sent the Mali shader compiler into minutes-long compiles; a pipeline the driver never finishes no longer blacks out the next boots; cleaner XMA audio decoding; Battlefield 2: Modern Combat ground fix (needs player confirmation) |
 
 More than 600 test builds, each measured on the phone before a change was kept.
 

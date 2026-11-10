@@ -942,12 +942,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
     }
 
-    pipeline_storage_file_flush_needed_ = true;
-    PipelineStoredDescription stored_description;
-    stored_description.description_hash = description.GetHash();
-    std::memcpy(&stored_description.description, &description,
-                sizeof(description));
-    storage_writer_.QueuePipelineWrite(stored_description);
+    // Queued by the creation itself, once the driver has returned.
+    pipeline_pair.second.storage_write_pending.store(
+        true, std::memory_order_release);
   }
 
   // Get tessellation shaders if needed.
@@ -3106,6 +3103,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   }
   VkPipeline pipeline;
   VkResult result;
+  // Paired with "Pipeline created": a creation the driver never returns from
+  // (seen on Mali r49 with Dead or Alive Xtreme 2) is the one left unpaired.
+  XELOGI("Pipeline creating ({}) for VS {:016X}, PS {:016X}",
+         creating_placeholder ? "placeholder" : "real",
+         creation_arguments.vertex_shader->shader().ucode_data_hash(),
+         creation_arguments.pixel_shader
+             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+             : 0);
   bool feedback_valid = false;
   bool application_cache_hit = false;
   {
@@ -3219,6 +3224,18 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     creation_arguments.pipeline->second.is_placeholder.store(
         false, std::memory_order_release);
     cp_wait_stats::pipelines_created.fetch_add(1, std::memory_order_relaxed);
+    if (creation_arguments.pipeline->second.storage_write_pending.exchange(
+            false, std::memory_order_acq_rel) &&
+        storage_writer_.is_active()) {
+      const PipelineDescription& created_description =
+          creation_arguments.pipeline->first;
+      PipelineStoredDescription stored_description;
+      stored_description.description_hash = created_description.GetHash();
+      std::memcpy(&stored_description.description, &created_description,
+                  sizeof(created_description));
+      storage_writer_.QueuePipelineWrite(stored_description);
+      pipeline_storage_file_flush_needed_ = true;
+    }
     XELOGI("Pipeline created for VS {:016X}, PS {:016X}",
            creation_arguments.vertex_shader->shader().ucode_data_hash(),
            creation_arguments.pixel_shader

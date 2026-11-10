@@ -20,6 +20,9 @@
 DEFINE_bool(inline_mmio_access, true, "Inline constant MMIO loads and stores.",
             "CPU");
 
+DEFINE_bool(fold_vec128_constants, true,
+            "Bisect aid: constant-fold instructions that take a constant "
+            "vector operand.", "CPU");
 DEFINE_bool(permit_float_constant_evaluation, false,
             "Allow float constant evaluation, may produce incorrect results "
             "and break games math",
@@ -77,6 +80,15 @@ bool ConstantPropagationPass::Run(HIRBuilder* builder, bool& result) {
       if (((i->opcode->flags & OPCODE_FLAG_DISALLOW_CONSTANT_FOLDING) != 0) &&
           !cvars::permit_float_constant_evaluation) {
         continue;
+      }
+      if (!cvars::fold_vec128_constants) {
+        bool vector_constant = false;
+        i->VisitValueOperands([&vector_constant](Value* operand, uint32_t) {
+          vector_constant |= operand->type == VEC128_TYPE && operand->IsConstant();
+        });
+        if (vector_constant) {
+          continue;
+        }
       }
       bool might_be_floatop = false;
 

@@ -49,6 +49,25 @@ static const Quirk kQuirks[] = {
     // report for this title.
     {0x545408B2, "ignore_offset_for_ranged_allocations", true,
      "crash as a match starts"},
+    // Battlefield 2: Modern Combat: the ground flickers with black polygons
+    // (player report on Mali-G57, issue #10). It reloads depth evicted from
+    // EDRAM, so the host-precision depth is lost unless the pixel shaders
+    // write 20e4 depth, and it uploads from pages marked no-access. Both
+    // settings together fix it (xenia-canary game-compatibility #9).
+    {0x454107DB, "depth_float24_convert_in_pixel_shader", true,
+     "black flickering ground polygons"},
+    {0x454107DB, "gpu_allow_invalid_upload_range", true,
+     "black flickering ground polygons"},
+    // Dead or Alive Xtreme 2 reads back render targets through pages the
+    // GPU wrote: without the page-state refresh the character select
+    // background and the scene after it are garbled (xenia-canary
+    // game-compatibility #619).
+    {0x544307D2, "clear_memory_page_state", true,
+     "garbled character select and intro"},
+    // FIFA 16: half of the pitch renders black (the stadium shadow mask is
+    // read back from a resolve the default "uma" mode does not copy to guest
+    // RAM); "fast" fixes it at 60 fps (player report).
+    {0x454109EE, "readback_resolve", "fast", "half of the pitch black"},
     // No vulkan_bindless_textures for GTA IV: with it Mali raises ~15 GPU
     // faults a second (GROUP_ERROR_FATAL, translation faults; the MediaTek
     // driver recreates the queue), shown as black frames and swapchain

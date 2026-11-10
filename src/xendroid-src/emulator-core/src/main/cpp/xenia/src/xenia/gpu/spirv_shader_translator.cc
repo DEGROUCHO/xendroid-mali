@@ -117,6 +117,17 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    spirv_forward_jump_segments, true,
+    "Translate shaders whose control flow only jumps forward (no loops, calls "
+    "or backward jumps) as a chain of one-pass segments instead of a program "
+    "counter switch inside a loop. The loop's back edge makes every guest "
+    "register a phi at the loop header used by every case; the Mali compiler "
+    "(r49) walks the users of values 16 levels deep without memoization, which "
+    "on such a phi web takes minutes to hours per pipeline (Dead or Alive "
+    "Xtreme 2 hung at the menu). Same results, acyclic control flow.",
+    "GPU");
+
+DEFINE_bool(
     spirv_texture_sign_specialization, true,
     "Pixel shaders take the signs of the textures of fetch constants 0-15 "
     "(all unsigned, gamma color with linear alpha, all gamma) from "
@@ -448,6 +459,13 @@ void SpirvShaderTranslator::Reset() {
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
+  main_forward_segments_ = false;
+  var_main_forward_target_ = spv::NoResult;
+  main_segment_loop_header_ = nullptr;
+  main_segment_continue_ = nullptr;
+  main_segment_merge_ = nullptr;
+  main_segment_guard_merge_ = nullptr;
+  main_forward_guest_loops_.clear();
   main_rect_list_loop_header_ = nullptr;
   main_rect_list_loop_continue_ = nullptr;
   main_rect_list_loop_merge_ = nullptr;
@@ -934,6 +952,14 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_predicate_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassFunction, type_bool_,
         "xe_var_predicate", builder_->makeBoolConstant(false));
+    main_forward_segments_ = cvars::spirv_forward_jump_segments &&
+                             !current_shader().label_addresses().empty() &&
+                             current_shader().has_only_forward_jumps();
+    if (main_forward_segments_) {
+      var_main_forward_target_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_int_,
+          "xe_var_forward_target", const_int_0_);
+    }
     var_main_loop_count_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassFunction, type_uint4_,
         "xe_var_loop_count", const_uint4_0_);
@@ -1072,8 +1098,9 @@ void SpirvShaderTranslator::StartTranslation() {
   builder_->createBranch(main_loop_header_);
 
   // If no jumps, don't create a switch, but still create a loop so exece can
-  // break.
-  bool has_main_switch = !current_shader().label_addresses().empty();
+  // break. Forward-only jumps use segments instead of the switch.
+  bool has_main_switch = !current_shader().label_addresses().empty() &&
+                         !main_forward_segments_;
 
   // Main loop header - based on whether it's the first iteration (entered from
   // the function or from the continuation), choose the program counter.
@@ -1122,13 +1149,82 @@ void SpirvShaderTranslator::StartTranslation() {
     function_main_->addBlock(main_switch_case_0_block);
     builder_->setBuildPoint(main_switch_case_0_block);
   }
+  if (main_forward_segments_) {
+    // Reset per invocation of the guest shader (run 3 times per rectangle in
+    // the rectangle list loop).
+    builder_->createStore(const_int_0_, var_main_forward_target_);
+    OpenForwardSegment(0);
+  }
+}
+
+void SpirvShaderTranslator::OpenForwardSegment(uint32_t cf_index) {
+  assert_true(main_forward_segments_);
+  spv::Function& function = builder_->getBuildPoint()->getParent();
+  main_segment_loop_header_ = new spv::Block(builder_->getUniqueId(), function);
+  main_segment_continue_ = new spv::Block(builder_->getUniqueId(), function);
+  main_segment_merge_ = new spv::Block(builder_->getUniqueId(), function);
+  main_segment_guard_merge_ = nullptr;
+  if (cf_index) {
+    // Skip the segment while a taken jump targets a later label (or after
+    // exece).
+    spv::Id target =
+        builder_->createLoad(var_main_forward_target_, spv::NoPrecision);
+    spv::Id run = builder_->createBinOp(spv::OpSLessThanEqual, type_bool_,
+                                        target,
+                                        builder_->makeIntConstant(int(cf_index)));
+    main_segment_guard_merge_ =
+        new spv::Block(builder_->getUniqueId(), function);
+    builder_->createSelectionMerge(main_segment_guard_merge_,
+                                   spv::SelectionControlDontFlattenMask);
+    builder_->createConditionalBranch(run, main_segment_loop_header_,
+                                      main_segment_guard_merge_);
+  } else {
+    builder_->createBranch(main_segment_loop_header_);
+  }
+  // do { body } while (false): a loop only so that a jump or exece from within
+  // the exec conditionals can break out of the segment. The continue block is
+  // unreachable, so there is no back edge.
+  function.addBlock(main_segment_loop_header_);
+  builder_->setBuildPoint(main_segment_loop_header_);
+  uint_vector_temp_.clear();
+  builder_->createLoopMerge(main_segment_merge_, main_segment_continue_,
+                            spv::LoopControlDontUnrollMask, uint_vector_temp_);
+  spv::Block& body = builder_->makeNewBlock();
+  builder_->createBranch(&body);
+  builder_->setBuildPoint(&body);
+}
+
+void SpirvShaderTranslator::CloseForwardSegment() {
+  assert_true(main_forward_segments_);
+  spv::Function& function = builder_->getBuildPoint()->getParent();
+  if (!builder_->getBuildPoint()->isTerminated()) {
+    builder_->createBranch(main_segment_merge_);
+  }
+  function.addBlock(main_segment_continue_);
+  builder_->setBuildPoint(main_segment_continue_);
+  builder_->createBranch(main_segment_loop_header_);
+  function.addBlock(main_segment_merge_);
+  builder_->setBuildPoint(main_segment_merge_);
+  if (main_segment_guard_merge_) {
+    builder_->createBranch(main_segment_guard_merge_);
+    function.addBlock(main_segment_guard_merge_);
+    builder_->setBuildPoint(main_segment_guard_merge_);
+  }
+  main_segment_loop_header_ = nullptr;
+  main_segment_continue_ = nullptr;
+  main_segment_merge_ = nullptr;
+  main_segment_guard_merge_ = nullptr;
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   if (!is_depth_only_fragment_shader_) {
     // Close flow control within the last switch case.
     CloseExecConditionals();
-    bool has_main_switch = !current_shader().label_addresses().empty();
+    bool has_main_switch = !current_shader().label_addresses().empty() &&
+                           !main_forward_segments_;
+    if (main_forward_segments_) {
+      CloseForwardSegment();
+    }
     // After the final exec (if it happened to be not exece, which would already
     // have a break branch), break from the switch if it exists, or from the
     // loop it doesn't.
@@ -1484,6 +1580,12 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
   // Close flow control within the previous switch case.
   CloseExecConditionals();
 
+  if (main_forward_segments_) {
+    CloseForwardSegment();
+    OpenForwardSegment(cf_index);
+    return;
+  }
+
   spv::Function& function = builder_->getBuildPoint()->getParent();
   // Create the next switch case and fallthrough to it.
   spv::Block* new_case = new spv::Block(builder_->getUniqueId(), function);
@@ -1522,7 +1624,13 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(
   if (instr.is_end) {
     // Break out of the main switch (if exists) and the main loop.
     CloseInstructionPredication();
-    if (!builder_->getBuildPoint()->isTerminated()) {
+    if (main_forward_segments_) {
+      if (!builder_->getBuildPoint()->isTerminated()) {
+        builder_->createStore(builder_->makeIntConstant(INT32_MAX),
+                              var_main_forward_target_);
+        builder_->createBranch(main_segment_merge_);
+      }
+    } else if (!builder_->getBuildPoint()->isTerminated()) {
       builder_->createBranch(current_shader().label_addresses().empty()
                                  ? main_loop_merge_
                                  : main_switch_merge_);
@@ -1623,6 +1731,42 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(
   skip_block.addPredecessor(&head_block);
   body_block.addPredecessor(&head_block);
   builder_->setBuildPoint(&skip_block);
+  if (main_forward_segments_) {
+    builder_->createStore(
+        builder_->makeIntConstant(int(instr.loop_skip_address)),
+        var_main_forward_target_);
+    builder_->createBranch(main_segment_merge_);
+    builder_->setBuildPoint(&body_block);
+    CloseForwardSegment();
+    // Enter the loop unless skipped (the target is then the skip address) or
+    // a jump to a later label was taken earlier.
+    spv::Function& function = builder_->getBuildPoint()->getParent();
+    ForwardGuestLoop loop;
+    loop.skip_address = instr.loop_skip_address;
+    loop.header = new spv::Block(builder_->getUniqueId(), function);
+    loop.continue_target = new spv::Block(builder_->getUniqueId(), function);
+    loop.merge = new spv::Block(builder_->getUniqueId(), function);
+    loop.guard_merge = new spv::Block(builder_->getUniqueId(), function);
+    spv::Id enter = builder_->createBinOp(
+        spv::OpSLessThan, type_bool_,
+        builder_->createLoad(var_main_forward_target_, spv::NoPrecision),
+        builder_->makeIntConstant(int(instr.loop_skip_address)));
+    builder_->createSelectionMerge(loop.guard_merge,
+                                   spv::SelectionControlDontFlattenMask);
+    builder_->createConditionalBranch(enter, loop.header, loop.guard_merge);
+    function.addBlock(loop.header);
+    builder_->setBuildPoint(loop.header);
+    uint_vector_temp_.clear();
+    builder_->createLoopMerge(loop.merge, loop.continue_target,
+                              spv::LoopControlMask(0), uint_vector_temp_);
+    spv::Block& loop_body = builder_->makeNewBlock();
+    builder_->createBranch(&loop_body);
+    builder_->setBuildPoint(&loop_body);
+    main_forward_guest_loops_.push_back(loop);
+    // Empty until the label of the loop body opens the first real segment.
+    OpenForwardSegment(0);
+    return;
+  }
   main_switch_next_pc_phi_operands_.push_back(
       builder_->makeIntConstant(int(instr.loop_skip_address)));
   main_switch_next_pc_phi_operands_.push_back(
@@ -1639,6 +1783,28 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(
   CloseExecConditionals();
 
   EnsureBuildPointAvailable();
+
+  if (main_forward_segments_) {
+    assert_false(main_forward_guest_loops_.empty());
+    CloseForwardSegment();
+    // A jump past the loop (or exece) taken in the body leaves the loop
+    // without popping the loop stacks, like the program counter would.
+    const ForwardGuestLoop& loop = main_forward_guest_loops_.back();
+    spv::Function& function = builder_->getBuildPoint()->getParent();
+    spv::Id leave = builder_->createBinOp(
+        spv::OpSGreaterThanEqual, type_bool_,
+        builder_->createLoad(var_main_forward_target_, spv::NoPrecision),
+        builder_->makeIntConstant(int(loop.skip_address)));
+    spv::Block* leave_block = new spv::Block(builder_->getUniqueId(), function);
+    spv::Block* end_block = new spv::Block(builder_->getUniqueId(), function);
+    builder_->createSelectionMerge(end_block, spv::SelectionControlMaskNone);
+    builder_->createConditionalBranch(leave, leave_block, end_block);
+    function.addBlock(leave_block);
+    builder_->setBuildPoint(leave_block);
+    builder_->createBranch(loop.merge);
+    function.addBlock(end_block);
+    builder_->setBuildPoint(end_block);
+  }
 
   // Subtract 1 from the loop counter (will store later).
   spv::Id loop_count_stack_old =
@@ -1728,11 +1894,16 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(
           address_relative_stack_old, type_int4_, 0),
       var_main_loop_address_);
   // Jump back to the beginning of the loop body.
-  main_switch_next_pc_phi_operands_.push_back(
-      builder_->makeIntConstant(int(instr.loop_body_address)));
-  main_switch_next_pc_phi_operands_.push_back(
-      builder_->getBuildPoint()->getId());
-  builder_->createBranch(main_loop_continue_);
+  if (main_forward_segments_) {
+    builder_->createStore(const_int_0_, var_main_forward_target_);
+    builder_->createBranch(main_forward_guest_loops_.back().continue_target);
+  } else {
+    main_switch_next_pc_phi_operands_.push_back(
+        builder_->makeIntConstant(int(instr.loop_body_address)));
+    main_switch_next_pc_phi_operands_.push_back(
+        builder_->getBuildPoint()->getId());
+    builder_->createBranch(main_loop_continue_);
+  }
 
   // Break case.
   builder_->setBuildPoint(&break_block);
@@ -1756,6 +1927,22 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(
   builder_->createStore(
       builder_->createCompositeConstruct(type_int4_, id_vector_temp_),
       var_main_loop_address_);
+  if (main_forward_segments_) {
+    ForwardGuestLoop loop = main_forward_guest_loops_.back();
+    main_forward_guest_loops_.pop_back();
+    spv::Function& function = builder_->getBuildPoint()->getParent();
+    builder_->createBranch(loop.merge);
+    function.addBlock(loop.continue_target);
+    builder_->setBuildPoint(loop.continue_target);
+    builder_->createBranch(loop.header);
+    function.addBlock(loop.merge);
+    builder_->setBuildPoint(loop.merge);
+    builder_->createBranch(loop.guard_merge);
+    function.addBlock(loop.guard_merge);
+    builder_->setBuildPoint(loop.guard_merge);
+    // Until the label after the loop opens the next segment.
+    OpenForwardSegment(0);
+  }
   // Now going to fall through to the next control flow instruction.
 }
 
@@ -1780,6 +1967,12 @@ void SpirvShaderTranslator::ProcessJumpInstruction(
 
   if (builder_->getBuildPoint()->isTerminated()) {
     // Unreachable for some reason.
+    return;
+  }
+  if (main_forward_segments_) {
+    builder_->createStore(builder_->makeIntConstant(int(instr.target_address)),
+                          var_main_forward_target_);
+    builder_->createBranch(main_segment_merge_);
     return;
   }
   main_switch_next_pc_phi_operands_.push_back(

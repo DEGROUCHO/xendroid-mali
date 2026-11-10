@@ -75,6 +75,17 @@ DEFINE_bool(
     "through guest context memory. Forced off by disable_context_promotion.",
     "CPU");
 
+DEFINE_bool(context_promote_vec128_constants, true,
+            "Bisect aid: with context_promote_vec128, also forward constant "
+            "vectors stored to the context (makes vector operands constant: "
+            "folds and the backend constant-operand paths).", "CPU");
+DEFINE_bool(context_promote_vec128_loads, true,
+            "Bisect aid: with context_promote_vec128, reuse vector context "
+            "loads/stores as SSA values.", "CPU");
+DEFINE_bool(context_vec128_dse, true,
+            "Bisect aid: with context_promote_vec128, strip dead vector "
+            "context stores (block-local and whole-function).", "CPU");
+
 DECLARE_bool(disable_context_promotion);
 DECLARE_bool(savestate_enable);
 
@@ -624,7 +635,7 @@ bool ContextPromotionPass::Run(HIRBuilder* builder) {
         }
 
         const bool promote_vec128 =
-            cvars::context_promote_vec128 &&
+            cvars::context_promote_vec128 && cvars::context_vec128_dse &&
             !cvars::disable_context_promotion;
         // a64_abi_volatile_cr_dse: CR0, CR1 and CR5-CR7 are volatile in the
         // Xbox 360 ABI. Only `bl`-style linked calls and returns count as ABI
@@ -890,7 +901,8 @@ void ContextPromotionPass::PromoteBlock(
         remaining_entry_facts.end());
   };
   const bool promote_vec128 =
-      cvars::context_promote_vec128 && !cvars::disable_context_promotion;
+      cvars::context_promote_vec128 && cvars::context_promote_vec128_loads &&
+      !cvars::disable_context_promotion;
 
   bool has_transfer_snapshot = false;
   auto capture_transfer_snapshot = [&]() {
@@ -1001,7 +1013,9 @@ void ContextPromotionPass::PromoteBlock(
       if (!remaining_entry_facts.empty()) {
         forget_incoming_range(offset, size);
       }
-      if (promote_vec128 || value->type != TypeName::VEC128_TYPE) {
+      if ((promote_vec128 || value->type != TypeName::VEC128_TYPE) &&
+          (cvars::context_promote_vec128_constants ||
+           value->type != TypeName::VEC128_TYPE || !value->IsConstant())) {
         // Track the stored value for later loads. TrackValue first drops
         // every tracked value overlapping the bytes this store clobbers.
         TrackValue(offset, size, value);
@@ -1052,7 +1066,8 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
   auto& validity = context_validity_;
   validity.reset();
   const bool promote_vec128 =
-      cvars::context_promote_vec128 && !cvars::disable_context_promotion;
+      cvars::context_promote_vec128 && cvars::context_vec128_dse &&
+      !cvars::disable_context_promotion;
 
   // Walk backwards and mark byte ranges that are written to.
   // If a store's whole range was already written to later, it is dead.

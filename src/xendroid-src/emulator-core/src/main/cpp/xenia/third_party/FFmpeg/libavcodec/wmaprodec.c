@@ -165,6 +165,7 @@ typedef struct WMAProChannelCtx {
     float*   coeffs;                                  ///< pointer to the subframe decode buffer
     uint16_t num_vec_coeffs;                          ///< number of vector coded coefficients
     float*    out;                                      ///< output buffer, owned by WMAProDecodeCtx::scratch
+    float    cut_tail[WMAPRO_BLOCK_MIN_SIZE];         ///< overlap tail a cut frame started from
 } WMAProChannelCtx;
 
 /**
@@ -200,6 +201,8 @@ typedef struct WMAProDecodeCtx {
     uint8_t          dynamic_range_compression;     ///< frame contains DRC data
     uint8_t          bits_per_sample;               ///< integer audio sample size for the unscaled IMDCT output (used to scale to [-1.0, 1.0])
     uint16_t         samples_per_frame;             ///< number of samples to output
+    uint16_t         output_offset;                 ///< where in out[] a frame's samples start
+    uint8_t          cut_frame;                     ///< xmaframes frame is cut short and isn't the next frame's overlap
     uint16_t         trim_start;                    ///< number of samples to skip at start
     uint16_t         trim_end;                      ///< number of samples to skip at end
     uint16_t         log2_frame_size;
@@ -1511,6 +1514,15 @@ static int decode_frame(WMAProDecodeCtx *s, AVFrame *frame, int *got_frame_ptr)
 
     ff_dlog(s->avctx, "decoding frame with length %x\n", len);
 
+    /** a cut frame hands the next frame the tail it started from */
+    if (s->cut_frame) {
+        const int half = s->min_samples_per_subframe >> 1;
+        for (i = 0; i < s->nb_channels; i++)
+            memcpy(s->channel[i].cut_tail,
+                   &s->channel[i].out[(s->samples_per_frame >> 1) - half],
+                   half * sizeof(*s->channel[i].cut_tail));
+    }
+
     /** decode tile information */
     if (decode_tilehdr(s)) {
         s->packet_loss = 1;
@@ -1562,8 +1574,18 @@ static int decode_frame(WMAProDecodeCtx *s, AVFrame *frame, int *got_frame_ptr)
 
     /** copy samples to the output buffer */
     for (i = 0; i < s->nb_channels; i++)
-        memcpy(frame->extended_data[i], s->channel[i].out,
+        memcpy(frame->extended_data[i], s->channel[i].out + s->output_offset,
                s->samples_per_frame * sizeof(*s->channel[i].out));
+
+    if (s->cut_frame) {
+        const int half = s->min_samples_per_subframe >> 1;
+        for (i = 0; i < s->nb_channels; i++)
+            memcpy(&s->channel[i].out[s->samples_per_frame +
+                                      (s->samples_per_frame >> 1) - half],
+                   s->channel[i].cut_tail,
+                   half * sizeof(*s->channel[i].out));
+        s->cut_frame = 0;
+    }
 
     for (i = 0; i < s->nb_channels; i++) {
         /** reuse second half of the IMDCT output for the next frame */
@@ -1581,7 +1603,11 @@ static int decode_frame(WMAProDecodeCtx *s, AVFrame *frame, int *got_frame_ptr)
     }
 
     if (s->len_prefix) {
-        if (len != (get_bits_count(gb) - s->frame_offset) + 2) {
+        const int used = get_bits_count(gb) - s->frame_offset;
+        /** the XMA decoder plays a frame whose data ends before its length
+         *  and skips the rest */
+        if (s->avctx->codec_id == AV_CODEC_ID_XMAFRAMES ? used + 2 > len
+                                                        : used + 2 != len) {
             /** FIXME: not sure if this is always an error */
             av_log(s->avctx, AV_LOG_ERROR,
                    "frame[%"PRIu32"] would have to skip %i bits\n",
@@ -2196,6 +2222,12 @@ static av_cold int xmaframes_decode_init(AVCodecContext *avctx)
         /* Each packet contains a complete, individually decodable XMA frame,
          * so there is no need to skip the first frame for IMDCT warmup. */
         s->skip_frame = 0;
+        /* XMA frames use minimum-length subframes, which overlap the next
+         * frame by one subframe. Their samples are final up to half a
+         * subframe before the frame end. Output those instead of stopping
+         * half a frame before. */
+        s->output_offset = (s->samples_per_frame -
+                            s->min_samples_per_subframe) >> 1;
     }
     return ret;
 }
@@ -2239,7 +2271,9 @@ static int xmaframes_decode_packet(AVCodecContext *avctx, AVFrame *frame,
     /* get padding sizes from first byte */
     padding_start = get_bits(gb, 3);
     padding_end   = get_bits(gb, 3);
-    skip_bits(gb, 2);
+    skip_bits(gb, 1);
+    /* the frame is cut short, so the next frame overlaps the one before it */
+    s->cut_frame = get_bits1(gb);
 
     /* move bit reader to start of XMA frame */
     skip_bits(gb, padding_start);

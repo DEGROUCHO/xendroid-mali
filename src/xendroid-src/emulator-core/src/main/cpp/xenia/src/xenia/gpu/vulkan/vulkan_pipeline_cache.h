@@ -120,6 +120,11 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // When true, the current pipeline uses a placeholder pixel shader and
     // the real pipeline is being compiled in the background.
     std::atomic<bool> is_placeholder{false};
+    // Set when a draw first asks for this description; the description is
+    // written to the pipeline storage only once the driver has really created
+    // it, so a pipeline the driver compiler never returns from is not
+    // precreated (and hung on) at every later boot.
+    std::atomic<bool> storage_write_pending{false};
     // When true, the placeholder rasterizes with the ucode interpreter VS (so
     // the draw must feed it full float constants and the ucode location). Set
     // once when the interpreter placeholder is built, gated by is_placeholder.

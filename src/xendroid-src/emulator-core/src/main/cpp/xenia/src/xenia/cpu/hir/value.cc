@@ -831,10 +831,14 @@ void Value::Extract(Value* vec, Value* index) {
   assert_true(vec->type == VEC128_TYPE);
   switch (type) {
     case INT8_TYPE:
-      constant.u8 = vec->constant.v128.u8[index->constant.u8 & 0x1F];
+      // The index is a guest (big-endian) element number: swizzle it the
+      // same way the backends do (VEC128_B / VEC128_W), or a constant
+      // vector folds to the wrong element (vspltb/vsplth, vsl/vsr/vslo/
+      // vsro shift counts, vmsum*) once vectors are promoted.
+      constant.u8 = vec->constant.v128.u8[(index->constant.u8 & 0xF) ^ 0x3];
       break;
     case INT16_TYPE:
-      constant.u16 = vec->constant.v128.u16[index->constant.u16 & 0x7];
+      constant.u16 = vec->constant.v128.u16[(index->constant.u8 & 0x7) ^ 0x1];
       break;
     case INT32_TYPE:
       constant.u32 = vec->constant.v128.u32[index->constant.u32 & 0x3];
@@ -995,17 +999,28 @@ void Value::VectorCompareEQ(Value* other, TypeName type) {
       }
       break;
     case INT32_TYPE:
-    case FLOAT32_TYPE:
       for (int i = 0; i < 4; i++) {
         constant.v128.u32[i] =
             constant.v128.u32[i] == other->constant.v128.u32[i] ? -1 : 0;
       }
       break;
+    case FLOAT32_TYPE:
+      // vcmpeqfp compares values: +0 == -0, NaN != NaN (as the backends).
+      for (int i = 0; i < 4; i++) {
+        constant.v128.u32[i] =
+            constant.v128.f32[i] == other->constant.v128.f32[i] ? -1 : 0;
+      }
+      break;
     case INT64_TYPE:
-    case FLOAT64_TYPE:
       for (int i = 0; i < 2; i++) {
         constant.v128.u64[i] =
             constant.v128.u64[i] == other->constant.v128.u64[i] ? -1 : 0;
+      }
+      break;
+    case FLOAT64_TYPE:
+      for (int i = 0; i < 2; i++) {
+        constant.v128.u64[i] =
+            constant.v128.f64[i] == other->constant.v128.f64[i] ? -1 : 0;
       }
       break;
     default:

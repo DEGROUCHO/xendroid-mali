@@ -10,6 +10,8 @@
 #include "xenia/gpu/shader_translator.h"
 
 #include <cstdarg>
+#include <utility>
+#include <vector>
 
 #include "xenia/base/logging.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -51,6 +53,14 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
   // Gather the upper bound of the control flow instructions, and label
   // addresses, which are needed for disassembly.
   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
+  // {cf index, 0 jmp / 1 loop / 2 endloop, address}, for the structured
+  // control flow check below.
+  struct FlowTransfer {
+    uint32_t index;
+    uint32_t kind;
+    uint32_t address;
+  };
+  std::vector<FlowTransfer> flow_transfers;
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -70,18 +80,71 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
           // it must be a label that ret can jump back to.
           label_addresses_.insert(i * 2 + j + 1);
           uses_subroutine_calls_ = true;
+          has_only_forward_jumps_ = false;
           break;
         case ControlFlowOpcode::kCondJmp:
           label_addresses_.insert(cf.cond_jmp.address());
+          flow_transfers.push_back({i * 2 + j, 0, cf.cond_jmp.address()});
           break;
         case ControlFlowOpcode::kLoopStart:
           label_addresses_.insert(cf.loop_start.address());
+          flow_transfers.push_back({i * 2 + j, 1, cf.loop_start.address()});
           break;
         case ControlFlowOpcode::kLoopEnd:
           label_addresses_.insert(cf.loop_end.address());
+          flow_transfers.push_back({i * 2 + j, 2, cf.loop_end.address()});
+          break;
+        case ControlFlowOpcode::kReturn:
+          has_only_forward_jumps_ = false;
           break;
         default:
           break;
+      }
+    }
+  }
+
+  // Structured control flow: jumps only go forward, loops are properly nested
+  // with the body right after loop (endloop jumps back to loop + 1, loop skips
+  // to endloop + 1), and no jump enters a loop body from outside it.
+  if (has_only_forward_jumps_) {
+    std::vector<std::pair<uint32_t, uint32_t>> loop_stack;  // {loop, skip}
+    std::vector<std::pair<uint32_t, uint32_t>> loop_bodies;  // (loop, endloop]
+    for (const FlowTransfer& transfer : flow_transfers) {
+      if (transfer.kind == 0) {
+        if (transfer.address <= transfer.index) {
+          has_only_forward_jumps_ = false;
+        }
+      } else if (transfer.kind == 1) {
+        if (transfer.address <= transfer.index + 1) {
+          has_only_forward_jumps_ = false;
+        }
+        loop_stack.emplace_back(transfer.index, transfer.address);
+      } else {
+        if (loop_stack.empty() ||
+            transfer.address != loop_stack.back().first + 1 ||
+            loop_stack.back().second != transfer.index + 1) {
+          has_only_forward_jumps_ = false;
+          break;
+        }
+        loop_bodies.emplace_back(loop_stack.back().first, transfer.index);
+        loop_stack.pop_back();
+      }
+    }
+    if (!loop_stack.empty()) {
+      has_only_forward_jumps_ = false;
+    }
+    for (const FlowTransfer& transfer : flow_transfers) {
+      if (transfer.kind != 0 || !has_only_forward_jumps_) {
+        continue;
+      }
+      for (const auto& body : loop_bodies) {
+        bool source_inside =
+            transfer.index > body.first && transfer.index <= body.second;
+        bool target_inside =
+            transfer.address > body.first && transfer.address <= body.second;
+        if (target_inside && !source_inside) {
+          has_only_forward_jumps_ = false;
+        }
       }
     }
   }

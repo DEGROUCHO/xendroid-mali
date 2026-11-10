@@ -912,6 +912,11 @@ class Shader {
   // Whether the shader contains subroutine calls (cond_call).
   bool uses_subroutine_calls() const { return uses_subroutine_calls_; }
 
+  // Whether the control flow is structured: no calls, jmp only to later
+  // addresses, loops properly nested with the body right after loop and no jmp
+  // into a loop body from outside it. Translatable without a program counter.
+  bool has_only_forward_jumps() const { return has_only_forward_jumps_; }
+
   // c# registers used as the addend in MAD operations to eA.
   const std::set<uint32_t>& memexport_stream_constants() const {
     return memexport_stream_constants_;
@@ -1097,6 +1102,8 @@ class Shader {
   std::set<uint32_t> memexport_stream_constants_;
   // Set during analysis if the shader contains any cond_call.
   bool uses_subroutine_calls_ = false;
+  // Cleared during analysis by a call, a backward jmp or unstructured loops.
+  bool has_only_forward_jumps_ = true;
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;

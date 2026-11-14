@@ -27,8 +27,17 @@ DEFINE_int32(a64_loop_pinned_gprs, 5,
 UPDATE_from_int32(a64_loop_pinned_gprs, 2026, 10, 11, 17, 3);
 DEFINE_int32(a64_loop_pinned_vecs, 3,
              "Maximum floating-point/vector context registers pinned per "
-             "function (0-3).",
+             "function (0-14: v31 downwards, never more than half of the "
+             "allocator's vector set).",
              "CPU");
+DEFINE_bool(a64_pinning_with_savestate, true,
+            "Keep guest register pinning on when savestate_enable is on. Every "
+            "point a snapshot can observe (safepoint yield, call, kernel "
+            "export, function exit) already flushes the dirty pins to the "
+            "context first, and a restored thread re-enters through a function "
+            "entry that loads them again.",
+            "CPU");
+UPDATE_from_bool(a64_pinning_with_savestate, 2026, 11, 15, 1, false);
 DECLARE_bool(savestate_enable);
 DECLARE_bool(debug);
 DECLARE_bool(disable_context_promotion);
@@ -158,7 +167,8 @@ LoopRegisterPinningPass::~LoopRegisterPinningPass() = default;
 bool LoopRegisterPinningPass::Run(HIRBuilder* builder) {
   // Restored frames have context, but no pinned host state. Debuggers also
   // require every architectural update to be visible immediately.
-  if (!cvars::a64_loop_register_pinning || cvars::savestate_enable ||
+  if (!cvars::a64_loop_register_pinning ||
+      (cvars::savestate_enable && !cvars::a64_pinning_with_savestate) ||
       cvars::debug || cvars::disable_context_promotion ||
       cvars::store_all_context_values) {
     return true;
@@ -252,7 +262,7 @@ bool LoopRegisterPinningPass::Run(HIRBuilder* builder) {
   const uint32_t max_int = std::min(
       available_int_, uint32_t(std::clamp(cvars::a64_loop_pinned_gprs, 0, 6)));
   const uint32_t max_vec = std::min(
-      available_vec_, uint32_t(std::clamp(cvars::a64_loop_pinned_vecs, 0, 3)));
+      available_vec_, uint32_t(std::clamp(cvars::a64_loop_pinned_vecs, 0, 14)));
   auto& pinned = builder->pinned_context_slots();
   uint32_t ints = 0, vecs = 0;
   for (const Slot& s : slots) {

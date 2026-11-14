@@ -285,9 +285,11 @@ DEFINE_bool(
     "Compatibility rendering: turns off the render target -> texture shortcuts "
     "(vulkan_texture_from_render_target, vulkan_direct_host_resolve, "
     "vulkan_resolve_texture_copy, vulkan_color_surface_resolve, "
-    "vulkan_in_pass_transfers), so resolves take the plain compute path. For "
-    "drivers that show a black image with them (Mali-G615 r44p1). Costs GPU "
-    "time (Halo Reach on Mali-G720: about 6 ms per frame).",
+    "vulkan_in_pass_transfers), so resolves take the plain compute path, and "
+    "also the dynamic fragment shading rate and the NaN select form of the "
+    "multiply-by-zero emulation. For drivers that show a black image "
+    "(Mali-G615 r44p1). Costs GPU time (Halo Reach on Mali-G720: about 6 ms "
+    "per frame).",
     "Vulkan");
 
 DEFINE_bool(
@@ -3921,6 +3923,17 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
       constants.dump_pitch_tiles = dump_pitch;
       constants.source_base_tiles = source.key.base_tiles;
       constants.source_pitch_tiles = source.key.GetPitchTiles();
+      if (untile_row_offset_pixels_) {
+        // The strip is kept at its screen rows in the host render target: the
+        // shader takes the source row from (tile - source base) / pitch, so a
+        // base that many tile rows lower reads those rows (unsigned wrap).
+        const uint32_t untile_tile_rows =
+            (untile_row_offset_pixels_
+             << uint32_t(source.key.msaa_samples >= xenos::MsaaSamples::k2X)) /
+            xenos::kEdramTileHeightSamples;
+        constants.source_base_tiles -=
+            untile_tile_rows * constants.source_pitch_tiles;
+      }
       const uint32_t tile_size_x = (source.is_64bpp ? 40u : 80u) * scale_x;
       const uint32_t tile_size_y = 16u * scale_y;
       const uint32_t tile_pixel_size_x =
@@ -5966,7 +5979,8 @@ bool VulkanRenderTargetCache::Resolve(
                                      dump_pitch)) {
         return false;
       }
-      if (RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
+      if (!untile_row_offset_pixels_ &&
+          RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
           !command_processor_.deferred_resolve_recording_ &&
           TryDeferredDepthSurfaceResolve(resolve_info, shared_memory,
                                         texture_cache)) {
@@ -5987,7 +6001,8 @@ bool VulkanRenderTargetCache::Resolve(
             command_processor_.deferred_resolve_recording_);
       }
       // Try the on-tile resolve before dumping the owning render targets.
-      if (!copied && cvars::vulkan_in_pass_resolve &&
+      if (!copied && !untile_row_offset_pixels_ &&
+          cvars::vulkan_in_pass_resolve &&
           copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
         copied = TryInPassResolveCopy(
             resolve_info, copy_shader_constants, copy_shader, dump_base,
@@ -6034,6 +6049,16 @@ bool VulkanRenderTargetCache::Resolve(
             dump_row_length_used, dump_rows, dump_pitch, shared_memory,
             texture_cache, written_address_out, written_length_out);
         direct_host_used = copied;
+      }
+      if (!copied && untile_row_offset_pixels_) {
+        static uint32_t untile_dump_logged = 0;
+        if (untile_dump_logged < 16) {
+          ++untile_dump_logged;
+          XELOGE(
+              "Untile: a strip resolve at row offset {} fell back to the EDRAM "
+              "dump path, which reads the first strip's rows",
+              untile_row_offset_pixels_);
+        }
       }
       if (!copied || (cvars::vulkan_in_pass_resolve_debug_dump &&
                       !surface_resolve_taken)) {
@@ -6373,6 +6398,8 @@ bool VulkanRenderTargetCache::Resolve(
                 resolve_info, clear_rectangle, clear_render_targets[0],
                 clear_transfers_[0], clear_render_targets[1],
                 clear_transfers_[1])) {
+          // The strip's rows in the host render targets.
+          clear_rectangle.y_pixels += untile_row_offset_pixels_;
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
           // For 64bpp formats, RB_COLOR_CLEAR_LO is the lower 32 bits of the

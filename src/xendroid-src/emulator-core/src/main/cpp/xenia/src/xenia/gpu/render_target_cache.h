@@ -48,6 +48,14 @@ class RenderTargetCache {
   // ownership map after backend transfers; no public mutable map is exposed.
   friend class vulkan::VulkanRenderTargetCache;
  public:
+  // gpu_untile_predicated_tiling: rows to add when a resolve or a resolve
+  // clear of a tiling strip addresses the host render target (the strip is
+  // kept at its screen rows, not at row 0). Set around one resolve.
+  void set_untile_row_offset_pixels(uint32_t rows) {
+    untile_row_offset_pixels_ = rows;
+  }
+  uint32_t untile_row_offset_pixels_ = 0;
+
   enum : uint32_t {
     kRenderTargetHeightClassFull = 0,
     kRenderTargetHeightClassBaseCap = 1,

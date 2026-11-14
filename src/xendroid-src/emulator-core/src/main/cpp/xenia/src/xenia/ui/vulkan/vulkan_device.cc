@@ -29,6 +29,14 @@
 #include <unordered_set>
 #include <vector>
 
+DEFINE_bool(
+    vulkan_mali_dynamic_rendering_erratum_ignore, false,
+    "Diagnostic: use dynamic rendering on Arm Mali drivers older than r52 too "
+    "(normally render passes are used there because of the driver's dynamic "
+    "rendering errata). Lets the dynamic rendering path, which other drivers "
+    "take, be exercised on such a device; expect the errata's artifacts.",
+    "Vulkan");
+
 DEFINE_int32(
     vulkan_clamp_storage_buffer_range, 0,
     "If > 0, clamp the reported maxStorageBufferRange to this many bytes. "
@@ -1170,7 +1178,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       for (const char* s = properties_1_2_KHR_driver_properties.driverInfo;
            *s; ++s) {
         if (*s == 'r' && std::sscanf(s, "r%up%u", &r, &p) == 2) {
-          mali_dynamic_rendering_erratum = r < 52;
+          mali_dynamic_rendering_erratum =
+              r < 52 && !cvars::vulkan_mali_dynamic_rendering_erratum_ignore;
+          device->properties_.maliDriverRelease = r;
           break;
         }
       }

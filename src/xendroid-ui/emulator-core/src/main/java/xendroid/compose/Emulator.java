@@ -49,6 +49,12 @@ public class Emulator extends xendroid.emulator.Emulator{
     public native void set_gpu_timing_enabled(boolean enabled);
     // Player 1 rumble: left motor << 8 | right motor, each 0-255.
     public native int controller_rumble();
+    // Players 2-4 (pad 1-3): same encoding.
+    public native int controller_rumble_pad(int pad);
+    // Input for player pad + 1 (0-3); pad 0 is what key_event feeds.
+    public native void key_event_pad(int pad, int key_code, boolean pressed, int value);
+    // Players 2-4 plug in and out with their controllers (pad 0 is always there).
+    public native void set_pad_connected(int pad, boolean connected);
     // Effective Display|show_debug_overlay (the live cvar, with any per-game config
     // overlay applied by LoadGameConfig at boot). Poll post-boot: the per-game override
     // lands on the detached boot thread, so this only reflects it after the game loads.

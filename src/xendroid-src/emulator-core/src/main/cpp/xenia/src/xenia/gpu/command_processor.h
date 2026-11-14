@@ -800,6 +800,29 @@ class CommandProcessor {
   void Pm4TraceLog(uint32_t opcode, uint32_t count, bool predicated);
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+  // gpu_untile_predicated_tiling: inside a tiling pass the guest selects bins.
+  bool UntileTiled() const { return uint32_t(bin_select_) != 0xFFFFFFFFu; }
+  // New strip (bin select changed): its geometry comes before its resolves.
+  void UntileSyncPhase() {
+    if (bin_select_ != untile_phase_select_) {
+      untile_phase_select_ = bin_select_;
+      untile_resolve_seen_ = false;
+      untile_strip_bottom_ = 0;
+    }
+  }
+  uint64_t untile_phase_select_ = 0xFFFFFFFFull;
+  bool untile_resolve_seen_ = false;
+  // Largest window scissor bottom seen in the first strip so far (its tile
+  // rectangle, until the strip height is known).
+  uint32_t untile_strip_bottom_ = 0;
+  // Strip height in pixels: the smallest row offset of a later strip. Kept
+  // across frames once seen.
+  uint32_t untile_strip_height_ = 0;
+  // What the last draw's registers were patched with (0 = not patched).
+  uint32_t untile_last_signature_ = 0;
+  // Row offset of the last resolve inside tiling: a later strip's draws are
+  // dropped until its own resolves (its rows were drawn with the first one).
+  uint32_t untile_last_resolve_rows_ = 0;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

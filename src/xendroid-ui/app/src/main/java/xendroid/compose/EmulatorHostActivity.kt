@@ -166,6 +166,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val TRIGGER_PRESSED = 30
         // Rumble one-shots outlast the re-arm period, so a held motor never gaps.
         private const val RUMBLE_SHOT_MS = 600L
+        // Guest players: the on-screen pad + first controller, then three more controllers.
+        private const val MAX_PADS = 4
         private const val RUMBLE_REARM_MS = 400L
         private const val MENU_TAB_GAME = 0
         private const val MENU_TAB_CONTROLS = 1
@@ -352,12 +354,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     // Falls back to GameButtons.DEFAULT_LOOKUP until KeymapStore loads in onCreate.
     @Volatile private var keyMap: Map<Int, Int> = GameButtons.DEFAULT_LOOKUP
     private var vibrator: Vibrator? = null
-    // Controller rumble (API 31+): the game's XInputSetState, polled every 16 ms and played on
-    // the vibrators of the controller that sent the last input.
+    // Controller rumble (API 31+): each player's XInputSetState, polled every 16 ms and played
+    // on the vibrators of that player's controller (player 1: the one that sent the last input).
     private val rumbleOn = mutableStateOf(true)
-    private var rumbleDeviceId = -1
-    private var rumbleApplied = 0
-    private var rumbleArmedAt = 0L
+    private val rumbleDeviceId = IntArray(MAX_PADS) { -1 }
+    private val rumbleApplied = IntArray(MAX_PADS)
+    private val rumbleArmedAt = LongArray(MAX_PADS)
     private val rumbleTick = object : Runnable {
         override fun run() {
             applyRumble()
@@ -394,7 +396,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val inputDevices = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) { updatePcCapture() }
         override fun onInputDeviceChanged(deviceId: Int) = Unit
-        override fun onInputDeviceRemoved(deviceId: Int) { releasePcInput() }
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            releasePcInput()
+            releasePad(deviceId)
+        }
     }
 
     private fun releasePcInput() {
@@ -403,7 +408,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (session.booted) for (code in 0..23) {
             session.keyEvent(code, false, if (code >= 16) 0 else KEY_VALUE_UNUSED)
         }
-        axisPressed.fill(false); axisValue.fill(Int.MIN_VALUE)
+        axisPressed[0].fill(false); axisValue[0].fill(Int.MIN_VALUE)
         l3Down = false; r3Down = false
         if (surfaceView?.hasPointerCapture() == true) surfaceView?.releasePointerCapture()
     }
@@ -1144,7 +1149,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             ?: return consumeIfGamepad(event) || super.onKeyDown(keyCode, event)
         if (analogTriggerKey(gameKey, event)) return true
         if (event.repeatCount == 0) {
-            session.keyEvent(gameKey, true, KEY_VALUE_UNUSED)
+            session.padKeyEvent(padOf(event.deviceId, event.source), gameKey, true, KEY_VALUE_UNUSED)
             return true
         }
         return super.onKeyDown(keyCode, event)            // ignore auto-repeats
@@ -1164,7 +1169,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         val gameKey = keyMap[keyCode]
             ?: return consumeIfGamepad(event) || super.onKeyUp(keyCode, event)
         if (analogTriggerKey(gameKey, event)) return true
-        session.keyEvent(gameKey, false, KEY_VALUE_UNUSED)
+        session.padKeyEvent(padOf(event.deviceId, event.source), gameKey, false, KEY_VALUE_UNUSED)
         return true
     }
 
@@ -1190,7 +1195,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (panelNav() != null) return
         if (consumeIfGamepad(event)) {
             usePcControls(false)
-            if (event.deviceId != rumbleDeviceId) selectRumbleDevice(event.deviceId)
+            val pad = padOf(event.deviceId, event.source)
+            if (event.deviceId != rumbleDeviceId[pad]) selectRumbleDevice(pad, event.deviceId)
         } else if (pcKey(event.keyCode) != null &&
             event.source and InputDevice.SOURCE_KEYBOARD == InputDevice.SOURCE_KEYBOARD &&
             event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD) {
@@ -1223,13 +1229,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    private fun selectRumbleDevice(deviceId: Int) {
-        stopRumble()
-        rumbleDeviceId = -1
+    private fun selectRumbleDevice(pad: Int, deviceId: Int) {
+        stopRumble(pad)
+        rumbleDeviceId[pad] = -1
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         val ids = runCatching { InputDevice.getDevice(deviceId)?.vibratorManager?.vibratorIds }
             .getOrNull()
-        if (ids != null && ids.isNotEmpty()) rumbleDeviceId = deviceId
+        if (ids != null && ids.isNotEmpty()) rumbleDeviceId[pad] = deviceId
     }
 
     private fun setRumbleOn(on: Boolean) {
@@ -1241,22 +1247,27 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  controllers); a single vibrator plays the stronger one. Held rumble is re-armed before
      *  each one-shot ends, so it stops by itself within RUMBLE_SHOT_MS if polling stops. */
     private fun applyRumble() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || rumbleDeviceId < 0) return
+        for (pad in 0 until MAX_PADS) applyRumble(pad)
+    }
+
+    private fun applyRumble(pad: Int) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || rumbleDeviceId[pad] < 0) return
         val want = if (rumbleOn.value && session.booted && !uiHoldsPause())
-            session.controllerRumble() else 0
+            session.controllerRumble(pad) else 0
         val now = SystemClock.uptimeMillis()
-        if (want == rumbleApplied && (want == 0 || now - rumbleArmedAt < RUMBLE_REARM_MS)) return
-        val manager = runCatching { InputDevice.getDevice(rumbleDeviceId)?.vibratorManager }
+        if (want == rumbleApplied[pad] && (want == 0 || now - rumbleArmedAt[pad] < RUMBLE_REARM_MS)) return
+        val manager = runCatching { InputDevice.getDevice(rumbleDeviceId[pad])?.vibratorManager }
             .getOrNull()
         if (manager == null) {
-            rumbleDeviceId = -1; rumbleApplied = 0; return
+            rumbleDeviceId[pad] = -1; rumbleApplied[pad] = 0; return
         }
         val left = want shr 8 and 0xFF
         val right = want and 0xFF
+        val applied = rumbleApplied[pad]
         runCatching {
             // A motor going quiet is left out of the next combination: stop the old one first.
-            if (want == 0 || (left == 0 && rumbleApplied shr 8 and 0xFF != 0) ||
-                (right == 0 && rumbleApplied and 0xFF != 0)) manager.cancel()
+            if (want == 0 || (left == 0 && applied shr 8 and 0xFF != 0) ||
+                (right == 0 && applied and 0xFF != 0)) manager.cancel()
             val ids = manager.vibratorIds
             if (want != 0 && ids.isNotEmpty()) {
                 val combination = CombinedVibration.startParallel()
@@ -1272,16 +1283,20 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 manager.vibrate(combination.combine())
             }
         }.onFailure { Log.w(TAG, "controller rumble failed", it) }
-        rumbleApplied = want
-        rumbleArmedAt = now
+        rumbleApplied[pad] = want
+        rumbleArmedAt[pad] = now
     }
 
     private fun stopRumble() {
-        if (rumbleApplied != 0 && rumbleDeviceId >= 0 &&
+        for (pad in 0 until MAX_PADS) stopRumble(pad)
+    }
+
+    private fun stopRumble(pad: Int) {
+        if (rumbleApplied[pad] != 0 && rumbleDeviceId[pad] >= 0 &&
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            runCatching { InputDevice.getDevice(rumbleDeviceId)?.vibratorManager?.cancel() }
+            runCatching { InputDevice.getDevice(rumbleDeviceId[pad])?.vibratorManager?.cancel() }
         }
-        rumbleApplied = 0
+        rumbleApplied[pad] = 0
     }
 
     /** The SurfaceView listener only fires while that view holds focus. */
@@ -1306,9 +1321,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             return true
         }
         val isJoystick = event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        // A controller joins (takes a player) with its first real input, not with the resting
+        // noise every connected pad streams: an idle second pad must not take player 1.
+        val pad = if (!isJoystick) 0 else padOfDevice[event.deviceId]
+            ?: if (joystickInUse(event)) padOf(event.deviceId, event.source) else return true
         if (isJoystick && joystickInUse(event)) {
             usePcControls(false)
-            if (event.deviceId != rumbleDeviceId) selectRumbleDevice(event.deviceId)
+            if (event.deviceId != rumbleDeviceId[pad]) selectRumbleDevice(pad, event.deviceId)
         } else if (!pcInput.enabled &&
             event.source and InputDevice.SOURCE_MOUSE == InputDevice.SOURCE_MOUSE &&
             event.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
@@ -1319,96 +1338,137 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             return true
         }
         // No early return: sticks/triggers must still process while a hat is held.
-        val hatHandled = isNonDpadSource(event) && handleHat(event)
+        val hatHandled = isNonDpadSource(event) && handleHat(pad, event)
         if (event.source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK) {
             return hatHandled || super.onGenericMotionEvent(event)
         }
-        emitStick(event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
+        emitStick(pad, event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
             KC_LTHUMB_LEFT, KC_LTHUMB_RIGHT, KC_LTHUMB_UP, KC_LTHUMB_DOWN)
-        emitStick(event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
+        emitStick(pad, event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
             KC_RTHUMB_LEFT, KC_RTHUMB_RIGHT, KC_RTHUMB_UP, KC_RTHUMB_DOWN)
         // Most pads report triggers as ANALOG axes (LTRIGGER/RTRIGGER, or BRAKE/GAS).
-        emitTrigger(maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+        emitTrigger(pad, maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
             event.getAxisValue(MotionEvent.AXIS_BRAKE)), KC_TRIGGER_L)
-        emitTrigger(maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+        emitTrigger(pad, maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
             event.getAxisValue(MotionEvent.AXIS_GAS)), KC_TRIGGER_R)
         return true
     }
 
     /** Analog trigger -> XInput's 0-255, the whole travel (throttle and brake in driving
      *  games). Pressed, for keystrokes, from XInput's own threshold. */
-    private fun emitTrigger(value: Float, gameKey: Int) {
+    private fun emitTrigger(pad: Int, value: Float, gameKey: Int) {
         val v = (value.coerceIn(0f, 1f) * 255f).roundToInt().let { if (it < TRIGGER_REST) 0 else it }
-        emitAxis(gameKey, v >= TRIGGER_PRESSED, v)
+        emitAxis(pad, gameKey, v >= TRIGGER_PRESSED, v)
     }
 
     /** One stick with a round dead zone: inside it both axes read exactly zero (hardware drift
      *  never reaches native); outside it both pass untouched, so a slight diagonal is kept
      *  instead of snapping to the axis. The game applies its own dead zone on top, as on a 360. */
-    private fun emitStick(x: Float, y: Float, left: Int, right: Int, up: Int, down: Int) {
+    private fun emitStick(pad: Int, x: Float, y: Float, left: Int, right: Int, up: Int, down: Int) {
         val rest = x * x + y * y < AXIS_DEADZONE * AXIS_DEADZONE
-        emitAxisPair(if (rest) 0f else x, left, right, invert = false)
-        emitAxisPair(if (rest) 0f else y, up, down, invert = true)
+        emitAxisPair(if (rest) 0f else x, left, right, invert = false, pad = pad)
+        emitAxisPair(if (rest) 0f else y, up, down, invert = true, pad = pad)
     }
 
     /** For one axis emit the opposing thumb directions, scaled to signed-short range.
      *  invert flips sign first (screen Y is up-negative; X360 up is positive). */
-    private fun emitAxisPair(axis: Float, negKey: Int, posKey: Int, invert: Boolean) {
+    private fun emitAxisPair(axis: Float, negKey: Int, posKey: Int, invert: Boolean, pad: Int = 0) {
         val v = (if (invert) -axis else axis).coerceIn(-1f, 1f)
         when {
             v < 0f -> {
-                emitAxis(posKey, false, 0)
-                emitAxis(negKey, true, (v * 32768f).toInt())
+                emitAxis(pad, posKey, false, 0)
+                emitAxis(pad, negKey, true, (v * 32768f).toInt())
             }
             v > 0f -> {
-                emitAxis(negKey, false, 0)
-                emitAxis(posKey, true, (v * 32767f).toInt())
+                emitAxis(pad, negKey, false, 0)
+                emitAxis(pad, posKey, true, (v * 32767f).toInt())
             }
             else -> {
-                emitAxis(negKey, false, 0)
-                emitAxis(posKey, false, 0)
+                emitAxis(pad, negKey, false, 0)
+                emitAxis(pad, posKey, false, 0)
             }
         }
     }
 
     // Last value pushed per analog code: motion events arrive per sample (~120Hz x 4 axes)
     // and mostly repeat, so without this every sample costs ~10 JNI calls.
-    private val axisPressed = BooleanArray(24)
-    private val axisValue = IntArray(24) { Int.MIN_VALUE }
+    private val axisPressed = Array(MAX_PADS) { BooleanArray(24) }
+    private val axisValue = Array(MAX_PADS) { IntArray(24) { Int.MIN_VALUE } }
 
-    private fun emitAxis(code: Int, pressed: Boolean, value: Int) {
-        if (axisPressed[code] == pressed && axisValue[code] == value) return
-        axisPressed[code] = pressed
-        axisValue[code] = value
-        session.keyEvent(code, pressed, value)
+    private fun emitAxis(pad: Int, code: Int, pressed: Boolean, value: Int) {
+        if (axisPressed[pad][code] == pressed && axisValue[pad][code] == value) return
+        axisPressed[pad][code] = pressed
+        axisValue[pad][code] = value
+        session.padKeyEvent(pad, code, pressed, value)
+    }
+
+    // Physical controllers -> players. The first controller that sends input is player 1,
+    // together with the on-screen pad and keyboards; each further one takes the lowest free
+    // player, up to 4. Unplugging a controller frees its player. Controls built into the phone
+    // (shoulder triggers of gaming phones) always stay on player 1.
+    private val padOfDevice = HashMap<Int, Int>()
+
+    private fun padOf(deviceId: Int, source: Int): Int {
+        if (source and InputDevice.SOURCE_GAMEPAD != InputDevice.SOURCE_GAMEPAD &&
+            source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK) return 0
+        padOfDevice[deviceId]?.let { return it }
+        val device = InputDevice.getDevice(deviceId) ?: return 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !device.isExternal) return 0
+        val pad = (0 until MAX_PADS).firstOrNull { it !in padOfDevice.values } ?: return 0
+        padOfDevice[deviceId] = pad
+        Log.i(TAG, "controller ${device.name} (device $deviceId) -> player ${pad + 1}")
+        if (pad > 0) {
+            session.setPadConnected(pad, true)
+            Toast.makeText(this, l10n("${device.name}: player ${pad + 1}",
+                "${device.name}: giocatore ${pad + 1}"), Toast.LENGTH_SHORT).show()
+        }
+        return pad
+    }
+
+    /** A controller went away: nothing it held stays pressed, and its player is free. */
+    private fun releasePad(deviceId: Int) {
+        val pad = padOfDevice.remove(deviceId) ?: return
+        if (pad == 0) {
+            if (session.booted) for (code in 0..23) {
+                session.keyEvent(code, false, if (code >= 16) 0 else KEY_VALUE_UNUSED)
+            }
+        } else {
+            session.setPadConnected(pad, false)
+        }
+        axisPressed[pad].fill(false); axisValue[pad].fill(Int.MIN_VALUE)
+        hatLeft[pad] = false; hatUp[pad] = false; hatRight[pad] = false; hatDown[pad] = false
+        if (rumbleDeviceId[pad] == deviceId) {
+            stopRumble(pad)
+            rumbleDeviceId[pad] = -1
+        }
     }
 
     // Hat D-pad state, edge-detected: the hat only releases what IT pressed, so it can't
     // clobber a D-pad held via real KEYCODE_DPAD_* key events.
-    private var hatLeft = false
-    private var hatUp = false
-    private var hatRight = false
-    private var hatDown = false
+    private val hatLeft = BooleanArray(MAX_PADS)
+    private val hatUp = BooleanArray(MAX_PADS)
+    private val hatRight = BooleanArray(MAX_PADS)
+    private val hatDown = BooleanArray(MAX_PADS)
 
     /** Hat axes -> D-pad; thresholds, not ==+-1f (some pads are inexact). */
-    private fun handleHat(event: MotionEvent): Boolean {
+    private fun handleHat(pad: Int, event: MotionEvent): Boolean {
         val hx = event.getAxisValue(MotionEvent.AXIS_HAT_X)
         val hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
         val left = hx < -0.5f
         val right = hx > 0.5f
         val up = hy < -0.5f
         val down = hy > 0.5f
-        if (left != hatLeft) {
-            session.keyEvent(KC_DPAD_LEFT, left, KEY_VALUE_UNUSED); hatLeft = left
+        if (left != hatLeft[pad]) {
+            session.padKeyEvent(pad, KC_DPAD_LEFT, left, KEY_VALUE_UNUSED); hatLeft[pad] = left
         }
-        if (right != hatRight) {
-            session.keyEvent(KC_DPAD_RIGHT, right, KEY_VALUE_UNUSED); hatRight = right
+        if (right != hatRight[pad]) {
+            session.padKeyEvent(pad, KC_DPAD_RIGHT, right, KEY_VALUE_UNUSED); hatRight[pad] = right
         }
-        if (up != hatUp) {
-            session.keyEvent(KC_DPAD_UP, up, KEY_VALUE_UNUSED); hatUp = up
+        if (up != hatUp[pad]) {
+            session.padKeyEvent(pad, KC_DPAD_UP, up, KEY_VALUE_UNUSED); hatUp[pad] = up
         }
-        if (down != hatDown) {
-            session.keyEvent(KC_DPAD_DOWN, down, KEY_VALUE_UNUSED); hatDown = down
+        if (down != hatDown[pad]) {
+            session.padKeyEvent(pad, KC_DPAD_DOWN, down, KEY_VALUE_UNUSED); hatDown[pad] = down
         }
         return left || right || up || down
     }

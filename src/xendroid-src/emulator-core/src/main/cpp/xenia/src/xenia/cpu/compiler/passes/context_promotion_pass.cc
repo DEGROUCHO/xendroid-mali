@@ -94,6 +94,15 @@ DEFINE_bool(a64_dse_through_preempt, true,
             "preemption safepoints (loop heads): stores every path overwrites "
             "before reading are dropped even across a loop back-edge.",
             "a64");
+DEFINE_bool(a64_dse_through_preempt_with_savestate, true,
+            "Keep a64_dse_through_preempt on with savestate_enable. A dropped "
+            "store's slot is overwritten before any read on every path from "
+            "the safepoint, so a thread restored there (a fresh function "
+            "entered at that guest address) never reads the stale value "
+            "either.",
+            "a64");
+UPDATE_from_bool(a64_dse_through_preempt_with_savestate, 2026, 11, 15, 1,
+                 false);
 DEFINE_bool(context_transparent_atomics, true,
             "Atomic compare-exchanges, reserved loads/stores and memory "
             "barriers neither read nor write PPCContext: keep promoted "
@@ -721,7 +730,8 @@ bool ContextPromotionPass::Run(HIRBuilder* builder) {
               }
             } else if (opcode == &OPCODE_CHECK_PREEMPT_info &&
                        cvars::a64_dse_through_preempt &&
-                       !cvars::savestate_enable) {
+                       (!cvars::savestate_enable ||
+                        cvars::a64_dse_through_preempt_with_savestate)) {
               // A fiber switch resumes this very point with this very
               // context, so a slot overwritten before its next read on every
               // path is as unobservable to the guest thread as without the

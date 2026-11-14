@@ -79,6 +79,10 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // caller emits a normal call.
   bool TryInlineLeafCall(uint32_t target_address, uint64_t cia);
   Label* LookupLabel(uint32_t address);
+  // While a leaf with internal forward branches is being expanded inline
+  // (inline_leaf_branches): the label its returns (blr, conditional bclr)
+  // jump to, right after the inlined body. Null otherwise.
+  Label* inline_exit_label() const { return inline_exit_; }
 
   Value* LoadLR();
   void StoreLR(Value* value);
@@ -134,6 +138,15 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   uint64_t instr_count_;
   Instr** instr_offset_list_;
   Label** label_list_;
+
+  // Set only while TryInlineLeafCall expands a leaf with internal branches:
+  // its branch targets resolve through inline_labels_ ([inline_start_,
+  // inline_end_), one slot per instruction) instead of the enclosing
+  // function's tables, and its returns branch to inline_exit_.
+  uint32_t inline_start_ = 0;
+  uint32_t inline_end_ = 0;
+  Label** inline_labels_ = nullptr;
+  Label* inline_exit_ = nullptr;
 
   // Reset each instruction. Sized for what a single PowerPC instruction can
   // write, so anything emitting a longer run of register stores from one

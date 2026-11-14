@@ -295,6 +295,30 @@ DEFINE_bool(
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
 
+DEFINE_bool(
+    gpu_untile_predicated_tiling, true,
+    "Draw predicated tiling (720p surfaces with MSAA that do not fit the EDRAM "
+    "and are rendered in horizontal strips) once instead of once per strip. "
+    "The screen extents the guest asks for each draw are reported as the first "
+    "strip only, so the guest masks the geometry out of the later strips; the "
+    "first strip is drawn with the window offset removed and the scissor "
+    "opened to the whole screen into the host render targets (already taller "
+    "than a strip), and the resolves and clears of every strip are served "
+    "from its own rows; a later strip's own draws before its resolves (GTA "
+    "IV's depth clear) are dropped, its rows being drawn already, while the "
+    "resolves of every strip are kept. GTA IV: image identical to the tiled "
+    "path at the strip boundaries, command processor time per frame -10%, "
+    "draws 6976 -> 4665.",
+    "GPU");
+// A first version was on by default only briefly: GTA IV showed a seam with
+// stale content below it. The second update returns configs written by that
+// version (true) to the default of the time.
+UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 11, 18, false);
+UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 11, 19, true);
+// On by default again: the seam is fixed (the resolves of strips 2-3 were
+// skipped as the strip's own draws).
+UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 15, 2, false);
+
 DEFINE_bool(readback_resolve_sync, true,
             "Stall the GPU after each readback_resolve copy so guest RAM is "
             "coherent in "

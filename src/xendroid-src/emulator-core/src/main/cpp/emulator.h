@@ -32,6 +32,9 @@ namespace ae{
 
     extern void main_thr();
     extern void key_event(int key_code,bool pressed,int value);
+    // Players 1-4 (pad 0-3): pad 0 is the on-screen pad, keyboard and first controller.
+    extern void key_event_pad(int pad,int key_code,bool pressed,int value);
+    extern void set_pad_connected(int pad,bool connected);
     extern bool is_running();
     extern bool is_paused();
     extern void pause();

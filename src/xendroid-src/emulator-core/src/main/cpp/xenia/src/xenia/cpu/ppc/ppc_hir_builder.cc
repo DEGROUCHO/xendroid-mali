@@ -10,6 +10,7 @@
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
 #include <stddef.h>
+#include <algorithm>
 #include <cstring>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -59,6 +60,22 @@ DEFINE_bool(
     "the call indirection, the guest prologue and its stackpoint push, and "
     "the return protocol - which together dwarf the two or three instructions "
     "some of these leaves actually contain.",
+    "CPU");
+
+DEFINE_bool(
+    inline_leaf_branches, true,
+    "Second tier of inline_leaf_calls: also expand leaves with internal "
+    "forward branches (if/else, early and conditional returns: b, bc, bclr "
+    "without LK). Only forward targets inside the leaf are accepted, so the "
+    "expanded body has no loop, hence no safepoint of its own, and every "
+    "return lands right after it. Calls, indirect branches, traps, sc and "
+    "LR moves still keep the real call.",
+    "CPU");
+
+DEFINE_uint32(
+    inline_leaf_branches_max_instructions, 32,
+    "Largest leaf with internal branches, in guest instructions, that "
+    "inline_leaf_branches will expand.",
     "CPU");
 
 DEFINE_uint32(
@@ -483,11 +500,25 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
 
   // Scan first, emit second: a rejection partway through emission could not be
   // undone.
+  // With inline_leaf_branches the body may also branch forward inside
+  // itself; it then ends at the first unconditional blr no branch jumps past.
+  const bool branches_allowed =
+      cvars::inline_leaf_branches &&
+      cvars::inline_leaf_branches_max_instructions;
+  const uint32_t scan_limit =
+      branches_allowed ? std::max(cvars::inline_leaf_max_instructions,
+                                  cvars::inline_leaf_branches_max_instructions)
+                       : cvars::inline_leaf_max_instructions;
+  constexpr uint32_t kMaxInlineBranchTargets = 64;
+  uint32_t branch_targets[kMaxInlineBranchTargets];
+  uint32_t branch_target_count = 0;
+  uint32_t furthest_target = target_address;
+  bool has_branches = false;
   uint32_t body_count = 0;
   {
     uint32_t address = target_address;
     for (;; address += 4) {
-      if (body_count > cvars::inline_leaf_max_instructions) {
+      if (body_count > scan_limit) {
         return false;
       }
       uint8_t* ptr = memory->TranslateVirtual(address);
@@ -496,7 +527,13 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
       }
       uint32_t code = xe::load_and_swap<uint32_t>(ptr);
       if (code == kBlr) {
-        break;  // terminal return, and the end of the body
+        if (address >= furthest_target) {
+          break;  // terminal return, and the end of the body
+        }
+        // A return in the middle of a branchy leaf (only reachable here once
+        // a forward branch jumps past it): emitted as a jump to the exit.
+        ++body_count;
+        continue;
       }
       auto opcode = LookupOpcode(code);
       if (opcode == PPCOpcode::kInvalid) {
@@ -511,7 +548,41 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
       // offset tables are sized for the enclosing function only), no call can
       // recurse, and no control leaves the run except through the blr above.
       if (opcode_info.group == PPCOpcodeGroup::kB) {
-        return false;
+        if (!branches_allowed) {
+          return false;
+        }
+        // Only branches that stay inside the leaf and go forward (no loop,
+        // so no safepoint and no label behind the emission point), and
+        // returns. Anything linking, indirect through CTR, trapping or
+        // calling the system keeps the real call.
+        if (opcode == PPCOpcode::bx || opcode == PPCOpcode::bcx) {
+          const bool is_b = opcode == PPCOpcode::bx;
+          // LK is bit 0 and AA bit 1 in both encodings.
+          if (code & 3) {
+            return false;
+          }
+          uint32_t target =
+              is_b ? uint32_t(address + XEEXTS26(code & 0x03FFFFFC))
+                   : uint32_t(address + XEEXTS16(code & 0xFFFC));
+          if (target <= address ||
+              target - target_address > 4 * scan_limit) {
+            return false;
+          }
+          if (branch_target_count == kMaxInlineBranchTargets) {
+            return false;
+          }
+          branch_targets[branch_target_count++] = target;
+          furthest_target = std::max(furthest_target, target);
+        } else if (opcode == PPCOpcode::bclrx) {
+          if (code & 1) {
+            return false;  // bclrl
+          }
+        } else {
+          return false;
+        }
+        has_branches = true;
+        ++body_count;
+        continue;
       }
       // mtlr: the blr that ends the body then goes wherever the leaf decided,
       // not back to this call site (the tail of a longjmp, a thunk that
@@ -531,6 +602,11 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
   if (!body_count) {
     return false;  // a bare `blr`; the call is already about to be elided
   }
+  if (has_branches
+          ? body_count > cvars::inline_leaf_branches_max_instructions
+          : body_count > cvars::inline_leaf_max_instructions) {
+    return false;
+  }
 
   // The architectural effect of the bl itself. The inlined body may read LR,
   // and the caller certainly may after we return.
@@ -542,12 +618,35 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
                   body_count);
   }
 
+  // A branchy leaf: its branch targets get labels of their own, and every
+  // return - the terminal blr included, so it is emitted too - jumps to the
+  // exit label placed after the body.
+  uint32_t emit_count = body_count;
+  if (has_branches) {
+    emit_count = body_count + 1;
+    inline_start_ = target_address;
+    inline_end_ = target_address + 4 * emit_count;
+    inline_labels_ = static_cast<Label**>(
+        arena_->Alloc(sizeof(Label*) * emit_count, alignof(Label*)));
+    std::memset(inline_labels_, 0, sizeof(Label*) * emit_count);
+    for (uint32_t t = 0; t < branch_target_count; ++t) {
+      Label*& label = inline_labels_[(branch_targets[t] - target_address) / 4];
+      if (!label) {
+        label = NewLabel();
+      }
+    }
+    inline_exit_ = NewLabel();
+  }
+
   // Emit the body. Deliberately no SourceOffset: the source map is keyed to
   // the enclosing function's range, so a fault inside the inlined run is
   // better attributed to this call site than to an address the map does not
   // own.
   uint32_t address = target_address;
-  for (uint32_t n = 0; n < body_count; ++n, address += 4) {
+  for (uint32_t n = 0; n < emit_count; ++n, address += 4) {
+    if (inline_labels_ && inline_labels_[n]) {
+      MarkLabel(inline_labels_[n]);
+    }
     trace_info_.dest_count = 0;
     uint32_t code = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
     auto opcode = LookupOpcode(code);
@@ -566,6 +665,12 @@ bool PPCHIRBuilder::TryInlineLeafCall(uint32_t target_address,
       XELOGE("Unimplemented instr {:08X} {:08X} while inlining leaf {:08X}",
              address, code, target_address);
     }
+  }
+  if (has_branches) {
+    MarkLabel(inline_exit_);
+    inline_start_ = inline_end_ = 0;
+    inline_labels_ = nullptr;
+    inline_exit_ = nullptr;
   }
   return true;
 }
@@ -631,6 +736,14 @@ Function* PPCHIRBuilder::LookupFunction(uint32_t address) {
 }
 
 Label* PPCHIRBuilder::LookupLabel(uint32_t address) {
+  if (inline_labels_) {
+    // Inside an expanded branchy leaf only its own targets exist (the scan
+    // rejected anything else).
+    if (address >= inline_start_ && address < inline_end_) {
+      return inline_labels_[(address - inline_start_) / 4];
+    }
+    return nullptr;
+  }
   if (address < start_address_) {
     return nullptr;
   }

@@ -167,6 +167,10 @@ DEFINE_int32(
     "Percentage of the image height that can be kept when presenting to "
     "maintain aspect ratio without letterboxing or stretching.",
     "Display");
+// The app's default config shipped 90 (TV overscan): on phones wider than 16:9 it cut 5% off
+// the top and bottom of every game, HUDs included (issue 14). A phone screen has no overscan.
+UPDATE_from_int32(present_safe_area_x, 2026, 11, 15, 3, 90);
+UPDATE_from_int32(present_safe_area_y, 2026, 11, 15, 3, 90);
 
 namespace xe {
 namespace ui {

@@ -25,6 +25,7 @@
 
 DECLARE_bool(log_gpu_frame_time_breakdown);
 DECLARE_bool(log_relaxed_attachment_ops);
+DECLARE_bool(vulkan_render_area_tight);
 DECLARE_bool(vulkan_relax_unused_attachment_loads);
 
 DEFINE_bool(vulkan_classic_pass_finalize, false,
@@ -1518,8 +1519,11 @@ void DeferredCommandBuffer::ShrinkRenderAreaToDrawn(
     return;
   }
   const size_t patch_offset = render_area_patch_offset_;
-  if (!pass_recorded_draws_ || !pass_drawn_width_ || !pass_drawn_height_ ||
-      pass_unaccounted_clear_) {
+  // A pass without draws whose clear rectangles are all accounted touches
+  // exactly those rectangles (vulkan_render_area_tight); a pass with neither is
+  // only load/store work and keeps the full extent.
+  if ((!pass_recorded_draws_ && !cvars::vulkan_render_area_tight) ||
+      !pass_drawn_width_ || !pass_drawn_height_ || pass_unaccounted_clear_) {
     // Nothing rasterized into the pass (or only load/store work) - the full
     // extent is the only safe answer.
     if (cvars::log_gpu_frame_time_breakdown && xe_shrink_logged < 200) {

@@ -1170,7 +1170,21 @@ static jdouble j_gpu_frame_time_ms(JNIEnv*, jobject) {
 // Player 1 rumble from the last XInputSetState: left motor << 8 | right
 // motor, each 0-255.
 static jint j_controller_rumble(JNIEnv*, jobject) {
-    return jint(xe::hid::android::controller_rumble.load(std::memory_order_relaxed));
+    return jint(xe::hid::android::controller_rumble[0].load(std::memory_order_relaxed));
+}
+
+// Players 2-4: the physical controller each one is on (pad 1-3).
+static jint j_controller_rumble_pad(JNIEnv*, jobject, jint pad) {
+    if (pad < 0 || pad >= xe::hid::android::kMaxPads) return 0;
+    return jint(xe::hid::android::controller_rumble[pad].load(std::memory_order_relaxed));
+}
+
+static void j_key_event_pad(JNIEnv*, jobject, jint pad, jint key_code, jboolean pressed, jint value) {
+    ae::key_event_pad(pad, key_code, pressed, value);
+}
+
+static void j_set_pad_connected(JNIEnv*, jobject, jint pad, jboolean connected) {
+    ae::set_pad_connected(pad, connected);
 }
 static void j_set_gpu_timing_enabled(JNIEnv*, jobject, jboolean enabled) {
     // GPU.log_gpu_time keeps the timing on when the overlay closes.
@@ -1856,6 +1870,9 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"gpu_frame_time_ms", "()D", (void *) j_gpu_frame_time_ms}
             ,{"set_gpu_timing_enabled", "(Z)V", (void *) j_set_gpu_timing_enabled}
             ,{"controller_rumble", "()I", (void *) j_controller_rumble}
+            ,{"controller_rumble_pad", "(I)I", (void *) j_controller_rumble_pad}
+            ,{"key_event_pad", "(IIZI)V", (void *) j_key_event_pad}
+            ,{"set_pad_connected", "(IZ)V", (void *) j_set_pad_connected}
             ,{"last_frame_time_ms", "()D", (void *) j_last_frame_time_ms}
             ,{"show_debug_overlay_enabled", "()Z", (void *) j_show_debug_overlay_enabled}
             ,{"show_touch_overlay_enabled", "()Z", (void *) j_show_touch_overlay_enabled}

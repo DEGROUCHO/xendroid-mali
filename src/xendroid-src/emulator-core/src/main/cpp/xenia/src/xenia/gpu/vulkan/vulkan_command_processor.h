@@ -536,6 +536,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
     bool vulkan_placeholder_pipelines = {};
     bool vulkan_relax_unused_attachment_ops = {};
     bool vulkan_render_area_draw_bound = {};
+    bool vulkan_render_area_tight = {};
     bool vulkan_republish_draw_inputs = {};
     bool vulkan_reuse_index_buffer_binding = {};
     bool vulkan_unclipped_fallback = {};

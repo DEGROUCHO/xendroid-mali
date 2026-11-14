@@ -43,6 +43,7 @@
 #include "xenia/gpu/spirv_compatibility.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_compatibility.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/xenos.h"
@@ -282,6 +283,7 @@ bool VulkanPipelineCache::Initialize() {
     }
     caps.fragment_shading_rate =
         cvars::vulkan_fragment_shading_rate_dynamic &&
+        !cvars::vulkan_compatibility_rendering &&
         !edram_fragment_shader_interlock &&
         vulkan_device->extensions().ext_KHR_fragment_shading_rate;
     if (cvars::vulkan_fragment_shading_rate_dynamic) {

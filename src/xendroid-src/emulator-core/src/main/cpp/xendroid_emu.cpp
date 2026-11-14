@@ -872,25 +872,37 @@ namespace ae{
 
     }
 
-    void key_event(int key_code,bool pressed,int value){
+    // The Android input driver, or null while the emulator is not up (input can arrive in
+    // that window: a controller press on the boot splash, the touch overlay releasing its
+    // keys as it leaves composition). The caller holds runtime_state_input_mutex shared.
+    static xe::hid::android::AndroidInputDriver* android_input_driver(){
+        static const bool is_android=cvars::hid=="android";
+        if(!is_android) return nullptr;
+        if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return nullptr;
+        xe::hid::InputSystem* input_system=g_windowed_app_ref->emu->input_system();
+        // driver(0) indexes the vector, so the count must be checked, not the pointer.
+        if(!input_system || input_system->driver_count()==0) return nullptr;
+        return reinterpret_cast<xe::hid::android::AndroidInputDriver*>(input_system->driver(0));
+    }
+
+    void key_event_pad(int pad,int key_code,bool pressed,int value){
         // A save keeps the input system: let releases through so a key let go
         // during it doesn't stay held. A restore rebuilds it: drop everything.
         if (runtime_state_busy.load(std::memory_order_acquire) &&
             (pressed || runtime_state_restoring.load(std::memory_order_acquire))) return;
         std::shared_lock input_lock(runtime_state_input_mutex, std::try_to_lock);
         if (!input_lock.owns_lock()) return;
-        static const bool is_android=cvars::hid=="android";
-        if(!is_android) return;
-        // Every hop can still be null while the detached boot thread builds the emulator,
-        // and input arrives in that window: a controller press on the boot splash, or the
-        // touch overlay releasing its keys as it leaves composition.
-        if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return;
-        xe::hid::InputSystem* input_system=g_windowed_app_ref->emu->input_system();
-        // driver(0) indexes the vector, so the count must be checked, not the pointer.
-        if(!input_system || input_system->driver_count()==0) return;
-        auto* driver=reinterpret_cast<xe::hid::android::AndroidInputDriver*>(input_system->driver(0));
-        if(!driver) return;
-        driver->OnKey(key_code,pressed,value);
+        if(auto* driver=android_input_driver()) driver->OnKey(pad,key_code,pressed,value);
+    }
+    void key_event(int key_code,bool pressed,int value){
+        key_event_pad(0,key_code,pressed,value);
+    }
+    void set_pad_connected(int pad,bool connected){
+        // Never stalls the UI thread behind a restore: that rebuilds the driver with
+        // players 2-4 unplugged anyway, and a controller's next press plugs it back.
+        std::shared_lock input_lock(runtime_state_input_mutex, std::try_to_lock);
+        if (!input_lock.owns_lock()) return;
+        if(auto* driver=android_input_driver()) driver->SetPadConnected(pad,connected);
     }
     bool is_running(){
         if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return false;

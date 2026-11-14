@@ -59,6 +59,7 @@ DEFINE_bool(
 
 DECLARE_bool(precise_interpolation);
 DECLARE_bool(vulkan_msaa_2x2_pixel_rate);
+DECLARE_bool(vulkan_compatibility_rendering);
 DECLARE_bool(vulkan_bindless_textures);
 DEFINE_bool(vulkan_bindless_debug_constant_slot, false,
             "Diagnostic: the shaders sample bindless slot 0 (the null view and "
@@ -92,9 +93,12 @@ DEFINE_int32(
     "operands only comes from 0 * inf, so the result is the same; a NaN "
     "operand times a non-zero value gives +0 instead of NaN. Needs "
     "SignedZeroInfNanPreserve so OpIsNan cannot be folded away. -1 = "
-    "automatic: on for the Arm Mali driver, where the select costs 3 instead "
-    "of 4 arithmetic cycles per multiply (Mali Offline Compiler, Mali-G720); "
-    "0 = off; 1 = on.",
+    "automatic: on for the Arm Mali driver from r49, where the select costs 3 "
+    "instead of 4 arithmetic cycles per multiply (Mali Offline Compiler, "
+    "Mali-G720), and off with vulkan_compatibility_rendering. Older releases "
+    "keep the operand test: on the Mali-G615 with r44p1 the picture is black "
+    "with the proprietary driver and correct with a driver that takes the "
+    "operand test on the same phone. 0 = off; 1 = on.",
     "GPU");
 DEFINE_bool(
     spirv_multiply_zero_test_on_bits, false,
@@ -291,6 +295,7 @@ SpirvShaderTranslator::Features::Features(
       samples_as_pixels_coarse(
           cvars::vulkan_msaa_2x2_pixel_rate &&
           cvars::vulkan_fragment_shading_rate_dynamic &&
+          !cvars::vulkan_compatibility_rendering &&
           vulkan_device->extensions().ext_KHR_fragment_shading_rate),
       bindless_textures(
           cvars::vulkan_bindless_textures &&
@@ -307,8 +312,10 @@ SpirvShaderTranslator::Features::Features(
       multiply_zero_nan_select(
           cvars::spirv_multiply_zero_nan_select > 0 ||
           (cvars::spirv_multiply_zero_nan_select < 0 &&
+           !cvars::vulkan_compatibility_rendering &&
            vulkan_device->properties().driverID ==
                VK_DRIVER_ID_ARM_PROPRIETARY &&
+           vulkan_device->properties().maliDriverRelease >= 49 &&
            vulkan_device->properties()
                .shaderSignedZeroInfNanPreserveFloat32)) {
   // Check for SPIR-V version override from CVAR.

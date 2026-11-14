@@ -389,7 +389,7 @@ void RegisterAllocationPass::PrecolorPinnedValues(HIRBuilder* builder) {
            op == &OPCODE_LOAD_MMIO_info || op == &OPCODE_STORE_MMIO_info ||
            op == &OPCODE_SPIN_BACKOFF_info;
   };
-  constexpr uint32_t kMaxPinned = 8;
+  constexpr uint32_t kMaxPinned = 16;
   for (Block* block = builder->first_block(); block; block = block->next) {
     PinnedState states[2][kMaxPinned];
     uint32_t last_branch = 0;

@@ -87,6 +87,15 @@ DEFINE_bool(
     "fiber last checked in rather than only its link register. Costs a "
     "materialize and a store on every loop back-edge; diagnostic only.",
     "CPU");
+DEFINE_bool(
+    a64_safepoint_pc_cold_only, true,
+    "With log_safepoint_pc (forced on by savestate_enable), write the "
+    "safepoint's guest address only on the taken cold path, just before the "
+    "yield handler runs, instead of on every pass. The snapshot parks a fiber "
+    "only from that handler, so it reads the same address; the scheduler's "
+    "no-progress report then names the last safepoint that yielded.",
+    "CPU");
+UPDATE_from_bool(a64_safepoint_pc_cold_only, 2026, 11, 15, 1, false);
 
 DECLARE_bool(a64_vconst_pool);
 
@@ -1370,8 +1379,17 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address, uint32_t dirty_mask,
       shared_sync = found->second.second;
     }
   }
+  const bool cold_pc = cvars::log_safepoint_pc &&
+                       cvars::a64_safepoint_pc_cold_only && guest_address;
   Label& do_yield = AddToTail([&after, flag_offset, dirty_mask, live_mask,
-                               shared_sync](A64Emitter& e, Label&) {
+                               shared_sync, cold_pc,
+                               guest_address](A64Emitter& e, Label&) {
+    if (cold_pc) {
+      // Per-site tail code: the shared paths below never see the address.
+      e.mov(e.w9, guest_address);
+      e.str(e.w9, ptr(e.x20, static_cast<uint32_t>(offsetof(
+                                 ppc::PPCContext, last_safepoint_pc))));
+    }
     if (shared_sync) {
       e.bl(*shared_sync);
       e.b(after);
@@ -1400,7 +1418,7 @@ void A64Emitter::EmitPreemptCheck(uint32_t guest_address, uint32_t dirty_mask,
     e.EmitPinnedContext(true, live_mask);
     e.b(after);
   });
-  if (cvars::log_safepoint_pc && guest_address) {
+  if (cvars::log_safepoint_pc && guest_address && !cold_pc) {
     // Diagnostic only: costs a materialize + store on every loop back-edge, so
     // it stays off unless a wedge is being chased.
     static_assert(offsetof(ppc::PPCContext, last_safepoint_pc) < 16384);

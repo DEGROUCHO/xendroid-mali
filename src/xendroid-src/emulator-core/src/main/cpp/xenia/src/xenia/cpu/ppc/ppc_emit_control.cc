@@ -111,6 +111,24 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
                      bool expect_true = true, bool nia_is_lr = false) {
   uint32_t call_flags = 0;
 
+  // A return inside a leaf being expanded inline (inline_leaf_branches): LR
+  // still holds the call site's return address (the leaf may not move LR),
+  // so it lands right after the inlined body.
+  if (Label* exit = f.inline_exit_label()) {
+    if (nia_is_lr && !lk) {
+      if (cond) {
+        if (expect_true) {
+          f.BranchTrue(cond, exit);
+        } else {
+          f.BranchFalse(cond, exit);
+        }
+      } else {
+        f.Branch(exit);
+      }
+      return 0;
+    }
+  }
+
   // Saverest helpers first: their calls are pure register spill/fill and the
   // whole call apparatus around them is overhead. Conditional forms fall
   // through to the normal path.

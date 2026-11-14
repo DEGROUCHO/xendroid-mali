@@ -1321,8 +1321,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
       byte_swap<unsigned short>(xenos::kTexture2DCubeMaxWidthHeight >>
                                 3),       // max x
       byte_swap<unsigned short>(0 >> 3),  // min y
-      byte_swap<unsigned short>(xenos::kTexture2DCubeMaxWidthHeight >>
-                                3),  // max y
+      // Untiling: the draw is reported inside the first strip only, the
+      // guest then masks it out of the other strips (drawn once, full
+      // height, by the first).
+      byte_swap<unsigned short>(
+          cvars::gpu_untile_predicated_tiling
+              ? 1
+              : (xenos::kTexture2DCubeMaxWidthHeight >> 3)),  // max y
       byte_swap<unsigned short>(0),  // min z
       byte_swap<unsigned short>(1),  // max z
   };

@@ -45,7 +45,7 @@
 </p>
 
 > [!NOTE]
-> **New in q664:** **FIFA 16** plays properly (players no longer freeze or teleport on the ball, the whole pitch is lit) and **Dead or Alive Xtreme 2** gets past the main menu to Zack Island. Both were reported by players. Since q655: black screen on **Mali-G615** while the game runs? Turn on **Settings → Vulkan → Compatibility rendering**; **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too.
+> **New in 1.0.0:** **up to 4 players**, each with their own controller (and their own rumble); the **whole picture** on phones wider than 16:9 (the top and bottom 5% used to be cut off, HUD included); **Black Ops** from 38–41 to **44–46 fps** thanks to a faster CPU recompiler that no longer slows down with savestates on; **GTA IV** draws a third fewer calls per frame. **Mali-G615** (Dimensity 7300 / 8200 / 8300) black screen: a second fix is in, please tell me how it goes on your phone.
 
 <br>
 
@@ -56,7 +56,7 @@
     <td width="33%"><img src="docs/media/halo-reach.jpg" alt="Halo: Reach"></td>
   </tr>
   <tr>
-    <td align="center"><b>Call of Duty: Black Ops</b><br><sub>42–60 fps</sub></td>
+    <td align="center"><b>Call of Duty: Black Ops</b><br><sub>44–60 fps</sub></td>
     <td align="center"><b>Grand Theft Auto IV</b><br><sub>33–42 fps · no black flashing</sub></td>
     <td align="center"><b>Halo: Reach</b><br><sub>steady 30 fps · clean image</sub></td>
   </tr>
@@ -76,8 +76,8 @@
 | Game | Early Mali builds | **This release** | What changed |
 |:--|:--:|:--:|:--|
 | Call of Duty: Modern Warfare 2 | ~20 fps, striped picture | **44–57 fps** | The first game of this fork: stripes and rainbow textures fixed; its tuning became the default for every game |
-| Call of Duty: Black Ops | 5–10 fps | **42–60 fps** | Global guest lock removed; memory coherency rebuilt |
-| Grand Theft Auto IV | 24 fps | **33–42 fps** | Fewer 4x transfers; black flashing fixed |
+| Call of Duty: Black Ops | 5–10 fps | **44–60 fps** | Global guest lock removed; memory coherency rebuilt; faster CPU recompiler (1.0.0) |
+| Grand Theft Auto IV | 24 fps | **33–42 fps** | Fewer 4x transfers; black flashing fixed; split-screen tiling drawn once (−33% draws, 1.0.0) |
 | Halo: Reach | ~20 fps, rainbow artifacts | **30 fps** steady | MSAA 2×2 layout (+30%); rainbow fixed; GPU export copies cut from 24–34 MB to 0.3 MB per frame |
 | Dante's Inferno | blocks + dither artifacts | **60 fps** locked · **~110 fps** with the limit off | Mali erratum workaround; dither fixed |
 | Need for Speed: Most Wanted | crashed ~40% of boots | **44–51 fps** | Lock-free atomics fixed |
@@ -110,7 +110,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
 | Game | Status | FPS (POCO X7 Pro unless noted) | Notes |
 |:--|:--:|:--:|:--|
 | Dante's Inferno | ✅ Great | 60 locked · ~110 free | Savestates |
-| Call of Duty: Black Ops | ✅ Playable | 42–60 | Savestates · occasional square artifacts |
+| Call of Duty: Black Ops | ✅ Playable | 44–60 | Savestates · occasional square artifacts |
 | Need for Speed: Most Wanted | ✅ Playable | 44–51 | Also runs well in races on a **POCO X8 Pro** (player report) |
 | Call of Duty: Modern Warfare 2 | ✅ Playable | 44–57 | Measured on an October build |
 | Grand Theft Auto IV | ✅ Playable | 33–42 | Savestates · no black flashing · also runs smoothly on a Dimensity 8400+ (player report) |
@@ -227,7 +227,7 @@ Headroom, from the statistics box: Dante's Inferno holds its 60 fps lock with th
     </td>
     <td valign="top">
       <h3>🎮 Play comfortably</h3>
-      Xbox controller support, a one-tap FPS limit (Auto / 30 / Free) and a clear statistics box: FPS, frame time, CPU, GPU, RAM, battery temperature and what is limiting the FPS. The interface is in <b>English and Italian</b>, switchable in Settings → Language.
+      Xbox controller support with <b>up to 4 players</b> (one controller each, own rumble), a one-tap FPS limit (Auto / 30 / Free) and a clear statistics box: FPS, frame time, CPU, GPU, RAM, battery temperature and what is limiting the FPS. The interface is in <b>English and Italian</b>, switchable in Settings → Language.
     </td>
   </tr>
 </table>
@@ -455,9 +455,10 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 1 Nov 2026 | q651 | WWE 2K14 playable with savestates; community patch catalog and patch import; less audio crackle |
 | 1 Nov 2026 | q652 | DLC and title updates found next to a game are offered for install; imported saves go to the signed-in profile |
 | 9 Nov 2026 | q655 | **Compatibility rendering** switch for black screens on older Mali drivers (Mali-G615); **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too |
-| 10 Nov 2026 | **q664** | **FIFA 16** player physics and black pitch fixed; **Dead or Alive Xtreme 2** no longer hangs on its menu: shaders with branches and loops are translated without the big dispatch loop that sent the Mali shader compiler into minutes-long compiles; a pipeline the driver never finishes no longer blacks out the next boots; cleaner XMA audio decoding; Battlefield 2: Modern Combat ground fix (needs player confirmation) |
+| 10 Nov 2026 | q664 | **FIFA 16** player physics and black pitch fixed; **Dead or Alive Xtreme 2** no longer hangs on its menu: shaders with branches and loops are translated without the big dispatch loop that sent the Mali shader compiler into minutes-long compiles; a pipeline the driver never finishes no longer blacks out the next boots; cleaner XMA audio decoding; Battlefield 2: Modern Combat ground fix (needs player confirmation) |
+| 14 Nov 2026 | **1.0.0** | **Up to 4 players** with their own controllers and rumble; the **whole picture** on screens wider than 16:9 (no more 5% cut at the top and bottom); **Black Ops +15%** (faster CPU recompiler: short branchy functions inlined, no slowdown with savestates on); **GTA IV** split-screen tiling drawn once (−33% draws); second fix for the **Mali-G615** black screen; XMA audio and I/O completion fixes from upstream |
 
-More than 600 test builds, each measured on the phone before a change was kept.
+Nearly 700 test builds, each measured on the phone before a change was kept.
 
 </details>
 
@@ -468,6 +469,7 @@ More than 600 test builds, each measured on the phone before a change was kept.
 - **Black Ops:** occasional square artifacts. They are nondeterministic and the cause is unknown.
 - **Halo: Reach:** the first frame after loading a savestate can briefly show the old rainbow pattern.
 - **Bindless textures** (`vulkan_bindless_textures`) cause GPU faults on Mali r49p1, so they are off.
+- **Mali-G615 (Dimensity 7300 / 8200 / 8300):** some phones still show a black screen with the stock driver while the game runs. 1.0.0 has a second fix; if it is still black, the PanVK custom driver shows the picture (slower), and your logs help a lot.
 - **Sustained play:** heat lowers fps over time on any phone.
 
 ## 🤝 Contributing

@@ -94,10 +94,36 @@ class EmulatorSession {
         core.key_event(keyCode, pressed, value)
     }
 
+    /** keyEvent for player pad + 1 (0-3). Pad 0 takes the plain path, which every core has. */
+    fun padKeyEvent(pad: Int, keyCode: Int, pressed: Boolean, value: Int) {
+        if (!booted) return
+        if (pad == 0) { core.key_event(keyCode, pressed, value); return }
+        try {
+            core.key_event_pad(pad, keyCode, pressed, value)
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
+    /** Players 2-4 come and go with their controllers. */
+    fun setPadConnected(pad: Int, connected: Boolean) {
+        if (!booted || pad == 0) return
+        try {
+            core.set_pad_connected(pad, connected)
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
     /** Player 1 rumble from the game: left motor << 8 | right motor, 0-255 each. 0 before
      *  boot and on cores without it. */
     fun controllerRumble(): Int = if (!booted) 0 else try {
         core.controller_rumble()
+    } catch (_: UnsatisfiedLinkError) {
+        0
+    }
+
+    /** Rumble of player pad + 1 (0-3), same encoding. */
+    fun controllerRumble(pad: Int): Int = if (pad == 0) controllerRumble() else if (!booted) 0 else try {
+        core.controller_rumble_pad(pad)
     } catch (_: UnsatisfiedLinkError) {
         0
     }

@@ -98,6 +98,13 @@ DEFINE_bool(vulkan_render_area_draw_bound, true,
             "the render area by the render target cache's estimate for it "
             "(scissor, viewport or vertices) rather than by the scissor alone.",
             "GPU");
+DEFINE_bool(vulkan_render_area_tight, true,
+            "With vulkan_render_area_shrink: also bound the rows of draws with "
+            "clipping disabled (screen-space clears with an 8192 scissor) by "
+            "the render target cache's estimate - from their vertices, run on "
+            "the CPU only when every index and vertex read is CPU-authoritative, "
+            "otherwise the scissor - and shrink passes that only clear.",
+            "GPU");
 DEFINE_bool(
     vulkan_bindless_textures, false,
     "Guest textures and samplers through one update-after-bind descriptor set "
@@ -6336,8 +6343,118 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                        uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
-  return IssueDrawImpl(prim_type, index_count, index_buffer_info,
-                       major_mode_explicit);
+  if (!cvars::gpu_untile_predicated_tiling) {
+    return IssueDrawImpl(prim_type, index_count, index_buffer_info,
+                         major_mode_explicit);
+  }
+  // Untiling: inside a tiling pass, draw at the screen rows of the host render
+  // targets (window offset removed), and let the geometry of the first strip
+  // cover the whole screen (the guest masks it out of the other strips, see
+  // ExecutePacketType3_EVENT_WRITE_EXT). The registers are restored after the
+  // draw: the guest keeps seeing its own values.
+  RegisterFile& regs = *register_file_;
+  // Resolves arrive here as copy-mode draws: they are never dropped and keep
+  // the guest's window offset (IssueCopy reads it to address the strip's
+  // rows). Dropping them (an earlier version) left the rows below the first strip with
+  // the previous frame's contents: a ghosted lower two thirds in GTA IV.
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+    return IssueDrawImpl(prim_type, index_count, index_buffer_info,
+                         major_mode_explicit);
+  }
+  const uint32_t saved_window_offset =
+      regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+  const uint32_t saved_window_scissor_br =
+      regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+  const uint32_t saved_screen_scissor_br =
+      regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR];
+  const uint32_t saved_screen_scissor_tl =
+      regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL];
+  uint32_t signature = 0;
+  if (UntileTiled()) {
+    UntileSyncPhase();
+    reg::PA_SC_WINDOW_OFFSET window_offset;
+    window_offset.value = saved_window_offset;
+    if (!window_offset.window_x_offset && window_offset.window_y_offset <= 0) {
+      const uint32_t row_offset = uint32_t(-window_offset.window_y_offset);
+      if (row_offset &&
+          (!untile_strip_height_ || row_offset < untile_strip_height_)) {
+        untile_strip_height_ = row_offset;
+      }
+      // Diagnostic: the strip's own draws (not the predicated
+      // geometry): offset, scissors and what they write, in sampled frames.
+      static uint32_t untile_logged = 0;
+      if (untile_logged < 600 && (row_offset || untile_resolve_seen_) &&
+          frame_current_ % 512 == 0) {
+        ++untile_logged;
+        reg::PA_SC_WINDOW_SCISSOR_TL wtl;
+        wtl.value = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+        reg::PA_SC_WINDOW_SCISSOR_BR wbr;
+        wbr.value = saved_window_scissor_br;
+        reg::PA_SC_SCREEN_SCISSOR_TL stl;
+        stl.value = saved_screen_scissor_tl;
+        reg::PA_SC_SCREEN_SCISSOR_BR sbr;
+        sbr.value = saved_screen_scissor_br;
+        XELOGI(
+            "UNTILE-DRAW f={} rows={} last_resolve={} resolved={} {} "
+            "wscissor {},{}-{},{} wod={} sscissor {},{}-{},{} cmask={:08X} "
+            "depthctl={:08X} edram={:08X} n={}",
+            frame_current_, row_offset, untile_last_resolve_rows_,
+            untile_resolve_seen_,
+            (row_offset && row_offset != untile_last_resolve_rows_) ? "SKIP"
+                                                                    : "draw",
+            uint32_t(wtl.tl_x), uint32_t(wtl.tl_y), uint32_t(wbr.br_x),
+            uint32_t(wbr.br_y), uint32_t(wtl.window_offset_disable),
+            int32_t(stl.tl_x), int32_t(stl.tl_y), int32_t(sbr.br_x),
+            int32_t(sbr.br_y), regs.values[XE_GPU_REG_RB_COLOR_MASK],
+            regs.values[XE_GPU_REG_RB_DEPTHCONTROL],
+            regs.values[XE_GPU_REG_RB_MODECONTROL], index_count);
+      }
+      // A later strip before its first resolve: its geometry was drawn over
+      // the whole screen in the first strip; what still arrives here is not
+      // predicated, like the depth clear GTA IV draws at the top of every
+      // strip (GTA-TR1), which would wipe those rows. The draws after the
+      // strip's resolves stay: they initialize the rows just copied (the
+      // EDRAM state for the next strip), as on the console.
+      if (row_offset && row_offset != untile_last_resolve_rows_) {
+        return true;
+      }
+      signature = 1 + row_offset;
+      window_offset.window_y_offset = 0;
+      regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = window_offset.value;
+      if (!row_offset && !untile_resolve_seen_) {
+        reg::PA_SC_WINDOW_SCISSOR_BR window_br;
+        window_br.value = saved_window_scissor_br;
+        untile_strip_bottom_ =
+            untile_strip_height_
+                ? untile_strip_height_
+                : std::max(untile_strip_bottom_, uint32_t(window_br.br_y));
+        // A scissor that ends above the strip's bottom is the game's own.
+        if (window_br.br_y == untile_strip_bottom_) {
+          signature |= UINT32_C(0x80000000);
+          window_br.br_y = xenos::kTexture2DCubeMaxWidthHeight;
+          regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = window_br.value;
+          reg::PA_SC_SCREEN_SCISSOR_BR screen_br;
+          screen_br.value = saved_screen_scissor_br;
+          if (uint32_t(screen_br.br_y) == untile_strip_bottom_) {
+            screen_br.br_y = int32_t(xenos::kTexture2DCubeMaxWidthHeight);
+            regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = screen_br.value;
+          }
+        }
+      }
+    }
+  }
+  if (signature != untile_last_signature_) {
+    // The cached draw state was derived from other effective values.
+    untile_last_signature_ = signature;
+    regs.draw_dirty |= RegisterFile::kAllDraw;
+  }
+  const bool result = IssueDrawImpl(prim_type, index_count, index_buffer_info,
+                                    major_mode_explicit);
+  regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = saved_window_offset;
+  regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = saved_window_scissor_br;
+  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = saved_screen_scissor_br;
+  regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = saved_screen_scissor_tl;
+  return result;
 }
 
 bool VulkanCommandProcessor::IssueDrawCensus(
@@ -8872,7 +8989,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(
       render_target_cache_->GetPath() ==
           RenderTargetCache::Path::kHostRenderTargets &&
       render_target_cache_->last_update_height_used() != UINT32_MAX &&
-      !register_file_->Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      (draw_config_.vulkan_render_area_tight ||
+       !register_file_->Get<reg::PA_CL_CLIP_CNTL>().clip_disable);
   if (draw_height_bound) {
     const uint32_t scale_y = render_target_cache_->IsDrawScaleNative()
                                  ? 1
@@ -9559,8 +9677,26 @@ bool VulkanCommandProcessor::IssueCopy() {
       RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
       register_file_->Get<reg::RB_COPY_CONTROL>().copy_src_select >=
           xenos::kMaxColorRenderTargets;
+  // Untiling: the resolves and clears of a strip address its screen rows.
+  uint32_t untile_rows = 0;
+  if (cvars::gpu_untile_predicated_tiling && UntileTiled()) {
+    UntileSyncPhase();
+    untile_resolve_seen_ = true;
+    const reg::PA_SC_WINDOW_OFFSET window_offset =
+        register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    if (!window_offset.window_x_offset && window_offset.window_y_offset < 0) {
+      untile_rows = uint32_t(-window_offset.window_y_offset);
+      if (!untile_strip_height_ || untile_rows < untile_strip_height_) {
+        untile_strip_height_ = untile_rows;
+      }
+    }
+    untile_last_resolve_rows_ = untile_rows;
+  }
+  render_target_cache_->set_untile_row_offset_pixels(untile_rows);
+  // A deferred resolve runs later, without the row offset.
   const bool try_defer = cvars::vulkan_resolve_defer && in_render_pass_ &&
-                         frame_open_ && !device_lost_ && !depth_to_surface;
+                         frame_open_ && !device_lost_ && !depth_to_surface &&
+                         !untile_rows;
   if ((cvars::log_render_pass_breaks > 0 || try_defer) && in_render_pass_) {
     resolve_defer_census_.active = true;
     resolve_defer_census_.recording = true;
@@ -9607,6 +9743,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     frame_time_stats_.copies++;
     frame_time_stats_.copy_ns += FrameStatsNow() - fs_copy_begin;
   }
+  render_target_cache_->set_untile_row_offset_pixels(0);
   return copy_result;
 }
 
@@ -11225,6 +11362,7 @@ void VulkanCommandProcessor::RefreshDrawConfig() {
   next.vulkan_placeholder_pipelines = cvars::vulkan_placeholder_pipelines;
   next.vulkan_relax_unused_attachment_ops = cvars::vulkan_relax_unused_attachment_ops;
   next.vulkan_render_area_draw_bound = cvars::vulkan_render_area_draw_bound;
+  next.vulkan_render_area_tight = cvars::vulkan_render_area_tight;
   next.vulkan_alpha_tested_depth_prepass =
       cvars::vulkan_alpha_tested_depth_prepass;
   next.vulkan_republish_draw_inputs = cvars::vulkan_republish_draw_inputs;

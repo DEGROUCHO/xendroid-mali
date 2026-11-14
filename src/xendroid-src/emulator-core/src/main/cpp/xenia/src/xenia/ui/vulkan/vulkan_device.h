@@ -189,6 +189,8 @@ class VulkanDevice {
     // VK_KHR_driver_properties (#197, promoted to 1.2)
 
     VkDriverId driverID = VkDriverId(0);
+    // Arm proprietary driver release (49 for r49p1), 0 if unknown or not Arm.
+    uint32_t maliDriverRelease = 0;
 
     // VK_KHR_shader_float_controls (#198, promoted to 1.2)
 

@@ -45,7 +45,7 @@
 </p>
 
 > [!NOTE]
-> **New in 1.0.0:** **up to 4 players**, each with their own controller (and their own rumble); the **whole picture** on phones wider than 16:9 (the top and bottom 5% used to be cut off, HUD included); **Black Ops** from 38–41 to **44–46 fps** thanks to a faster CPU recompiler that no longer slows down with savestates on; **GTA IV** draws a third fewer calls per frame. **Mali-G615** (Dimensity 7300 / 8200 / 8300) black screen: a second fix is in, please tell me how it goes on your phone.
+> **New in 1.0.1:** games now **fill the whole screen automatically** on phones (no black bars on 20:9 screens), with a new **Settings → Display → Picture format** option (Original, Zoom, Stretch, 16:9, 4:3); **Need for Speed: Most Wanted** and **Assassin's Creed** draw their whole 3D scene again (1.0.0 showed only the upper part). 1.0.0 brought **up to 4 players**, **Black Ops** at 44–46 fps and a second fix for the **Mali-G615** black screen.
 
 <br>
 
@@ -457,6 +457,7 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 9 Nov 2026 | q655 | **Compatibility rendering** switch for black screens on older Mali drivers (Mali-G615); **custom Vulkan drivers** (e.g. PanVK) can be installed on Mali too |
 | 10 Nov 2026 | q664 | **FIFA 16** player physics and black pitch fixed; **Dead or Alive Xtreme 2** no longer hangs on its menu: shaders with branches and loops are translated without the big dispatch loop that sent the Mali shader compiler into minutes-long compiles; a pipeline the driver never finishes no longer blacks out the next boots; cleaner XMA audio decoding; Battlefield 2: Modern Combat ground fix (needs player confirmation) |
 | 14 Nov 2026 | **1.0.0** | **Up to 4 players** with their own controllers and rumble; the **whole picture** on screens wider than 16:9 (no more 5% cut at the top and bottom); **Black Ops +15%** (faster CPU recompiler: short branchy functions inlined, no slowdown with savestates on); **GTA IV** split-screen tiling drawn once (−33% draws); second fix for the **Mali-G615** black screen; XMA audio and I/O completion fixes from upstream |
+| 15 Nov 2026 | **1.0.1** | Games **fill the whole screen automatically** (phones up to 21:9; tablets and 4:3 games keep their shape); new **Picture format** setting; **Need for Speed: Most Wanted** (16:9) and **Assassin's Creed** missing 3D fixed (the GTA IV tiling speed-up is now GTA IV only); logs now tell whether a black screen comes from rendering or from presenting |
 
 Nearly 700 test builds, each measured on the phone before a change was kept.
 
@@ -469,7 +470,7 @@ Nearly 700 test builds, each measured on the phone before a change was kept.
 - **Black Ops:** occasional square artifacts. They are nondeterministic and the cause is unknown.
 - **Halo: Reach:** the first frame after loading a savestate can briefly show the old rainbow pattern.
 - **Bindless textures** (`vulkan_bindless_textures`) cause GPU faults on Mali r49p1, so they are off.
-- **Mali-G615 (Dimensity 7300 / 8200 / 8300):** some phones still show a black screen with the stock driver while the game runs. 1.0.0 has a second fix; if it is still black, the PanVK custom driver shows the picture (slower), and your logs help a lot.
+- **Mali-G615 (Dimensity 7300 / 8200 / 8300):** some phones still show a black screen with the stock driver while the game runs. If it is still black with 1.0.1, the PanVK custom driver shows the picture (slower). Please send your logs: from 1.0.1 they show where the picture gets lost.
 - **Sustained play:** heat lowers fps over time on any phone.
 
 ## 🤝 Contributing

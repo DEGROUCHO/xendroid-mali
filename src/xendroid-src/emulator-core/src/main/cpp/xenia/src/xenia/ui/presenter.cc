@@ -171,6 +171,17 @@ DEFINE_int32(
 // the top and bottom of every game, HUDs included (issue 14). A phone screen has no overscan.
 UPDATE_from_int32(present_safe_area_x, 2026, 11, 15, 3, 90);
 UPDATE_from_int32(present_safe_area_y, 2026, 11, 15, 3, 90);
+DEFINE_string(
+    present_aspect, "auto",
+    "How the game picture fits the screen. auto: fill the whole screen when "
+    "its shape is close to the game's (a 16:9 game on any phone up to 21:9 is "
+    "widened to the edges, nothing cut off), otherwise keep the game's shape "
+    "with black bars (tablets, foldables, 4:3 games). original: the game's own "
+    "shape with black bars (present_safe_area_x/y may crop instead). zoom: fill "
+    "the whole screen keeping the game's shape, cropping what does not fit "
+    "(top and bottom on wide phones). stretch: always fill the whole screen. 16:9, 4:3: force that "
+    "shape, with black bars.",
+    "Display");
 
 namespace xe {
 namespace ui {
@@ -1271,29 +1282,73 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                    old_scale);
   };
 
+  // Picture shape (present_aspect): the game's own aspect ratio or a forced
+  // one, how much may be cropped, and whether to fill the screen instead.
+  uint32_t aspect_x = properties.display_aspect_ratio_x;
+  uint32_t aspect_y = properties.display_aspect_ratio_y;
+  int32_t safe_area_x = cvars::present_safe_area_x;
+  int32_t safe_area_y = cvars::present_safe_area_y;
+  bool letterbox_enabled = cvars::present_letterbox;
+  bool fill_surface = false;
+  {
+    const std::string& mode = cvars::present_aspect;
+    if (mode == "stretch") {
+      fill_surface = true;
+    } else if (mode == "zoom") {
+      // Safe area 1%: the crop is never limited, the picture covers the
+      // surface with its own shape.
+      safe_area_x = safe_area_y = 1;
+      letterbox_enabled = true;
+    } else if (mode == "16:9" || mode == "4:3") {
+      aspect_x = mode == "16:9" ? 16 : 4;
+      aspect_y = mode == "16:9" ? 9 : 3;
+      safe_area_x = safe_area_y = 100;
+      letterbox_enabled = true;
+    } else if (mode != "original") {
+      // auto: widen or narrow the picture to the screen when that changes its
+      // shape by less than a third (16:9 on 18:9 to 21:9 phones, 16:10
+      // tablets); beyond that (16:9 on a 4:3 tablet, 4:3 on a phone,
+      // foldables) keep the shape with black bars.
+      const uint64_t screen = uint64_t(surface_width_in_paint_connection_) *
+                              std::max(aspect_y, 1u);
+      const uint64_t game = uint64_t(surface_height_in_paint_connection_) *
+                            std::max(aspect_x, 1u);
+      fill_surface = std::max(screen, game) * 3 < std::min(screen, game) * 4;
+      safe_area_x = safe_area_y = 100;
+      letterbox_enabled = true;
+    }
+  }
+  if (!aspect_x || !aspect_y) {
+    aspect_x = 16;
+    aspect_y = 9;
+  }
+
   // Final output location and dimensions.
   // All host location calculations are DPI-independent, conceptually depending
   // only on the aspect ratios, not the absolute values.
   uint32_t output_width, output_height;
-  if (uint64_t(surface_width_in_paint_connection_) *
-          properties.display_aspect_ratio_y >
-      uint64_t(surface_height_in_paint_connection_) *
-          properties.display_aspect_ratio_x) {
+  if (fill_surface) {
+    output_width = surface_width_in_paint_connection_;
+    output_height = surface_height_in_paint_connection_;
+    flow.output_x = 0;
+    flow.output_y = 0;
+  } else if (uint64_t(surface_width_in_paint_connection_) * aspect_y >
+             uint64_t(surface_height_in_paint_connection_) * aspect_x) {
     // The window is wider that the source - crop along Y to preserve the aspect
     // ratio while stretching throughout the entire surface's width, then limit
     // the Y cropping via letterboxing or stretching along X.
     uint32_t present_safe_area;
-    if (config.GetAllowOverscanCutoff() && cvars::present_safe_area_y > 0 &&
-        cvars::present_safe_area_y < 100) {
-      present_safe_area = uint32_t(cvars::present_safe_area_y);
+    if (config.GetAllowOverscanCutoff() && safe_area_y > 0 &&
+        safe_area_y < 100) {
+      present_safe_area = uint32_t(safe_area_y);
     } else {
       present_safe_area = 100;
     }
     // Scale the desired width by the H:W aspect ratio (inverse of W:H) to get
     // the height.
     output_height = rescale_unsigned(surface_width_in_paint_connection_,
-                                     properties.display_aspect_ratio_y,
-                                     properties.display_aspect_ratio_x);
+                                     aspect_y,
+                                     aspect_x);
     bool letterbox = false;
     if (output_height * present_safe_area >
         surface_height_in_paint_connection_ * 100) {
@@ -1302,11 +1357,11 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                                        present_safe_area);
       letterbox = true;
     }
-    if (letterbox && cvars::present_letterbox) {
+    if (letterbox && letterbox_enabled) {
       output_width = rescale_unsigned(
           surface_height_in_paint_connection_ * 100,
-          properties.display_aspect_ratio_x,
-          properties.display_aspect_ratio_y * present_safe_area);
+          aspect_x,
+          aspect_y * present_safe_area);
       // output_width might have been rounded up already by rescale_unsigned, so
       // rounding down in this division.
       flow.output_x = (int32_t(surface_width_in_paint_connection_) -
@@ -1326,16 +1381,16 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     // aspect ratio while stretching throughout the entire surface's height,
     // then limit the X cropping via letterboxing or stretching along Y.
     uint32_t present_safe_area;
-    if (config.GetAllowOverscanCutoff() && cvars::present_safe_area_x > 0 &&
-        cvars::present_safe_area_x < 100) {
-      present_safe_area = uint32_t(cvars::present_safe_area_x);
+    if (config.GetAllowOverscanCutoff() && safe_area_x > 0 &&
+        safe_area_x < 100) {
+      present_safe_area = uint32_t(safe_area_x);
     } else {
       present_safe_area = 100;
     }
     // Scale the desired height by the W:H aspect ratio to get the width.
     output_width = rescale_unsigned(surface_height_in_paint_connection_,
-                                    properties.display_aspect_ratio_x,
-                                    properties.display_aspect_ratio_y);
+                                    aspect_x,
+                                    aspect_y);
     bool letterbox = false;
     if (output_width * present_safe_area >
         surface_width_in_paint_connection_ * 100) {
@@ -1344,11 +1399,11 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
                                       present_safe_area);
       letterbox = true;
     }
-    if (letterbox && cvars::present_letterbox) {
+    if (letterbox && letterbox_enabled) {
       output_height = rescale_unsigned(
           surface_width_in_paint_connection_ * 100,
-          properties.display_aspect_ratio_y,
-          properties.display_aspect_ratio_x * present_safe_area);
+          aspect_y,
+          aspect_x * present_safe_area);
       // output_height might have been rounded up already by rescale_unsigned,
       // so rounding down in this division.
       flow.output_y = (int32_t(surface_height_in_paint_connection_) -

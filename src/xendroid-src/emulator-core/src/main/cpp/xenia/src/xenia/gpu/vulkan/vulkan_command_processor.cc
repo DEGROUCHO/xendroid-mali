@@ -171,6 +171,15 @@ DEFINE_int32(
     "evaluation.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_guest_output_probe, true,
+    "Read the guest output back once at guest frames 600 and 3000 and log its "
+    "average color and the share of non-black pixels (GUEST-OUTPUT-PROBE). "
+    "Tells from any user log whether a black screen is drawn black by the "
+    "game's rendering or lost later while presenting it. Two small readbacks "
+    "per session.",
+    "Vulkan");
+
 DEFINE_path(
     vulkan_rt_trace_request, "",
     "Path to an opt-in one-shot request file. When it exists at a guest "
@@ -4102,6 +4111,35 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   // failure, to keep this diagnostic one-shot.
   if (!cvars::live_cvar_file.empty()) {
     PollLiveCvars();
+  }
+  if (cvars::vulkan_guest_output_probe && guest_output_refreshed &&
+      (guest_output_capture_frame == 600 ||
+       guest_output_capture_frame == 3000)) {
+    ui::RawImage image;
+    if (presenter->CaptureGuestOutput(image) && image.width && image.height) {
+      uint64_t sum[3] = {}, lit = 0, count = 0;
+      // Every 4th pixel of every 4th row is plenty for a mean.
+      for (uint32_t y = 0; y < image.height; y += 4) {
+        const uint8_t* row = image.data.data() + image.stride * y;
+        for (uint32_t x = 0; x < image.width; x += 4) {
+          const uint8_t* px = row + size_t(x) * 4;
+          sum[0] += px[0];
+          sum[1] += px[1];
+          sum[2] += px[2];
+          lit += (px[0] | px[1] | px[2]) > 8;
+          ++count;
+        }
+      }
+      XELOGI(
+          "[GUEST-OUTPUT-PROBE] frame={} size={}x{} avg_rgb={},{},{} "
+          "non_black={:.1f}%",
+          guest_output_capture_frame, image.width, image.height,
+          sum[0] / count, sum[1] / count, sum[2] / count,
+          double(lit) * 100.0 / double(count));
+    } else {
+      XELOGW("[GUEST-OUTPUT-PROBE] frame={} readback failed",
+             guest_output_capture_frame);
+    }
   }
   static bool guest_output_capture_request_consumed = false;
   static int32_t guest_output_capture_sequence_left = 0;

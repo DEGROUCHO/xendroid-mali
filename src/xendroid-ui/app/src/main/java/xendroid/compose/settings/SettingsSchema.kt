@@ -137,6 +137,12 @@ object SettingsSchema {
         )),
 
         SettingsCategory("Display", listOf(
+            l("Display", "present_aspect", l10n("Picture format", "Formato immagine"), "auto",
+                "auto" to l10n("Full screen (automatic)", "Schermo intero (automatico)"),
+                "original" to l10n("Original, with black bars", "Originale, con bande nere"),
+                "zoom" to l10n("Zoom (crops top and bottom)", "Zoom (taglia sopra e sotto)"),
+                "stretch" to l10n("Stretch to fill", "Allunga sempre"),
+                "16:9" to "16:9", "4:3" to "4:3"),
             b("Display", "present_letterbox", l10n("Letterbox on present", "Letterbox in presentazione"), true),
             b("Display", "postprocess_dither", l10n("Post-process dithering", "Dithering di post-elaborazione"), true),
             l("Display", "postprocess_scaling_and_sharpening", l10n("Scaling and sharpening", "Scala e nitidezza"), "",

@@ -296,7 +296,7 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
-    gpu_untile_predicated_tiling, true,
+    gpu_untile_predicated_tiling, false,
     "Draw predicated tiling (720p surfaces with MSAA that do not fit the EDRAM "
     "and are rendered in horizontal strips) once instead of once per strip. "
     "The screen extents the guest asks for each draw are reported as the first "
@@ -308,7 +308,9 @@ DEFINE_bool(
     "IV's depth clear) are dropped, its rows being drawn already, while the "
     "resolves of every strip are kept. GTA IV: image identical to the tiled "
     "path at the strip boundaries, command processor time per frame -10%, "
-    "draws 6976 -> 4665.",
+    "draws 6976 -> 4665. Off by default: other tiled games draw only the "
+    "first strip (Need for Speed: Most Wanted in 16:9 and Assassin's Creed "
+    "show the upper part only); kept on for GTA IV through game_quirks.cc.",
     "GPU");
 // A first version was on by default only briefly: GTA IV showed a seam with
 // stale content below it. The second update returns configs written by that
@@ -318,6 +320,9 @@ UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 11, 19, true);
 // On by default again: the seam is fixed (the resolves of strips 2-3 were
 // skipped as the strip's own draws).
 UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 15, 2, false);
+// Off again for every game except GTA IV (game_quirks.cc): Need for Speed:
+// Most Wanted and Assassin's Creed lost everything below the first strip.
+UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 15, 4, true);
 
 DEFINE_bool(readback_resolve_sync, true,
             "Stall the GPU after each readback_resolve copy so guest RAM is "

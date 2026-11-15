@@ -68,6 +68,11 @@ static const Quirk kQuirks[] = {
     // read back from a resolve the default "uma" mode does not copy to guest
     // RAM); "fast" fixes it at 60 fps (player report).
     {0x454109EE, "readback_resolve", "fast", "half of the pitch black"},
+    // GTA IV: untiling verified at every strip boundary, command processor
+    // -10%, draws 6976 -> 4665. Off for every other game: Need for Speed:
+    // Most Wanted and Assassin's Creed showed only their first strip.
+    {0x545407F2, "gpu_untile_predicated_tiling", true,
+     "tiled scene drawn once, verified"},
     // No vulkan_bindless_textures for GTA IV: with it Mali raises ~15 GPU
     // faults a second (GROUP_ERROR_FATAL, translation faults; the MediaTek
     // driver recreates the queue), shown as black frames and swapchain

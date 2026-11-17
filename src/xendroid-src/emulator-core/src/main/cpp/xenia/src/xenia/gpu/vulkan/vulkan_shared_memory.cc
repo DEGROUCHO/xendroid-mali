@@ -438,6 +438,7 @@ void VulkanSharedMemory::AwaitDepthSurfaces(
     // callback. The worker polls this flag even inside WAIT_REG_MEM/IBs.
     depth_request_pending_.store(true, std::memory_order_release);
     lock.unlock();
+    command_processor_.WakeForMemoryRequest();
     while (depth_request_pending_.load(std::memory_order_acquire))
       std::this_thread::yield();
     lock.lock();
@@ -483,7 +484,8 @@ void VulkanSharedMemory::MaterializeDepthSurfaces(uint32_t start,
   for (size_t i = 0; i < depth_surfaces_.size(); ++i) {
     if (!depth_surfaces_[i].pending || depth_surfaces_[i].start >= uint64_t(start) + length ||
         uint64_t(depth_surfaces_[i].start) + depth_surfaces_[i].length <= start) continue;
-    if (for_gpu && depth_surfaces_[i].gpu_materialized) continue;
+    if (for_gpu && (depth_surfaces_[i].gpu_materialized ||
+                    depth_surfaces_[i].uma_submission)) continue;
     // Non-CP access must use AwaitDepthSurfaces with a once-held lock. Physical
     // faults have already run that provider before invalidation reaches here.
     if (!command_processor_.IsWorkerThread()) std::terminate();
@@ -511,7 +513,24 @@ void VulkanSharedMemory::MaterializeDepthSurfaces(uint32_t start,
     // provider and wait; no vector references survive the unlocked GPU drain.
     lock.unlock();
     bool completed;
-    if (depth_surfaces_[i].gpu_materialized) {
+    if (const uint64_t uma_submission = depth_surfaces_[i].uma_submission) {
+      // The resolve wrote the buffer: only its submission must complete.
+      ++uma_provider_stats_.cpu_copies;
+      uma_provider_stats_.copied_bytes += size;
+      if (command_processor_.GetCompletedSubmission() >= uma_submission) {
+        completed = true;
+      } else {
+        ++uma_provider_stats_.cpu_waits;
+        if (uma_submission >= command_processor_.GetCurrentSubmission()) {
+          completed = command_processor_.EndSubmission(false) &&
+                      command_processor_.AwaitAllQueueOperationsCompletion() &&
+                      command_processor_.BeginSubmission(false);
+        } else {
+          completed = command_processor_.AwaitSubmissionAndUpdateCompleted(
+              uma_submission);
+        }
+      }
+    } else if (depth_surfaces_[i].gpu_materialized) {
       // Already in the stream: just finish it.
       completed = command_processor_.EndSubmission(false) &&
                   command_processor_.AwaitAllQueueOperationsCompletion() &&
@@ -606,7 +625,8 @@ bool VulkanSharedMemory::IsRangeValidInSurface(uint32_t start,
   if (!length || start >= kBufferSize || length > kBufferSize - start) return false;
   auto lock = global_critical_region::AcquireDirect();
   for (const auto& s : depth_surfaces_) {
-    if (s.pending && !s.gpu_materialized && start >= s.start &&
+    if (s.pending && !s.gpu_materialized && !s.uma_submission &&
+        start >= s.start &&
         uint64_t(start) + length <= uint64_t(s.start) + s.length) return true;
   }
   return false;
@@ -661,8 +681,16 @@ uint32_t VulkanSharedMemory::DiscardDepthSurfacesWithin(uint32_t start,
 void VulkanSharedMemory::PublishDepthSurface(
     uint32_t start, uint32_t length, uint64_t geometry,
     std::function<bool(bool wait)> materialize,
-    std::function<void()> discard) {
+    std::function<void()> discard, uint64_t uma_submission) {
   auto lock = global_critical_region::AcquireDirect();
+  PublishSurfaceLocked(start, length, geometry, std::move(materialize),
+                       std::move(discard), uma_submission);
+}
+
+void VulkanSharedMemory::PublishSurfaceLocked(
+    uint32_t start, uint32_t length, uint64_t geometry,
+    std::function<bool(bool wait)> materialize,
+    std::function<void()> discard, uint64_t uma_submission) {
   assert_true(CanPublishDepthSurface() && length && start < kBufferSize &&
               length <= kBufferSize - start);
   // RequestRange has materialized previous overlapping providers and padding.
@@ -675,17 +703,86 @@ void VulkanSharedMemory::PublishDepthSurface(
     depth_read_callback_ = memory().RegisterPhysicalMemoryAccessProvider(DepthReadCallback, this);
   depth_surfaces_.push_back(
       {start, length, geometry, std::move(materialize), std::move(discard)});
+  depth_surfaces_.back().uma_submission = uma_submission;
   depth_pending_lo_ = UINT32_MAX;
   depth_pending_hi_ = 0;
   for (const auto& s : depth_surfaces_) {
     depth_pending_lo_ = std::min(depth_pending_lo_, s.start);
     depth_pending_hi_ = std::max(depth_pending_hi_, s.start + s.length);
   }
-  MakeRangeValidInSurfaceOnly(start, length);
+  // An UMA record's bytes are already in the buffer: it stays valid for GPU
+  // use, only guest RAM waits for the CPU's first access.
+  if (!uma_submission) MakeRangeValidInSurfaceOnly(start, length);
   memory().EnablePhysicalMemoryAccessCallbacks(start, length, true, true);
   ++depth_provider_stats_.published;
   depth_provider_stats_.published_bytes += length;
   depth_provider_stats_.pending_bytes += length;
+}
+
+bool VulkanSharedMemory::PublishUmaResolve(uint32_t start, uint32_t length,
+                                           uint64_t submission) {
+  if (!length || start >= kBufferSize || length > kBufferSize - start) {
+    return false;
+  }
+  {
+    auto lock = global_critical_region::AcquireDirect();
+    if (depth_materializing_) {
+      ++uma_provider_stats_.refused;
+      return false;
+    }
+    uint32_t lo = start, hi = start + length;
+    for (auto& s : depth_surfaces_) {
+      if (!s.pending || s.start >= hi || s.start + s.length <= lo) continue;
+      if (!s.uma_submission || s.requested) {
+        // A depth record or a CPU waiter on this range: keep eager readback.
+        ++uma_provider_stats_.refused;
+        return false;
+      }
+      if (s.start <= start && s.start + s.length >= start + length) {
+        // Same (or larger) destination resolved again: the record copies the
+        // buffer when the CPU looks, so only the submission to wait for moves.
+        s.uma_submission = std::max(s.uma_submission, submission);
+        ++uma_provider_stats_.reused;
+        return true;
+      }
+    }
+    // Partial overlaps with other UMA records merge into one record over the
+    // union (records never overlap).
+    uint64_t merged_bytes = 0;
+    for (const auto& s : depth_surfaces_) {
+      if (!s.pending || !s.uma_submission || s.start >= hi ||
+          s.start + s.length <= lo) continue;
+      lo = std::min(lo, s.start);
+      hi = std::max(hi, s.start + s.length);
+      merged_bytes += s.length;
+    }
+    if (!CanPublishDepthSurface() ||
+        depth_provider_stats_.pending_bytes - merged_bytes + (hi - lo) >
+            (64u << 20)) {
+      ++uma_provider_stats_.refused;
+      return false;
+    }
+    for (auto& s : depth_surfaces_) {
+      if (!s.pending || !s.uma_submission || s.start >= hi ||
+          s.start + s.length <= lo) continue;
+      submission = std::max(submission, s.uma_submission);
+      s.pending = false;
+      depth_provider_stats_.pending_bytes -= s.length;
+    }
+    // Under the same lock as the retirement: a CPU fault never sees the
+    // merged bytes unprotected.
+    PublishSurfaceLocked(lo, hi - lo, 0, {}, {}, submission);
+    ++uma_provider_stats_.published;
+  }
+  return true;
+}
+
+VulkanSharedMemory::UmaProviderStats
+VulkanSharedMemory::TakeUmaProviderStats() {
+  auto lock = global_critical_region::AcquireDirect();
+  const auto stats = uma_provider_stats_;
+  uma_provider_stats_ = {};
+  return stats;
 }
 
 VulkanSharedMemory::DepthProviderStats
@@ -1202,9 +1299,29 @@ bool VulkanSharedMemory::WriteBackGpuWrittenToGuest(uint32_t& pages_written) {
   return true;
 }
 
+bool VulkanSharedMemory::ReadHostMappedGpuWritten(uint32_t guest_address,
+                                                  uint32_t length,
+                                                  bool gpu_ordered,
+                                                  uint32_t* skipped_pages) {
+  // Outside the global lock: materializing may wait for the GPU.
+  MaterializeDepthSurfaces(guest_address, length, gpu_ordered);
+  uint8_t* guest = memory().physical_membase();
+  return ForEachGpuWrittenSpan(
+      guest_address, length,
+      [&](uint32_t first, uint32_t end) {
+        return ReadHostMappedRaw(first, end - first, guest + first);
+      },
+      skipped_pages);
+}
+
 bool VulkanSharedMemory::ReadHostMapped(uint32_t guest_address, uint32_t length,
                                         void* dest, bool gpu_ordered) {
   MaterializeDepthSurfaces(guest_address, length, gpu_ordered);
+  return ReadHostMappedRaw(guest_address, length, dest);
+}
+
+bool VulkanSharedMemory::ReadHostMappedRaw(uint32_t guest_address,
+                                           uint32_t length, void* dest) {
   if (!dest || !length || guest_address >= kBufferSize ||
       length > kBufferSize - guest_address) {
     return false;

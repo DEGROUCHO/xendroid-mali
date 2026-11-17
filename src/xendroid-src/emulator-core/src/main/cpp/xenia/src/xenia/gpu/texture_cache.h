@@ -202,6 +202,16 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  // Diagnostic (debug_force_vertex_texture_reload): reload these bindings'
+  // textures from guest memory on this request.
+  void ForceReloadBindings(uint32_t mask);
+  void LogVertexTextureFetches(uint32_t mask, Memory& memory);
+  void CheckVsTextureRewrites(Memory& memory);
+  struct VsRaceRecord {
+    uint32_t base, span;
+    uint64_t hash;
+  };
+  std::vector<VsRaceRecord> vs_race_records_;
   // Returns whether RequestTextures(used_texture_mask) may need to process
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
@@ -408,6 +418,19 @@ class TextureCache {
                               bool allow_surface = false);
 
     void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip);
+    // Diagnostic: drop the watches and mark both levels outdated.
+    void ForceOutdated() {
+      if (base_watch_handle_) {
+        texture_cache_.shared_memory().UnwatchMemoryRange(base_watch_handle_);
+        base_watch_handle_ = nullptr;
+      }
+      if (mips_watch_handle_) {
+        texture_cache_.shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+        mips_watch_handle_ = nullptr;
+      }
+      if (GetGuestBaseSize()) base_outdated_ = true;
+      if (GetGuestMipsSize()) mips_outdated_ = true;
+    }
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -615,6 +638,9 @@ class TextureCache {
     kLoadShaderIndexDXT1ToASTC4x4,
     kLoadShaderIndexDXT5ToASTC4x4,
     kLoadShaderIndexDXNToEACRG11,
+    kLoadShaderIndexR16XenosHalfToFloat32,
+    kLoadShaderIndexRG16XenosHalfToFloat32,
+    kLoadShaderIndexRGBA16XenosHalfToFloat32,
 
     kLoadShaderCount,
     kLoadShaderIndexUnknown = kLoadShaderCount,

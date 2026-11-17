@@ -61,6 +61,10 @@ DECLARE_bool(precise_interpolation);
 DECLARE_bool(vulkan_msaa_2x2_pixel_rate);
 DECLARE_bool(vulkan_compatibility_rendering);
 DECLARE_bool(vulkan_bindless_textures);
+DEFINE_bool(spirv_vfetch_vector_load, true,
+            "Vertex fetches of 3 or more words load the two aligned 4-word "
+            "vectors covering them instead of one word at a time.",
+            "GPU");
 DEFINE_bool(vulkan_bindless_debug_constant_slot, false,
             "Diagnostic: the shaders sample bindless slot 0 (the null view and "
             "sampler) through a constant index instead of the slots in the "

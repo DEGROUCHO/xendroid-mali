@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <vector>
+#include <unistd.h>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -2192,6 +2194,20 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     *out = xe::load_and_swap<uint32_t>(memory()->TranslateVirtual(addr));
     return true;
   };
+  // Reads through a pipe so an unmapped host page fails instead of faulting.
+  auto host_read = [&](uint32_t addr, void* out, size_t size) -> bool {
+    int fds[2];
+    if (pipe(fds) != 0) {
+      return false;
+    }
+    bool ok = write(fds[1], memory()->TranslateVirtual(addr), size) ==
+                  ssize_t(size) &&
+              read(fds[0], out, size) == ssize_t(size);
+    close(fds[0]);
+    close(fds[1]);
+    return ok;
+  };
+  int pointer_dump_budget = 24;
 
   std::string crash_msg;
   crash_msg.append("==== CRASH DUMP ====\n");
@@ -2229,6 +2245,117 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     crash_msg.append(
         fmt::format("Faulting instruction: 0x{:08X}\n", instr_word));
   }
+  // Raw guest code around PC and LR, so a crash in game code can be
+  // disassembled offline without the game files.
+  auto dump_code = [&](const char* name, uint32_t center, uint32_t before,
+                       uint32_t after) {
+    const uint32_t start = (center - before) & ~3u;
+    crash_msg.append(fmt::format("Code near {} ({:08X}..{:08X}):", name,
+                                 start, center + after));
+    for (uint32_t a = start; a < center + after; a += 4) {
+      uint32_t w = 0;
+      if (!guest_read32(a, &w)) {
+        break;
+      }
+      if (((a - start) & 0x1F) == 0) {
+        crash_msg.append(fmt::format("\n  {:08X}:", a));
+      }
+      crash_msg.append(fmt::format(" {:08X}", w));
+    }
+    crash_msg.append("\n");
+  };
+  dump_code("PC", guest_pc, 0x200, 0x80);
+  if (guest_lr != guest_pc) {
+    dump_code("LR", guest_lr, 0x80, 0x20);
+  }
+  // Guest memory each GPR points at (data structures the faulting code was
+  // walking), skipping values that are not readable guest addresses.
+  for (int i = 0; i < 32; i++) {
+    const uint64_t v = context->r[i];
+    if (v < 0x10000 || v > 0xFFFFFFFFull) {
+      continue;
+    }
+    const uint32_t base = uint32_t(v) & ~3u;
+    uint32_t probe = 0;
+    if (!guest_read32(base, &probe)) {
+      // Not readable per the page table: say what the heap thinks the page is
+      // (freed, reserved, protected) and what the host mapping holds there,
+      // copied through a pipe so an unmapped page fails instead of faulting.
+      auto* heap = memory()->LookupHeap(base);
+      HeapAllocationInfo info = {};
+      if (!heap || !heap->QueryRegionInfo(base, &info)) {
+        continue;
+      }
+      crash_msg.append(fmt::format(
+          "Memory at r{} ({:08X}): page not readable: heap {:08X} page size "
+          "{:X}, region {:08X}+{:X} state {:X} protect {:X}, allocation "
+          "{:08X}+{:X} protect {:X}",
+          i, base, heap->heap_base(), heap->page_size(), info.base_address,
+          info.region_size, info.state, info.protect, info.allocation_base,
+          info.allocation_size, info.allocation_protect));
+      uint8_t raw[0x100];
+      if (host_read(base, raw, sizeof(raw))) {
+        for (size_t k = 0; k < sizeof(raw); k += 4) {
+          if ((k & 0x1F) == 0) {
+            crash_msg.append(fmt::format("\n  host{:03X}:", k));
+          }
+          crash_msg.append(fmt::format(
+              " {:08X}", xe::load_and_swap<uint32_t>(raw + k)));
+        }
+        // One level of pointer dereference: a table in a page the guest page
+        // table does not know still points at the blocks the faulting code
+        // walks (Assassin's Creed Rogue's bit-block vector at r29).
+        uint32_t targets[4];
+        size_t target_count = 0;
+        for (size_t k = 0; k + 4 <= sizeof(raw); k += 4) {
+          const uint32_t w = xe::load_and_swap<uint32_t>(raw + k);
+          if (w < 0x80000000u || (w & 3u)) {
+            continue;
+          }
+          bool duplicate = false;
+          for (size_t t = 0; t < target_count; ++t) {
+            if (targets[t] == w) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (!duplicate && target_count < 4) {
+            targets[target_count++] = w;
+          }
+        }
+        for (size_t t = 0; t < target_count && pointer_dump_budget > 0; ++t) {
+          uint8_t target_raw[0x200];
+          if (!host_read(targets[t], target_raw, sizeof(target_raw))) {
+            continue;
+          }
+          --pointer_dump_budget;
+          for (size_t k = 0; k < sizeof(target_raw); k += 4) {
+            if ((k & 0x1F) == 0) {
+              crash_msg.append(
+                  fmt::format("\n  at {:08X}:", targets[t] + k));
+            }
+            crash_msg.append(fmt::format(
+                " {:08X}", xe::load_and_swap<uint32_t>(target_raw + k)));
+          }
+        }
+      }
+      crash_msg.append("\n");
+      continue;
+    }
+    crash_msg.append(fmt::format("Memory at r{} ({:08X}):", i, base));
+    for (uint32_t a = base - 0x20; a < base + 0x60; a += 4) {
+      uint32_t w = 0;
+      if (((a - (base - 0x20)) & 0x1F) == 0) {
+        crash_msg.append(fmt::format("\n  {:08X}:", a));
+      }
+      if (guest_read32(a, &w)) {
+        crash_msg.append(fmt::format(" {:08X}", w));
+      } else {
+        crash_msg.append(" --------");
+      }
+    }
+    crash_msg.append("\n");
+  }
 
   // Varied guest prologues make a fixed back-chain walk unreliable; scan the
   // stack for words pointing just past a `bl` in the module's code range.
@@ -2244,6 +2371,7 @@ bool Emulator::ExceptionCallback(Exception* ex) {
         fmt::format("  #{}  0x{:08X}  {}  (LR)\n", frame++, guest_lr,
                     mod_off(guest_lr)));
   }
+  std::vector<uint32_t> callers;
   for (uint32_t off = 0; off <= 0x800 && frame < 40; off += 4) {
     uint32_t w = 0;
     if (!guest_read32(guest_sp + off, &w)) {
@@ -2256,7 +2384,14 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     if (guest_read32(w - 4, &prev) && (prev >> 26) == 18 && (prev & 1)) {
       crash_msg.append(fmt::format("  #{}  0x{:08X}  {}\n", frame++, w,
                                    mod_off(w)));
+      if (callers.size() < 3) {
+        callers.push_back(w);
+      }
     }
+  }
+  for (size_t n = 0; n < callers.size(); ++n) {
+    dump_code(n == 0 ? "caller 1" : n == 1 ? "caller 2" : "caller 3",
+              callers[n], 0x100, 0x10);
   }
 
   crash_msg.append("Registers:\n");

@@ -119,5 +119,14 @@ bool GuestAddressInList(const std::string& list, uint32_t address) {
   return false;
 }
 
+bool GuestAddressListHitsRange(const std::string& list, uint32_t start,
+                               uint32_t end) {
+  for (uint32_t a = start; a && a <= end; a += 4) {
+    if (GuestAddressInList(list, a)) return true;
+    if (a > end - 4) break;
+  }
+  return false;
+}
+
 }  // namespace cpu
 }  // namespace xe

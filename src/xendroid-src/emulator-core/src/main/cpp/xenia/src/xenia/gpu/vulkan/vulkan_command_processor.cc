@@ -10,6 +10,9 @@
 #include <set>
 #include <dlfcn.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <thread>
+#include <chrono>
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/base/cp_wait_stats.h"
@@ -58,6 +61,16 @@
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(vulkan_texture_from_render_target);
 DECLARE_bool(log_texture_clobber);
+DECLARE_bool(debug_force_vertex_texture_reload);
+DEFINE_uint32(debug_vs_texture_draw_delay_us, 0,
+              "Sleep this long before each draw whose vertex shader samples "
+              "textures (diagnostic for CPU/GPU races on bone palettes).",
+              "GPU");
+DEFINE_bool(debug_force_float_constants_full, false,
+            "Re-copy all 256 float constants of each stage for every draw "
+            "(diagnostic for constant dirty tracking).",
+            "GPU");
+DECLARE_bool(log_vertex_texture_fetches);
 DECLARE_bool(vulkan_in_pass_resolve_debug_read_usage);
 DECLARE_bool(log_gpu_frame_time_breakdown);
 DECLARE_bool(vulkan_classic_pass_finalize);
@@ -263,6 +276,11 @@ DEFINE_bool(
     "completed, pages visited, pages copied and bytes copied.",
     "Vulkan");
 
+DEFINE_bool(cp_constant_load_gpu_written, false,
+            "Constants the CP loads from memory (LOAD_ALU_CONSTANT) whose "
+            "newest bytes the GPU wrote are read from the GPU buffer (after "
+            "completing the GPU work) instead of stale guest RAM.",
+            "Vulkan");
 DEFINE_bool(
     vulkan_memexport_vs_compute, true,
     "On devices without vertexPipelineStoresAndAtomics (Mali), run the memory "
@@ -726,6 +744,33 @@ void VulkanCommandProcessor::BeforeCpuMemoryWrite(uint32_t start,
     shared_memory_->PrepareForCpuAccess(start, length);
     shared_memory_->MemoryInvalidationCallback(start, length, true);
   }
+}
+
+void VulkanCommandProcessor::BeforeCpMemoryRead(uint32_t address,
+                                                uint32_t length) {
+  address &= 0x1FFFFFFF;
+  if (!shared_memory_ || !length || address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - address) {
+    return;
+  }
+  // Resolves whose guest RAM copy waits for the first CPU access.
+  if (shared_memory_->has_depth_surface_records()) {
+    shared_memory_->PrepareForCpuAccess(address, length);
+  }
+  if (!shared_memory_->IsRangeGpuWritten(address, length)) return;
+  static std::unordered_set<uint32_t> logged;
+  if (logged.size() < 32 && logged.insert(address >> 16).second) {
+    XELOGW("CP constant load from GPU-written memory {:08X}+{:X}", address,
+           length);
+  }
+  if (!cvars::cp_constant_load_gpu_written) return;
+  // The GPU may still be writing it: complete everything recorded so far.
+  if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion() ||
+      !BeginSubmission(false)) {
+    return;
+  }
+  uint32_t skipped = 0;
+  shared_memory_->ReadHostMappedGpuWritten(address, length, true, &skipped);
 }
 
 void VulkanCommandProcessor::PrepareForPause() {
@@ -2965,7 +3010,11 @@ void VulkanCommandProcessor::NativeHeapCensus() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  if (cvars::log_vertex_texture_fetches && texture_cache_) {
+    texture_cache_->CheckVsTextureRewrites(*memory_);
+  }
   FlushDeferredResolve(ResolveDeferStop::kEvent);
+  FlushUmaReadbackPending(true);
   SCOPE_profile_cpu_f("gpu");
   // Finish before reporting: no candidate crosses a guest frame boundary.
   if (resolve_defer_census_.active) {
@@ -3463,6 +3512,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           s.texload_kind_samples[0] / f, s.texload_kind_ns[1] / f / 1e6,
           s.texload_kind_samples[1] / f, s.texload_kind_ns[2] / f / 1e6,
           s.texload_kind_samples[2] / f);
+      if (cvars::readback_resolve_uma_provider && shared_memory_) {
+        const auto u = shared_memory_->TakeUmaProviderStats();
+        XELOGI(
+            "VkUmaProvider: per frame published={:.2f} reused={:.2f} "
+            "refused={:.2f} cpu_copies={:.2f} cpu_waits={:.2f} "
+            "copied_kb={:.1f} direct={:.2f}",
+            u.published / f, u.reused / f, u.refused / f, u.cpu_copies / f,
+            u.cpu_waits / f, u.copied_bytes / f / 1024.0,
+            s.rb_uma_direct / f);
+      }
       for (uint32_t format = 0; format < 64; ++format) {
         const auto& r = s.resolve_texture[format];
         if (r.avoided || r.reloaded || r.copy_ns || r.reload_ns) {
@@ -7025,8 +7084,24 @@ bool VulkanCommandProcessor::UpdateVertexInputRanges(const VulkanShader& shader)
           return XdDrawFail(__LINE__);
       }
 
+      {
+        // Diagnostic: vertex data outside plain physical views (writeback /
+        // XPS 0x7F..., or the top of physical memory). One line per 1 MB.
+        const uint32_t raw = uint32_t(vfetch_constant.address) << 2;
+        const uint32_t phys =
+            xenos::VertexFetchPhysicalAddress(vfetch_constant.address);
+        if ((raw >> 24) == 0x7F || phys >= 0x1F000000) {
+          static std::unordered_set<uint32_t> xps_logged;
+          if (xps_logged.size() < 32 && xps_logged.insert(raw >> 20).second) {
+            XELOGW("Vertex fetch high address: raw {:08X} phys {:08X} size {:X}",
+                   raw, phys, uint32_t(vfetch_constant.size) << 2);
+          }
+        }
+      }
       auto& range = vertex_input_ranges_[vertex_input_count_++];
-      range.memory.Set(vfetch_constant.address << 2, vfetch_constant.size << 2);
+      range.memory.Set(
+          xenos::VertexFetchPhysicalAddress(vfetch_constant.address),
+          vfetch_constant.size << 2);
       range.slot = vfetch_index;
     }
   }
@@ -7496,6 +7571,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(
       index_buffer_info == nullptr && index_count != 0;
   if (memexport_vs_compute) {
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+  } else if (draw_config_.vulkan_memexport_vs_compute &&
+             !memexport_used_vertex &&
+             vertex_shader->memexport_eM_written() != 0 &&
+             !device_properties.vertexPipelineStoresAndAtomics) {
+    // The export of this draw is dropped: log each shader once.
+    static std::unordered_set<uint64_t> dropped_logged;
+    if (dropped_logged.size() < 64 &&
+        dropped_logged.insert(vertex_shader->ucode_data_hash()).second) {
+      XELOGW("VS memexport dropped: shader {:016X} indexed={} count={}",
+             vertex_shader->ucode_data_hash(), index_buffer_info != nullptr,
+             index_count);
+    }
   }
 
   // Pixel shader analysis.
@@ -8224,7 +8311,88 @@ bool VulkanCommandProcessor::IssueDrawImpl(
       stage_bindings_ready[0]
           ? vertex_shader->GetUsedTextureMaskAfterTranslation()
           : 0;
-  if (textures_requested) {
+  if (cvars::debug_vs_texture_draw_delay_us && vertex_texture_mask) {
+    // Diagnostic: give guest CPU threads time to finish writing data a vertex
+    // shader samples (bone palettes) before this draw reads it.
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(cvars::debug_vs_texture_draw_delay_us));
+  }
+  if (cvars::log_vertex_texture_fetches && vertex_texture_mask) {
+    texture_cache_->LogVertexTextureFetches(vertex_texture_mask, *memory_);
+    // Wide 1D bone palette (tf17): log candidate palette base constants to see
+    // whether bone addresses fall past the 512 MB physical wrap.
+    {
+      static uint32_t tf17_logs = 0;
+      const RegisterFile& r17 = *register_file_;
+      xenos::xe_gpu_texture_fetch_t t17 = r17.GetTextureFetch(17);
+      if (tf17_logs < 300 && (vertex_texture_mask & (1u << 17)) &&
+          t17.dimension == xenos::DataDimension::k1D) {
+        ++tf17_logs;
+        auto cf = [&](uint32_t n) {
+          return xe::memory::Reinterpret<float>(
+              r17[XE_GPU_REG_SHADER_CONSTANT_000_X + n]);
+        };
+        XELOGI("TF17DRAW base=0x{:08X} w={} count={} c123={} {} {} {} "
+               "c252={} {} {} {} c253={} {} {} {} c254={} {} {} {} "
+               "c255={} {} {} {}",
+               t17.base_address << 12, t17.size_1d.width + 1, index_count,
+               cf(492), cf(493), cf(494), cf(495), cf(1008), cf(1009),
+               cf(1010), cf(1011), cf(1012), cf(1013), cf(1014), cf(1015),
+               cf(1016), cf(1017), cf(1018), cf(1019), cf(1020), cf(1021),
+               cf(1022), cf(1023));
+      }
+    }
+    // Skinning draw census: how many instances (palette rows) does the draw
+    // really reach, and which world-matrix rows c[120+3r] are non-zero.
+    static uint32_t skin_logs = 0;
+    const RegisterFile& sregs = *register_file_;
+    xenos::xe_gpu_texture_fetch_t tf16 = sregs.GetTextureFetch(16);
+    if (skin_logs < 150 && (vertex_texture_mask & (1u << 16)) &&
+        tf16.format == xenos::TextureFormat::k_16_16_16_16_EXPAND) {
+      ++skin_logs;
+      uint32_t imin = UINT32_MAX, imax = 0;
+      if (index_buffer_info && index_buffer_info->guest_base) {
+        const uint8_t* ib =
+            memory_->TranslatePhysical<const uint8_t*>(
+                index_buffer_info->guest_base);
+        bool i32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
+        for (uint32_t i = 0; i < index_buffer_info->count; ++i) {
+          uint32_t v;
+          if (i32) {
+            v = xenos::GpuSwap(reinterpret_cast<const uint32_t*>(ib)[i],
+                               index_buffer_info->endianness);
+          } else {
+            v = xenos::GpuSwap(reinterpret_cast<const uint16_t*>(ib)[i],
+                               index_buffer_info->endianness);
+          }
+          imin = std::min(imin, v);
+          imax = std::max(imax, v);
+        }
+      }
+      std::string rows;
+      for (uint32_t r = 0; r < 32; ++r) {
+        bool nz = false;
+        for (uint32_t k = 0; k < 12; ++k) {
+          nz |= sregs[XE_GPU_REG_SHADER_CONSTANT_000_X + (120 + 3 * r) * 4 +
+                      k] != 0;
+        }
+        rows.push_back(nz ? '1' : '0');
+      }
+      XELOGI("SKINDRAW tex=0x{:08X} w={} prim={} count={} indexed={} "
+             "imin={} imax={} indx_offset={} vtx_min={} vtx_max={} "
+             "world_nz={}",
+             tf16.base_address << 12, tf16.size_2d.width + 1,
+             uint32_t(prim_type), index_count, index_buffer_info ? 1 : 0,
+             imin, imax, sregs[XE_GPU_REG_VGT_INDX_OFFSET],
+             sregs[XE_GPU_REG_VGT_MIN_VTX_INDX],
+             sregs[XE_GPU_REG_VGT_MAX_VTX_INDX], rows);
+    }
+  }
+  if (cvars::debug_force_vertex_texture_reload && vertex_texture_mask) {
+    texture_cache_->ForceReloadBindings(vertex_texture_mask);
+  }
+  if (textures_requested || (cvars::debug_force_vertex_texture_reload &&
+                             vertex_texture_mask)) {
     texture_cache_->RequestTextures(used_texture_mask, vertex_texture_mask);
   } else {
     texture_cache_->EnsureTexturesSampled(used_texture_mask,
@@ -8492,8 +8660,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(
         }
         uint32_t span_start, span_length;
         if (!shared_memory_->RangeUploadWouldBreakPass(
-                vfetch_constant.address << 2, vfetch_constant.size << 2,
-                span_start, span_length)) {
+                xenos::VertexFetchPhysicalAddress(vfetch_constant.address),
+                vfetch_constant.size << 2, span_start, span_length)) {
           continue;
         }
         if (!vfetch_window_size) {
@@ -8545,6 +8713,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(
         (UINT32_C(1) << (range.slot & 31))) {
       shared_memory_->MarkRangeUsedInSubmission(range.memory.address, range.memory.length);
     } else if (!range.memory.Request(*shared_memory_)) {
+      // A vertex buffer the shared memory refuses drops the whole draw (the
+      // model is missing or keeps stale vertices): say which one and why.
+      static uint32_t vertex_request_failures = 0;
+      if (++vertex_request_failures <= 24 ||
+          !(vertex_request_failures & (vertex_request_failures - 1))) {
+        const auto fetch = register_file_->GetVertexFetch(range.slot);
+        const uint64_t end =
+            uint64_t(range.memory.address) + range.memory.length;
+        XELOGW(
+            "VertexRequestFail #{}: fetch {} ({:08X} {:08X}) range "
+            "{:08X}+{:X} end {:X} {} vs={:016X}",
+            vertex_request_failures, range.slot, fetch.dword_0,
+            fetch.dword_1, range.memory.address, range.memory.length, end,
+            end > SharedMemory::kBufferSize ? "beyond-512MB" : "in-bounds",
+            vertex_shader->ucode_data_hash());
+      }
       return XdDrawFail(__LINE__);
     }
   }
@@ -9446,9 +9630,17 @@ bool VulkanCommandProcessor::CanDeferResolveReadback(
   if (shared_memory_->is_zero_copy()) return false;
   const auto mode = GetReadbackResolveMode();
   if (mode == ReadbackResolveMode::kDisabled) return true;
+  if (cvars::readback_resolve_uma_sync) return false;
   if (mode != ReadbackResolveMode::kUma ||
       texture_cache_->IsDrawResolutionScaled() ||
       !shared_memory_->IsHostMapped()) {
+    return false;
+  }
+  if (cvars::readback_resolve_uma_readwatch &&
+      AnyResolvePageRead(info.copy_dest_extent_start,
+                         info.copy_dest_extent_length)) {
+    // The CPU reads this destination: never let the deferred path give it the
+    // previous resolve's bytes.
     return false;
   }
   const auto it = uma_readback_last_write_.find(MakeReadbackResolveKey(
@@ -9579,7 +9771,8 @@ void VulkanCommandProcessor::ResolveDeferDraw(
       const auto fetch = register_file_->GetVertexFetch(i * 32 + bit);
       if (fetch.type != xenos::FetchConstantType::kVertex) {
         c.reasons |= kResolveDeferUnknown;
-      } else if (overlaps(fetch.address << 2, uint64_t(fetch.size) << 2)) {
+      } else if (overlaps(xenos::VertexFetchPhysicalAddress(fetch.address),
+                          uint64_t(fetch.size) << 2)) {
         c.reasons |= kResolveDeferRead;
       }
     }
@@ -9785,12 +9978,67 @@ bool VulkanCommandProcessor::IssueCopy() {
   return copy_result;
 }
 
+void VulkanCommandProcessor::FlushUmaReadbackPending(bool drain) {
+  if (uma_readback_pending_.empty()) {
+    return;
+  }
+  if (drain) {
+    // Frame boundary: one drain for every range waiting for its current
+    // resolve, instead of one full queue wait per resolve.
+    PushBufferMemoryBarrier(
+        shared_memory_->buffer(), 0, VK_WHOLE_SIZE,
+        guest_shader_pipeline_stages_ | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
+    SubmitBarriers(true);
+    if (!AwaitAllQueueOperationsCompletion()) {
+      XELOGE("VulkanCommandProcessor: uma deferred readback drain failed");
+      return;
+    }
+  }
+  const uint64_t completed_submission = GetCompletedSubmission();
+  for (auto it = uma_readback_pending_.begin();
+       it != uma_readback_pending_.end();) {
+    if (!drain && completed_submission < it->second.submission) {
+      ++it;
+      continue;
+    }
+    const UmaReadbackPending pending = it->second;
+    if (cvars::readback_resolve_uma_skip_cpu_written) {
+      uint32_t skipped_pages = 0;
+      shared_memory_->ReadHostMappedGpuWritten(
+          pending.address, pending.length, true, &skipped_pages);
+      if (skipped_pages &&
+          ++vk_frame_sync_stats_.rb_uma_cpu_owned_skips <= 20) {
+        XELOGI(
+            "Resolve readback (uma deferred): kept CPU data in {} pages of "
+            "{:08X}+{:X}",
+            skipped_pages, pending.address, pending.length);
+      }
+    } else {
+      shared_memory_->ReadHostMapped(
+          pending.address, pending.length,
+          memory_->TranslatePhysical(pending.address), true);
+    }
+    static uint32_t deferred_logs = 0;
+    if (++deferred_logs <= 100) {
+      XELOGI("Resolve readback (uma deferred) copy {:08X}+{:X}",
+             pending.address, pending.length);
+    }
+    it = uma_readback_pending_.erase(it);
+  }
+}
+
 bool VulkanCommandProcessor::IssueCopyImpl(
     const draw_util::ResolveInfo* captured_info) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  FlushUmaReadbackPending(false);
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -9881,6 +10129,29 @@ bool VulkanCommandProcessor::IssueCopyImpl(
   // target) keeps guest RAM coherent itself: its pages are protected and the
   // first CPU access materializes them. Reading it back would materialize it
   // right away, with a GPU wait, for every resolve.
+  // UMA on demand: from the second resolve of a range on, guest RAM gets the
+  // bytes at the CPU's first access (the current resolve, not the previous
+  // one), and never for ranges the CPU does not read.
+  if (uma_direct && cvars::readback_resolve_uma_provider &&
+      !cvars::readback_resolve_uma_sync && written_length > 0 &&
+      IsResolveDestinationResident(written_address, written_length)) {
+    const uint64_t resolve_key =
+        MakeReadbackResolveKey(written_address, written_length);
+    auto& last_write = uma_readback_last_write_[resolve_key];
+    if (last_write) {
+      if (!shared_memory_->RequestRange(written_address, written_length)) {
+        PopDebugMarker();
+        return false;
+      }
+      if (shared_memory_->PublishUmaResolve(written_address, written_length,
+                                            GetCurrentSubmission())) {
+        ++vk_frame_sync_stats_.rb_uma_direct;
+        last_write = GetCurrentSubmission();
+        PopDebugMarker();
+        return true;
+      }
+    }
+  }
   const bool provider_published =
       written_length > 0 &&
       shared_memory_->IsRangeValidInSurface(written_address, written_length);
@@ -9911,9 +10182,44 @@ bool VulkanCommandProcessor::IssueCopyImpl(
       const uint64_t resolve_key =
           MakeReadbackResolveKey(written_address, written_length);
       auto& last_write = uma_readback_last_write_[resolve_key];
+      const bool uma_sync = cvars::readback_resolve_uma_sync;
+      const bool uma_readwatch = cvars::readback_resolve_uma_readwatch;
+      if (uma_readwatch) {
+        TryArmResolveReadWatch(resolve_key, written_address, written_length);
+      }
+      const bool read_before =
+          uma_readwatch &&
+          AnyResolvePageRead(written_address, written_length);
+      // uma_sync is diagnostic only. With readwatch, the range is executed
+      // immediately (CanDeferResolveReadback below); the current resolve of a
+      // destination the CPU reads is queued and copied once its submission
+      // retires - current data without draining the queue every resolve.
+      const bool force_current = uma_sync;
       bool do_read;
-      if (!last_write) {
-        ++vk_frame_sync_stats_.rb_uma_first_use;
+      if (!last_write || force_current) {
+        if (!last_write) {
+          if (++vk_frame_sync_stats_.rb_uma_first_use <= 400) {
+            // Every distinct range resolves copy back into guest RAM, once: a
+            // crash on CPU data can be matched against them.
+            const auto& regs = *register_file_;
+            const auto pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+            XELOGI(
+                "Resolve readback (uma) range {:08X}+{:X} dest format {} "
+                "pitch {} height {} array {} endian {}",
+                written_address, written_length,
+                uint32_t(copy_dest_info.copy_dest_format),
+                uint32_t(pitch.copy_dest_pitch),
+                uint32_t(pitch.copy_dest_height),
+                uint32_t(copy_dest_info.copy_dest_array),
+                uint32_t(copy_dest_info.copy_dest_endian));
+          }
+        } else {
+          static uint32_t sync_logs = 0;
+          if (++sync_logs <= 200) {
+            XELOGI("Resolve readback (uma sync) range {:08X}+{:X}",
+                   written_address, written_length);
+          }
+        }
         // Seed guest RAM.
         // Make the just-recorded write host-visible and drain to read it now.
         // Guest shader stages included: in-pass resolves write shared memory
@@ -9934,6 +10240,13 @@ bool VulkanCommandProcessor::IssueCopyImpl(
           return true;
         }
         do_read = true;
+      } else if (read_before) {
+        // Defer the CURRENT resolve to FlushUmaReadbackPending, which copies it
+        // once this submission has retired. Copying the previous resolve here
+        // is not enough: the CPU read after this resolve needs these bytes.
+        uma_readback_pending_[resolve_key] = {
+            written_address, written_length, resolve_submission};
+        do_read = false;
       } else {
         // Read the previous resolve's bytes, but only once that submission has
         // retired, so the CPU never races the GPU writing the same region.
@@ -9944,9 +10257,22 @@ bool VulkanCommandProcessor::IssueCopyImpl(
       if (do_read) {
         InsertDebugMarker("Resolve Readback (uma): 0x%08X, %u bytes",
                           written_address, written_length);
-        shared_memory_->ReadHostMapped(
-            written_address, written_length,
-            memory_->TranslatePhysical(written_address), true);
+        if (cvars::readback_resolve_uma_skip_cpu_written) {
+          uint32_t skipped_pages = 0;
+          shared_memory_->ReadHostMappedGpuWritten(
+              written_address, written_length, true, &skipped_pages);
+          if (skipped_pages &&
+              ++vk_frame_sync_stats_.rb_uma_cpu_owned_skips <= 20) {
+            XELOGI(
+                "Resolve readback (uma): kept CPU data in {} pages of "
+                "{:08X}+{:X} (written by the CPU after the resolve)",
+                skipped_pages, written_address, written_length);
+          }
+        } else {
+          shared_memory_->ReadHostMapped(
+              written_address, written_length,
+              memory_->TranslatePhysical(written_address), true);
+        }
       }
       last_write = resolve_submission;
       PopDebugMarker();
@@ -13286,7 +13612,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     if (float_constants_[stage].Update(shaders[stage], bitmap,
             !stage && interpreter_placeholder,
             regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X + stage * 1024,
-            interval.first, interval.end)) {
+            cvars::debug_force_float_constants_full ? 0u : interval.first,
+            cvars::debug_force_float_constants_full ? 256u : interval.end)) {
       current_constant_buffers_up_to_date_ &= ~(UINT32_C(1) <<
           (stage ? SpirvShaderTranslator::kConstantBufferFloatPixel
                  : SpirvShaderTranslator::kConstantBufferFloatVertex));

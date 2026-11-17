@@ -10,6 +10,10 @@
 #include "xenia/gpu/texture_cache.h"
 
 #include <algorithm>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cp_wait_stats.h"
@@ -21,6 +25,14 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
+DEFINE_bool(log_vertex_texture_fetches, false,
+            "Log each distinct texture fetch constant used by vertex shaders "
+            "(diagnostic).",
+            "GPU");
+DEFINE_bool(debug_force_vertex_texture_reload, false,
+            "Diagnostic: reload every texture a vertex shader samples on each "
+            "draw, ignoring the cache's validity tracking.",
+            "GPU");
 DEFINE_bool(debug_skip_texture_reloads, false,
             "Diagnostic only, renders WRONG images: textures whose guest data "
             "changed after their first load keep their old host data instead "
@@ -156,6 +168,9 @@ const TextureCache::LoadShaderInfo
         {16, 2},  // kDXT1ToASTC4x4
         {16, 2},  // kDXT5ToASTC4x4
         {16, 2},  // kDXNToEACRG11
+        {4, 3},   // kR16XenosHalfToFloat32
+        {8, 3},   // kRG16XenosHalfToFloat32
+        {16, 2},  // kRGBA16XenosHalfToFloat32
 };
 
 TextureCache::TextureCache(const RegisterFile& register_file,
@@ -713,6 +728,181 @@ bool TextureCache::IsBindingOutdatedForUse(
 // the main RequestTextures loop reprocesses them (re-binding the same Texture*
 // with fresh data uploaded via LoadTexturesData). Only used-and-outdated slots
 // are touched; non-used and clean slots keep their cached state.
+void TextureCache::ForceReloadBindings(uint32_t mask) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t index;
+  while (xe::bit_scan_forward(mask, &index)) {
+    mask = xe::clear_lowest_bit(mask);
+    TextureBinding& binding = texture_bindings_[index];
+    if (binding.texture) binding.texture->ForceOutdated();
+    if (binding.texture_signed) binding.texture_signed->ForceOutdated();
+    texture_bindings_in_sync_ &= ~(UINT32_C(1) << index);
+  }
+}
+
+void TextureCache::LogVertexTextureFetches(uint32_t mask, Memory& memory) {
+  static std::mutex log_mutex;
+  static std::unordered_set<uint64_t> seen;
+  std::lock_guard<std::mutex> lock(log_mutex);
+  static uint32_t ext_logs = 0;
+  const RegisterFile& regs = register_file();
+  uint32_t index;
+  while (xe::bit_scan_forward(mask, &index)) {
+    mask = xe::clear_lowest_bit(mask);
+    xenos::xe_gpu_texture_fetch_t f = regs.GetTextureFetch(index);
+    if (!f.tiled && f.format == xenos::TextureFormat::k_16_16_16_16_EXPAND) {
+      uint32_t base = f.base_address << 12;
+      uint32_t span = (f.pitch << 5) * (f.size_2d.height + 1) * 8;
+      const uint8_t* bp = memory.TranslatePhysical<const uint8_t*>(base);
+      uint64_t hsh = 1469598103934665603ull;
+      for (uint32_t i = 0; i < span; ++i) hsh = (hsh ^ bp[i]) * 1099511628211ull;
+      if (vs_race_records_.size() < 256)
+        vs_race_records_.push_back({base, span, hsh});
+      // Raw dumps of the bone palette for offline decoding: 6 samples, 40
+      // draws apart, 256 bytes per log line.
+      // Each distinct base is dumped twice (first sight and ~200 draws later).
+      static uint32_t dump_draws = 0, dumps = 0;
+      static std::unordered_map<uint32_t, uint32_t> dumped;  // base -> draw
+      ++dump_draws;
+      auto dit = dumped.find(base);
+      bool do_dump = false;
+      if (dumps < 12) {
+        if (dit == dumped.end()) {
+          dumped[base] = dump_draws;
+          do_dump = true;
+        } else if (dit->second && dump_draws - dit->second >= 200) {
+          dit->second = 0;
+          do_dump = true;
+        }
+      }
+      if (do_dump) {
+        ++dumps;
+        auto c = [&](uint32_t n) {
+          return regs[XE_GPU_REG_SHADER_CONSTANT_000_X + n];
+        };
+        XELOGI("BONEDUMP begin n={} base=0x{:08X} w={} h={} pitch={} span={} "
+               "tf={} dw0={:08X} dw1={:08X} dw2={:08X} dw3={:08X} dw4={:08X} "
+               "dw5={:08X} c118={:08X} {:08X} {:08X} {:08X} c119={:08X} "
+               "{:08X} {:08X} {:08X} c255={:08X} {:08X}",
+               dumps, base, f.size_2d.width + 1, f.size_2d.height + 1,
+               f.pitch << 5, span, index, f.dword_0, f.dword_1, f.dword_2,
+               f.dword_3, f.dword_4, f.dword_5, c(472), c(473), c(474),
+               c(475), c(476), c(477), c(478), c(479), c(1020), c(1021));
+        // Vertex bytes read by the skinning shader (vf0, stride 7, dword 6):
+        // per-component histograms to see which palette rows/bones are used.
+        {
+          xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(95);  // "vf0"
+          const uint32_t* vp = memory.TranslatePhysical<const uint32_t*>(
+              vf.address << 2);
+          uint32_t verts = vf.size / 7;
+          uint32_t hist[4][256] = {};
+          for (uint32_t v = 0; v < verts; ++v) {
+            uint32_t w = xenos::GpuSwap(vp[v * 7 + 6], vf.endian);
+            for (uint32_t k = 0; k < 4; ++k) ++hist[k][(w >> (8 * k)) & 0xFF];
+          }
+          for (uint32_t k = 0; k < 4; ++k) {
+            std::string hs;
+            for (uint32_t i = 0; i < 256; ++i) {
+              if (hist[k][i]) hs += fmt::format(" {}:{}", i, hist[k][i]);
+            }
+            XELOGI("BONEVTX {} vb=0x{:08X} endian={} verts={} comp{}{}", dumps,
+                   vf.address << 2, uint32_t(vf.endian), verts, k, hs);
+          }
+        }
+        static const char kHex[] = "0123456789ABCDEF";
+        std::string line;
+        for (uint32_t off = 0; off < span; off += 256) {
+          line.clear();
+          for (uint32_t i = off; i < std::min(span, off + 256); ++i) {
+            line.push_back(kHex[bp[i] >> 4]);
+            line.push_back(kHex[bp[i] & 15]);
+          }
+          XELOGI("BONEDUMP {} {:05X} {}", dumps, off, line);
+        }
+      }
+    }
+    // Xenos halves have no inf/NaN: exponent 31 is a normal number up to
+    // 131008, but a host SFLOAT image reads it as inf/NaN.
+    if (ext_logs < 40 && !f.tiled && f.dimension == xenos::DataDimension::k2DOrStacked &&
+        (f.format == xenos::TextureFormat::k_16_16_16_16_EXPAND ||
+         f.format == xenos::TextureFormat::k_16_16_16_16_FLOAT)) {
+      uint32_t w = f.size_2d.width + 1, h = f.size_2d.height + 1;
+      uint32_t pitch_texels = f.pitch << 5;
+      const uint8_t* p = memory.TranslatePhysical<const uint8_t*>(
+          f.base_address << 12);
+      uint32_t ext = 0, total = 0, first_word = 0;
+      for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w * 4; ++x) {
+          const uint8_t* e = p + (size_t(y) * pitch_texels * 4 + x) * 2;
+          // endian 1 = 8-in-16, i.e. big-endian halves.
+          uint16_t half = uint16_t((e[0] << 8) | e[1]);
+          ++total;
+          if (((half >> 10) & 0x1F) == 0x1F) {
+            if (!ext) first_word = half | ((y * w * 4 + x) << 16);
+            ++ext;
+          }
+        }
+      }
+      if (ext) {
+        ++ext_logs;
+        XELOGI("VS texture tf{} fmt={} base=0x{:08X} {}x{}: {} of {} halves "
+               "have exponent 31 (inf/NaN on host), first=0x{:04X} at {}",
+               index, uint32_t(f.format), f.base_address << 12, w, h, ext,
+               total, first_word & 0xFFFF, first_word >> 16);
+      }
+    }
+    if (seen.size() >= 64) continue;
+    uint64_t key = (uint64_t(f.dword_1) << 32) ^ f.dword_0 ^
+                   (uint64_t(f.dword_3) << 17) ^ (uint64_t(index) << 58);
+    if (!seen.insert(key).second) continue;
+    {
+      uint32_t base = f.base_address << 12;
+      uint32_t span = (f.pitch << 5) * (f.size_2d.height + 1) * 8;
+      bool ever_known = false;
+      bool ever = shared_memory().IsRangeEverGpuWritten(base, span, &ever_known);
+      XELOGI("VS texture tf{} base=0x{:08X} span={} gpu_written_now={} "
+             "ever_gpu_written={} (history={})",
+             index, base, span, shared_memory().IsRangeGpuWritten(base, span),
+             ever, ever_known);
+    }
+    XELOGI(
+        "VS texture tf{}: fmt={} {}x{} dim={} tiled={} endian={} signs={}{}{}{} "
+        "numfmt={} expadj={} swz={:03X} clamp={}/{} mag={} min={} mip={} "
+        "aniso={} nearest_policy={} base=0x{:08X} pitch={} packed={} "
+        "dwords={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+        index, uint32_t(f.format), f.size_2d.width + 1, f.size_2d.height + 1,
+        uint32_t(f.dimension), f.tiled, uint32_t(f.endianness),
+        uint32_t(f.sign_x), uint32_t(f.sign_y), uint32_t(f.sign_z),
+        uint32_t(f.sign_w), f.num_format, f.exp_adjust, f.swizzle,
+        uint32_t(f.clamp_x), uint32_t(f.clamp_y), uint32_t(f.mag_filter),
+        uint32_t(f.min_filter), uint32_t(f.mip_filter),
+        uint32_t(f.aniso_filter), f.nearest_clamp_policy,
+        f.base_address << 12, f.pitch, f.packed_mips, f.dword_0, f.dword_1,
+        f.dword_2, f.dword_3, f.dword_4, f.dword_5);
+  }
+}
+
+void TextureCache::CheckVsTextureRewrites(Memory& memory) {
+  static uint64_t frames = 0, draws = 0, changed = 0, changed_frames = 0;
+  ++frames;
+  uint64_t changed_now = 0;
+  for (const auto& r : vs_race_records_) {
+    const uint8_t* bp = memory.TranslatePhysical<const uint8_t*>(r.base);
+    uint64_t hsh = 1469598103934665603ull;
+    for (uint32_t i = 0; i < r.span; ++i) hsh = (hsh ^ bp[i]) * 1099511628211ull;
+    ++draws;
+    if (hsh != r.hash) ++changed_now;
+  }
+  changed += changed_now;
+  if (changed_now) ++changed_frames;
+  vs_race_records_.clear();
+  if ((frames & 63) == 0) {
+    XELOGI("VS bone race: frames={} draws={} changed_after_draw={} "
+           "frames_with_change={}",
+           frames, draws, changed, changed_frames);
+  }
+}
+
 void TextureCache::InvalidateUsedOutdatedBindings(uint32_t used_texture_mask) {
   uint32_t used_in_sync = used_texture_mask & texture_bindings_in_sync_;
   uint32_t index = 0;
@@ -1413,6 +1603,7 @@ void TextureCache::BindingInfoFromFetchConstant(
     // No texture data at all.
     return;
   }
+  uint32_t pitch = fetch.pitch;
   if (fetch.dimension == xenos::DataDimension::k1D) {
     bool is_invalid_1d = false;
     // Handle wide 1D textures (> 8192 wide) by mapping them to a 2D grid.
@@ -1422,6 +1613,7 @@ void TextureCache::BindingInfoFromFetchConstant(
       uint32_t total_width = width_minus_1 + 1;
       uint32_t row_width = xenos::kTexture2DCubeMaxWidthHeight;
       uint32_t num_rows = (total_width + row_width - 1) / row_width;
+      num_rows = std::min(num_rows, xenos::kTexture1DWideMaxRows);
       width_minus_1 = row_width - 1;
       height_minus_1 = num_rows - 1;
       // Disable mipmaps for wide 1D textures. The shader's coordinate remapping
@@ -1430,6 +1622,11 @@ void TextureCache::BindingInfoFromFetchConstant(
       // when num_rows >> N becomes 1 while the shader still expects multiple
       // rows. Mipmaps are rarely used with 1D lookup textures anyway.
       mip_max_level = 0;
+      // The guest pitch is meaningless for a texture the guest believes is 1D
+      // (the 9 bit field couldn't even express the line width, and it's 0 in
+      // practice) - with it, every 8192-texel row was loaded from the first
+      // row's memory, so data past the first 64 KB (with 8 bpp) was wrong.
+      pitch = xenos::kTexture2DCubeMaxWidthHeight >> 5;
     }
     assert_false(fetch.tiled);
     if (fetch.tiled) {
@@ -1460,7 +1657,7 @@ void TextureCache::BindingInfoFromFetchConstant(
   key_out.width_minus_1 = width_minus_1;
   key_out.height_minus_1 = height_minus_1;
   key_out.depth_or_array_size_minus_1 = depth_or_array_size_minus_1;
-  key_out.pitch = fetch.pitch;
+  key_out.pitch = pitch;
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
   key_out.packed_mips = fetch.packed_mips;

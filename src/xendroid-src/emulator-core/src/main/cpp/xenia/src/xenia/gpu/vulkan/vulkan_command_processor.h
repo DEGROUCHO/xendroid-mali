@@ -417,6 +417,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   void PrepareForPause() override;
+  void BeforeCpMemoryRead(uint32_t address, uint32_t length) override;
   void BeforeCpuMemoryWrite(uint32_t start, uint32_t length) override;
   bool DeferGuestFenceWrite(uint8_t* destination, uint32_t value) override;
 
@@ -1085,6 +1086,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint64_t primary_buffer_splits = 0;
     uint64_t rb_uma_direct = 0;
     uint64_t rb_uma_first_use = 0;
+    uint64_t rb_uma_cpu_owned_skips = 0;
     uint64_t last_report_ns = 0;
   };
   VkFrameSyncStats vk_frame_sync_stats_;
@@ -1914,6 +1916,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // readback_resolve=uma: last submission that resolved each destination key,
   // so the direct host read only happens once that submission has retired.
   std::unordered_map<uint64_t, uint64_t> uma_readback_last_write_;
+  // uma + readwatch: the current resolve of a destination the CPU reads, to
+  // copy once its submission retires. Resolves the current data off the GPU
+  // timeline instead of draining the queue for every resolve of the range.
+  struct UmaReadbackPending {
+    uint32_t address;
+    uint32_t length;
+    uint64_t submission;
+  };
+  std::unordered_map<uint64_t, UmaReadbackPending> uma_readback_pending_;
+  void FlushUmaReadbackPending(bool drain);
   // Per-backend trampoline from the memory read callback into the shared
   // MarkResolvePagesRead.
   static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,

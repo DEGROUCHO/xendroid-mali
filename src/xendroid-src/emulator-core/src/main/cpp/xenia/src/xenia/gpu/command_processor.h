@@ -491,6 +491,8 @@ class CommandProcessor {
   virtual void PrepareForPause() {}
   // These CP stores use the unprotected physical alias, bypassing CPU faults.
   virtual void BeforeCpuMemoryWrite(uint32_t start, uint32_t length) {}
+  // The CP is about to read guest memory directly (constants from memory).
+  virtual void BeforeCpMemoryRead(uint32_t address, uint32_t length) {}
   // Returns true if the backend takes over the guest-visible fence write and
   // performs it once the GPU work submitted before it has completed.
   virtual bool DeferGuestFenceWrite(uint8_t* destination, uint32_t value) {
@@ -501,6 +503,15 @@ class CommandProcessor {
   virtual void PollCompletedSubmission() {}
   virtual void ServiceMemoryRequests() {}
   virtual bool HasMemoryProviders() const { return false; }
+
+ public:
+  // A guest thread waits on a memory provider request: wake an idle worker
+  // instead of letting it sleep out its poll interval.
+  void WakeForMemoryRequest() {
+    if (write_ptr_index_event_) write_ptr_index_event_->Set();
+  }
+
+ protected:
 
   // Used by strict ZPD to distinguish normal in flight latency from a
   // genuinely stuck report.

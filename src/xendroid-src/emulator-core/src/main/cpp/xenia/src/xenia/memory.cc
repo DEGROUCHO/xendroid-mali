@@ -13,6 +13,8 @@
 #endif
 
 #include <cerrno>
+#include <cstdio>
+#include <utility>
 #include <cstring>
 #include <random>
 
@@ -35,6 +37,7 @@
 #include "xenia/base/threading.h"
 
 #include "xenia/cpu/mmio_handler.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/shared_memory_coherency.h"
 
 // TODO(benvanik): move xbox.h out
@@ -86,6 +89,19 @@ DEFINE_bool(shm_invalidate_physical_commit, true,
             "pages a commit makes writable again (realloc of watched memory), "
             "so later CPU writes are not missed.",
             "Memory");
+DEFINE_string(memory_trace_physical, "",
+              "Log every physical-heap allocation, release, decommit and "
+              "protect overlapping this physical range (hex lo-hi, e.g. "
+              "1F000000-20000000), with the guest lr. Debugging aid.",
+              "Memory");
+DEFINE_bool(memory_watch_physical_aliases, true,
+            "Arm GPU write watches on a physical page through every physical "
+            "view (A0/C0/E0), not only the one that allocated it: a store "
+            "through another view of the same memory is then noticed, instead "
+            "of leaving the GPU's copy stale and the page marked GPU-written "
+            "(Assassin's Creed Rogue crash: resolve readback copied over CPU "
+            "data written through the C0 view).",
+            "Memory");
 DEFINE_bool(protect_on_release, false,
             "Protect released memory to prevent accesses.", "Memory");
 DEFINE_bool(scribble_heap, false,
@@ -126,7 +142,9 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size) {
 /**
  * Memory map:
  * 0x00000000 - 0x3FFFFFFF (1024mb) - virtual 4k pages
- * 0x40000000 - 0x7FFFFFFF (1024mb) - virtual 64k pages
+ * 0x40000000 - 0x7EFFFFFF (1008mb) - virtual 64k pages
+ * 0x7F000000 - 0x7FC7FFFF ( 12.5mb) - GPU writeback & XPS
+ * 0x7FC80000 - 0x7FFFFFFF (  3.5mb) - MMIO
  * 0x80000000 - 0x8BFFFFFF ( 192mb) - xex 64k pages
  * 0x8C000000 - 0x8FFFFFFF (  64mb) - xex 64k pages (encrypted)
  * 0x90000000 - 0x9FFFFFFF ( 256mb) - xex 4k pages
@@ -243,6 +261,7 @@ Memory::~Memory() {
   heaps_.vA0000000.Dispose();
   heaps_.vC0000000.Dispose();
   heaps_.vE0000000.Dispose();
+  heaps_.v7F000000.Dispose();
   heaps_.physical.Dispose();
 
   // Unmap all views and close mapping.
@@ -345,6 +364,9 @@ bool Memory::Initialize() {
                               &heaps_.physical);
   heaps_.vE0000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
                               0xE0000000, 0x1FD00000, 4096, &heaps_.physical);
+  // XPS: 0x7F000000..0x7FC7FFFF is a view of the GPU writeback / L2 backing.
+  heaps_.v7F000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
+                              0x7F000000, 0x00C80000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(
@@ -355,10 +377,14 @@ bool Memory::Initialize() {
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000,
                              kMemoryAllocationReserve, kMemoryProtectNoAccess);
 
-  // GPU writeback.
-  // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
+  // GPU writeback & XPS.
+  // 0xC... is physical, 0x7F... is virtual. Overlaid.
   heaps_.vC0000000.AllocFixed(
       0xC0000000, 0x01000000, 32,
+      kMemoryAllocationReserve | kMemoryAllocationCommit,
+      kMemoryProtectRead | kMemoryProtectWrite);
+  heaps_.v7F000000.AllocFixed(
+      0x7F000000, 0x00C80000, 32,
       kMemoryAllocationReserve | kMemoryAllocationCommit,
       kMemoryProtectRead | kMemoryProtectWrite);
 
@@ -445,7 +471,7 @@ static const struct {
         0x7EFFFFFF,
         0x0000000040000000ull,
     },
-    //   (16mb) - GPU writeback + 15mb of XPS?
+    //   (16mb) - GPU writeback + XPS
     {
         0x7F000000,
         0x7FFFFFFF,
@@ -624,6 +650,8 @@ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
     selected_heap_offset = HEAP_INDEX(v00000000);
   } else if (address < 0x7F000000) {
     selected_heap_offset = HEAP_INDEX(v40000000);
+  } else if (address < 0x7FC80000) {
+    selected_heap_offset = HEAP_INDEX(v7F000000);
   } else if (high_nibble < 0x8) {
     heap_select = nullptr;
     // return nullptr;
@@ -655,6 +683,8 @@ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
     return &heaps_.v00000000;
   } else if (address < 0x7F000000) {
     return &heaps_.v40000000;
+  } else if (address < 0x7FC80000) {
+    return &heaps_.v7F000000;
   } else if (address < 0x80000000) {
     return nullptr;
   } else if (address < 0x90000000) {
@@ -989,6 +1019,9 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(
   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications,
                                          enable_data_providers);
+  heaps_.v7F000000.EnableAccessCallbacks(physical_address, length,
+                                         enable_invalidation_notifications,
+                                         enable_data_providers);
 }
 
 bool Memory::ProtectHostMemory(void* address, size_t length,
@@ -1051,6 +1084,7 @@ void Memory::DumpMap() {
   XELOGE("------------------------------------------------------------------");
   XELOGE("");
   heaps_.physical.DumpMap();
+  heaps_.v7F000000.DumpMap();
   heaps_.vA0000000.DumpMap();
   heaps_.vC0000000.DumpMap();
   heaps_.vE0000000.DumpMap();
@@ -2228,6 +2262,38 @@ bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
   return true;
 }
 
+uint32_t BaseHeap::RangeProtectRelaxed(uint32_t address,
+                                       uint32_t length) const {
+  if (!length || address < heap_base_ || (address - heap_base_) >= heap_size_) {
+    return 0;
+  }
+  uint32_t first = (address - heap_base_) >> page_size_shift_;
+  uint32_t last = std::min(
+      uint32_t((uint64_t(address - heap_base_) + length - 1) >>
+               page_size_shift_),
+      uint32_t(page_table_.size()) - 1);
+  uint32_t protect = 0;
+  for (uint32_t i = first; i <= last; ++i) {
+    PageEntry page_entry;
+    page_entry.qword = __atomic_load_n(&page_table_[i].qword, __ATOMIC_RELAXED);
+    protect |= page_entry.current_protect;
+  }
+  return protect;
+}
+
+xe::memory::PageAccess PhysicalHeap::AliasGuestAccess(
+    uint32_t system_page_number) const {
+  if (!cvars::memory_watch_physical_aliases) {
+    return xe::memory::PageAccess::kNoAccess;
+  }
+  const uint32_t offset = host_address_offset();
+  const uint32_t system_base = system_page_number << system_page_shift_;
+  const uint32_t heap_relative = system_base > offset ? system_base - offset : 0;
+  const uint32_t length = system_base + system_page_size_ - offset - heap_relative;
+  return ToPageAccess(parent_heap_->RangeProtectRelaxed(
+      GetPhysicalAddress(heap_base_) + heap_relative, length));
+}
+
 bool BaseHeap::IsPageReadableRelaxed(uint32_t address) const {
   if (address < heap_base_ || (address - heap_base_) >= heap_size_) {
     return false;
@@ -2396,6 +2462,35 @@ void PhysicalHeap::Initialize(Memory* memory, uint8_t* membase,
   system_page_flags_.resize((system_page_count_ + 63) / 64);
 }
 
+namespace {
+// cvars::memory_trace_physical, parsed once (config is loaded before any guest
+// allocation).
+void TracePhysicalOp(const char* op, uint32_t guest, uint32_t physical,
+                     uint32_t size, uint32_t protect) {
+  static const std::pair<uint32_t, uint32_t> range = [] {
+    unsigned lo = 0, hi = 0;
+    if (std::sscanf(cvars::memory_trace_physical.c_str(), "%x-%x", &lo, &hi) !=
+            2 ||
+        hi <= lo) {
+      lo = hi = 0;
+    }
+    return std::make_pair(uint32_t(lo), uint32_t(hi));
+  }();
+  if (range.first == range.second || uint64_t(physical) + size <= range.first ||
+      physical >= range.second) {
+    return;
+  }
+  uint32_t lr = 0;
+  auto* thread_state = cpu::ThreadState::Get();
+  if (thread_state && thread_state->context()) {
+    lr = uint32_t(thread_state->context()->lr);
+  }
+  XELOGI("MemTrace {} guest {:08X} phys {:08X} size {:08X} protect {:X} lr "
+         "{:08X}",
+         op, guest, physical, size, protect, lr);
+}
+}  // namespace
+
 bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
                          uint32_t allocation_type, uint32_t protect,
                          bool top_down, uint32_t* out_address) {
@@ -2448,6 +2543,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
     return false;
   }
   *out_address = address;
+  TracePhysicalOp("alloc", address, parent_address, size, protect);
   return true;
 }
 
@@ -2493,7 +2589,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size,
     parent_heap_->Release(parent_base_address);
     return false;
   }
-
+  TracePhysicalOp("allocfixed", address, parent_base_address, size, protect);
   return true;
 }
 
@@ -2546,6 +2642,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
     return false;
   }
   *out_address = address;
+  TracePhysicalOp("allocrange", address, parent_address, size, protect);
   return true;
 }
 
@@ -2558,6 +2655,7 @@ bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment,
 
 bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
   auto global_lock = global_critical_region_.Acquire();
+  TracePhysicalOp("decommit", address, GetPhysicalAddress(address), size, 0);
 
   uint32_t parent_address = GetPhysicalAddress(address);
   if (!parent_heap_->Decommit(parent_address, size)) {
@@ -2576,6 +2674,12 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   auto global_lock = global_critical_region_.Acquire();
 
   uint32_t parent_base_address = GetPhysicalAddress(base_address);
+  {
+    uint32_t traced_size = 0;
+    QuerySize(base_address, &traced_size);
+    TracePhysicalOp("release", base_address, parent_base_address, traced_size,
+                    0);
+  }
   if (!parent_heap_->Release(parent_base_address, out_region_size)) {
     XELOGE("PhysicalHeap::Release failed due to parent heap failure");
     return false;
@@ -2601,6 +2705,8 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
                            uint32_t* old_protect) {
   auto global_lock = global_critical_region_.Acquire();
+  TracePhysicalOp("protect", address, GetPhysicalAddress(address), size,
+                  protect);
 
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance. The guest is announcing a

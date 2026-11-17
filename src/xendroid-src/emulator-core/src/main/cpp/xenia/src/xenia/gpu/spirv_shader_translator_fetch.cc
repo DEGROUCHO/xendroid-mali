@@ -23,6 +23,7 @@
 
 DECLARE_bool(texture_integer_num_format);
 DECLARE_bool(vulkan_bindless_debug_constant_slot);
+DECLARE_bool(spirv_vfetch_vector_load);
 DECLARE_bool(spirv_texture_sign_specialization);
 DECLARE_bool(spirv_texture_exp_adjust_specialization);
 
@@ -96,11 +97,18 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // not a texture fetch) here instead of dropping draws with invalid vertex
     // fetch constants on the CPU when proper bound checks are added - vfetch
     // may be conditional, so fetch constants may also be used conditionally.
+    // The GPU sees 512 MiB of physical memory and ignores the upper 3 bits of
+    // the byte address: Assassin's Creed Rogue fetches its skinned models at
+    // 0xC0100100, which is physical 0x00100100 (same as the CPU side,
+    // VertexFetchPhysicalAddress).
     address = builder_->createUnaryOp(
         spv::OpBitcast, type_int_,
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                              fetch_constant_word_0,
-                              builder_->makeUintConstant(2)));
+        builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_,
+            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                  fetch_constant_word_0,
+                                  builder_->makeUintConstant(2)),
+            builder_->makeUintConstant(0x07FFFFFF)));
     // address is the base now. The exclusive end is base + size (size in words
     // in bits 2:25 of the second word). Store it for the subsequent
     // vfetch_mini, which reuses this fetch constant.
@@ -194,7 +202,8 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   spv::Id vector_first = spv::NoResult;
   spv::Id vector_last = spv::NoResult;
   spv::Id vector_lane = spv::NoResult;
-  if (!IsMemoryExportUsed() && xe::bit_count(needed_words) >= 3) {
+  if (cvars::spirv_vfetch_vector_load && !IsMemoryExportUsed() &&
+      xe::bit_count(needed_words) >= 3) {
     spv::Id first_address = builder_->createBinOp(
         spv::OpIAdd, type_int_, address,
         builder_->makeIntConstant(instr.attributes.offset));
@@ -1364,12 +1373,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id row_width_float = builder_->makeFloatConstant(
               float(xenos::kTexture2DCubeMaxWidthHeight));
 
-          // num_rows = ceil(original_width / row_width)
-          spv::Id num_rows = builder_->createUnaryBuiltinCall(
-              type_float_, ext_inst_glsl_std_450_, GLSLstd450Ceil,
-              builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
-                                                 original_width_float,
-                                                 row_width_float));
+          // num_rows = min(ceil(original_width / row_width), max rows) - keep
+          // this in sync with the texture cache's materialized row cap.
+          spv::Id num_rows = builder_->createBinBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450NMin,
+              builder_->createUnaryBuiltinCall(
+                  type_float_, ext_inst_glsl_std_450_, GLSLstd450Ceil,
+                  builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
+                                                     original_width_float,
+                                                     row_width_float)),
+              builder_->makeFloatConstant(float(xenos::kTexture1DWideMaxRows)));
 
           // linear_x = coord * original_width (denormalize to texel space)
           spv::Id linear_x = builder_->createNoContractionBinOp(
@@ -1387,13 +1400,30 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
                                                  row_index, row_width_float));
 
+          // The point-sampling rounding offset added to the full 1D
+          // coordinate is lost when it is large (float32 ULP is 0.25 above
+          // 2^21 texels), leaving the coordinate exactly on a texel edge -
+          // re-apply it within the row where precision is available, so
+          // edges resolve like the Xenos (and floor-based GPUs) do. Mali's
+          // nearest filter resolves exact edges to the left texel otherwise.
+          x_in_row = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_float_, x_in_row,
+              builder_->makeFloatConstant(1.5f / 1024.0f));
+
           // coord_2d.x = x_in_row / row_width (normalized)
           coord_x_wide = builder_->createNoContractionBinOp(
               spv::OpFDiv, type_float_, x_in_row, row_width_float);
 
-          // coord_2d.y = row_index / num_rows (normalized)
+          // coord_2d.y = (row_index + 0.5) / num_rows (normalized) - the row
+          // center, not its top edge: at an exact edge, nearest sampling may
+          // pick the previous row (it does on Mali), which is 8192 texels
+          // earlier in the 1D texture.
           coord_y_wide = builder_->createNoContractionBinOp(
-              spv::OpFDiv, type_float_, row_index, num_rows);
+              spv::OpFDiv, type_float_,
+              builder_->createNoContractionBinOp(
+                  spv::OpFAdd, type_float_, row_index,
+                  builder_->makeFloatConstant(0.5f)),
+              num_rows);
         }
         if_wide_1d.makeEndIf();
         coordinates[0] =

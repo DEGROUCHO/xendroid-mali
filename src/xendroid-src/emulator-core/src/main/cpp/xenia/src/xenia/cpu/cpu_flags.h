@@ -51,6 +51,10 @@ namespace cpu {
 // Matches an address against a comma-separated list of hex guest addresses,
 // tolerating "0x" and "sub_" prefixes.
 bool GuestAddressInList(const std::string& list, uint32_t address);
+// True when any listed address lies inside [start, end] (a crash PC inside a
+// function, not only its entry).
+bool GuestAddressListHitsRange(const std::string& list, uint32_t start,
+                               uint32_t end);
 
 }  // namespace cpu
 }  // namespace xe

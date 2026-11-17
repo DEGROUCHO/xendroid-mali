@@ -329,7 +329,11 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (cvars::disassemble_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
-  const bool dump_this_function = IsDumpTarget(function->address());
+  const bool dump_this_function =
+      IsDumpTarget(function->address()) ||
+      (!cvars::dump_functions_at.empty() && function->has_end_address() &&
+       GuestAddressListHitsRange(cvars::dump_functions_at,
+                                 function->address(), function->end_address()));
   if (dump_this_function) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }

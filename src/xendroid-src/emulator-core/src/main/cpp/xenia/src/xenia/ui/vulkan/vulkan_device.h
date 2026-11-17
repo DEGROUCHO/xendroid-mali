@@ -191,6 +191,11 @@ class VulkanDevice {
     VkDriverId driverID = VkDriverId(0);
     // Arm proprietary driver release (49 for r49p1), 0 if unknown or not Arm.
     uint32_t maliDriverRelease = 0;
+    // Patch level (1 for r49p1).
+    uint32_t maliDriverPatch = 0;
+    // Job Manager (Bifrost / Valhall up to G78) rather than Command Stream
+    // Frontend GPU - Arm exposes maxDrawIndirectCount == 1 only on Job Manager.
+    bool maliJobManager = false;
 
     // VK_KHR_shader_float_controls (#198, promoted to 1.2)
 

@@ -78,6 +78,13 @@ DEFINE_bool(a64_pair_cas_bump_generation, true,
             "reservation generation of its granule on, like every other "
             "store-conditional.",
             "a64");
+DEFINE_bool(a64_pair_cas_check_generation, false,
+            "A paired lwarx/stwcx. also takes the granule's reservation "
+            "generation at the load and its store fails when another "
+            "store-conditional moved it on since, like the unpaired path: a "
+            "value-only compare-and-swap cannot see a word that was changed and "
+            "changed back (ABA) in a lock-free list.",
+            "a64");
 DECLARE_bool(guest_scheduler);
 
 DEFINE_bool(a64_park_spin_backoff, true,
@@ -1651,7 +1658,51 @@ static void EmitAtomicCompareExchange(A64Emitter& e, const I64Op& guest,
     desired = Reg(desired_op.reg().getIdx());
   }
   const Reg current(0);
-  if (e.IsFeatureEnabled(kA64EmitLSE)) {
+  if (cvars::a64_pair_cas_check_generation) {
+    // Exclusive pair with both checks inside the window (word, then the
+    // granule generation taken at the paired load); after a few lost
+    // exclusives, the generation then one CAS, as the unpaired path.
+    if (!bump) {
+      LoadReserveAddress(e, guest);
+    }
+    LoadReserveGranule(e, e.x3);
+    e.ldr(e.w4, ptr(LoadBackendCtxPtr(e),
+                    static_cast<uint32_t>(offsetof(A64BackendContext,
+                                                   reserve_generation))));
+    auto& retry = e.NewCachedLabel();
+    auto& fail = e.NewCachedLabel();
+    auto& fail_exclusive = e.NewCachedLabel();
+    auto& stored = e.NewCachedLabel();
+    auto& out = e.NewCachedLabel();
+    e.mov(e.w3, kStoreConditionalExclusiveTries);
+    e.L(retry);
+    e.ldaxr(current, ptr(e.x16));
+    e.cmp(current, expected);
+    e.bne(fail_exclusive);
+    e.ldr(e.w0, ptr(e.x2));
+    e.cmp(e.w0, e.w4);
+    e.bne(fail_exclusive);
+    e.stlxr(e.w0, desired, ptr(e.x16));
+    e.cbz(e.w0, stored);
+    e.subs(e.w3, e.w3, 1);
+    e.bne(retry);
+    e.ldar(e.w0, ptr(e.x2));
+    e.cmp(e.w0, e.w4);
+    e.bne(fail);
+    e.mov(current, expected);
+    e.casal(current, desired, ptr(e.x16));
+    e.cmp(current, expected);
+    e.b(out);  // flags: eq = stored
+    e.L(fail_exclusive);
+    e.clrex(15);
+    e.L(fail);
+    e.mov(e.w0, 1);
+    e.cmp(e.w0, 0);  // ne
+    e.b(out);
+    e.L(stored);
+    e.cmp(e.w0, e.w0);  // eq
+    e.L(out);
+  } else if (e.IsFeatureEnabled(kA64EmitLSE)) {
     e.mov(current, expected);
     e.casal(current, desired, ptr(e.x16));
     e.cmp(current, expected);
@@ -1707,6 +1758,14 @@ static void EmitPairedReservedLoad(A64Emitter& e, const I64Op& guest,
   e.ldr(e.w0, ptr(bctx, flags_offset));
   e.and_(e.w0, e.w0, uint64_t(uint32_t(~(1u << kA64BackendHasReserveBit))));
   e.str(e.w0, ptr(bctx, flags_offset));
+  if (cvars::a64_pair_cas_check_generation) {
+    // The generation before the word (acquire), as EmitNativeReserve does.
+    LoadReserveAddress(e, guest);
+    LoadReserveGranule(e, e.x3);
+    e.ldar(e.w3, ptr(e.x2));
+    e.str(e.w3, ptr(bctx, static_cast<uint32_t>(offsetof(
+                              A64BackendContext, reserve_generation))));
+  }
   auto addr = ComputeMemoryAddress(e, guest);
   e.ldr(dest, ptr(e.GetMembaseReg(), addr));
 }

@@ -2466,6 +2466,27 @@ void GuestScheduler::ReportNoProgress() {
           uint32_t(kpcr->current_irql),
           uint32_t(context->preempt_requested),
           cpu.ready_summary.load(std::memory_order_relaxed));
+      // The guest code the running fiber loops in and a few registers, so a
+      // stuck boot can be read offline (image code is always mapped).
+      auto dump_code = [&](const char* name, uint32_t center) {
+        if (center < 0x82000000u || center >= 0x90000000u) {
+          return;
+        }
+        std::string words;
+        const uint32_t start = (center - 0x60) & ~3u;
+        for (uint32_t a = start; a < center + 0x40; a += 4) {
+          words += fmt::format(
+              " {:08X}", uint32_t(*context->TranslateVirtualBE<uint32_t>(a)));
+        }
+        XELOGW("    code near {} {:08X}:{}", name, start, words);
+      };
+      dump_code("safepoint", uint32_t(context->last_safepoint_pc));
+      dump_code("lr", uint32_t(context->lr));
+      std::string regs;
+      for (int r = 0; r < 32; ++r) {
+        regs += fmt::format(" r{}={:X}", r, uint32_t(context->r[r]));
+      }
+      XELOGW("    regs:{} ctr={:X}", regs, uint32_t(context->ctr));
     } else {
       XELOGW("  CPU {} idle, ready_summary={:#x}", i,
              cpu.ready_summary.load(std::memory_order_relaxed));

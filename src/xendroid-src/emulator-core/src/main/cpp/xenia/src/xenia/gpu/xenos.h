@@ -1136,6 +1136,11 @@ inline float GpuSwap(float value, Endian endianness) {
 inline uint32_t GpuToCpu(uint32_t p) { return p; }
 
 inline uint32_t CpuToGpu(uint32_t p) { return p & 0x1FFFFFFF; }
+// Vertex fetch constants may carry the upper address bits (0xC0000000 views
+// of physical memory); the GPU uses only the low 29 bits of the byte address.
+inline uint32_t VertexFetchPhysicalAddress(uint32_t address_dwords) {
+  return (address_dwords << 2) & 0x1FFFFFFF;
+}
 
 // XE_GPU_REG_SHADER_CONSTANT_LOOP_*
 union alignas(uint32_t) LoopConstant {
@@ -1191,6 +1196,10 @@ constexpr uint32_t kTextureSubresourceAlignmentBytes =
 // Texture fetch constant size field widths.
 constexpr uint32_t kTexture1DMaxWidthLog2 = 24;
 constexpr uint32_t kTexture1DMaxWidth = 1 << kTexture1DMaxWidthLog2;
+// Limit the number of rows materialized when wide 1D textures are mapped to
+// 2D. Some games use very large widths with much less data behind them
+// (555308CE: an 8M-texel bone buffer, of which only the start is used).
+constexpr uint32_t kTexture1DWideMaxRows = 32;
 constexpr uint32_t kTexture2DCubeMaxWidthHeightLog2 = 13;
 constexpr uint32_t kTexture2DCubeMaxWidthHeight =
     1 << kTexture2DCubeMaxWidthHeightLog2;

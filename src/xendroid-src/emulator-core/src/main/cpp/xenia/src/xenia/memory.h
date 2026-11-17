@@ -236,6 +236,9 @@ class BaseHeap {
   // caller reads the memory (its lock is released before that), without
   // contending with the guest threads for the global critical region.
   bool IsPageReadableRelaxed(uint32_t address) const;
+  // OR of the kMemoryProtect* bits of the pages of [address, address + length),
+  // read without the global lock (callers hold it or tolerate a race).
+  uint32_t RangeProtectRelaxed(uint32_t address, uint32_t length) const;
 
   // Locked, bounded prefix check equivalent to the resolve predicate using
   // QueryRegionInfo for nonzero lengths. Preserves its unaligned-address
@@ -422,8 +425,18 @@ class PhysicalHeap : public BaseHeap {
         access = xe::memory::PageAccess::kReadOnly;
       }
     }
+    if (access == xe::memory::PageAccess::kNoAccess) {
+      return AliasGuestAccess(system_page_number);
+    }
     return access;
   }
+  // Physical memory is host-mapped read/write in all three views (A0/C0/E0),
+  // whichever one allocated it, and titles do reach an allocation through
+  // another view (Assassin's Creed Rogue: allocated at BFxxxxxx, used at
+  // DFxxxxxx). A page this view's table calls unallocated therefore has the
+  // access of the physical page behind it, so write watches get armed on this
+  // view too and a store through the alias is seen like any other.
+  xe::memory::PageAccess AliasGuestAccess(uint32_t system_page_number) const;
 
  protected:
   VirtualHeap* parent_heap_;
@@ -782,6 +795,7 @@ class Memory {
     VirtualHeap v90000000;
 
     VirtualHeap physical;
+    PhysicalHeap v7F000000;
     PhysicalHeap vA0000000;
     PhysicalHeap vC0000000;
     PhysicalHeap vE0000000;

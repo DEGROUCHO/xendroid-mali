@@ -264,7 +264,10 @@ bool VulkanPipelineCache::Initialize() {
         vulkan_device->properties();
     DynamicStateCapabilities& caps = dynamic_state_capabilities_;
     caps = DynamicStateCapabilities();
+    // Compatibility rendering is the conservative path: state baked into
+    // pipelines (correct on every driver) instead of extended dynamic state.
     if (cvars::vulkan_dynamic_pipeline_state &&
+        !cvars::vulkan_compatibility_rendering &&
         !edram_fragment_shader_interlock &&
         device_properties.extendedDynamicState) {
       caps.extended_dynamic_state = true;
@@ -281,6 +284,8 @@ bool VulkanPipelineCache::Initialize() {
           device_properties
               .extendedDynamicState3PrimitiveTopologyUnrestricted;
     }
+    XELOGI("VulkanPipelineCache: extended dynamic state {}",
+           caps.extended_dynamic_state ? "on" : "off");
     caps.fragment_shading_rate =
         cvars::vulkan_fragment_shading_rate_dynamic &&
         !cvars::vulkan_compatibility_rendering &&
@@ -2801,6 +2806,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
           VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
                       uint32_t(description.stencil_back_compare_op));
     }
+    // The masks are always dynamic here, so the spec ignores these values, but
+    // Arm drivers before r43 break the dynamic write mask with discard / alpha
+    // to coverage when the static one is 0 (ANGLE
+    // useNonZeroStencilWriteMaskStaticState).
+    depth_stencil_state.front.compareMask = 0xFF;
+    depth_stencil_state.front.writeMask = 0xFF;
+    depth_stencil_state.back.compareMask = 0xFF;
+    depth_stencil_state.back.writeMask = 0xFF;
   }
 
   VkPipelineColorBlendStateCreateInfo color_blend_state = {};

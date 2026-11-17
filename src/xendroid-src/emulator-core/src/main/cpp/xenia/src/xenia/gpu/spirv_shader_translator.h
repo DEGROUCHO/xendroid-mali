@@ -45,7 +45,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 19;
+    static constexpr uint32_t kVersion = 22;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,

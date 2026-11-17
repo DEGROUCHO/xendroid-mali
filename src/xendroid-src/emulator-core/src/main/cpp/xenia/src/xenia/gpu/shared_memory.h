@@ -14,6 +14,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -264,6 +265,17 @@ class SharedMemory {
   static constexpr uint32_t kGpuWrittenPartialRanges = 4;
   uint32_t GpuWrittenPageRanges(
       uint32_t address, std::pair<uint32_t, uint32_t>* ranges_out) const;
+  // Calls copy(first, end) for each maximal byte span of [start, start +
+  // length) whose newest data the GPU wrote (GPU-written pages, and only the
+  // GPU's bytes of partly written ones), holding the global lock throughout so
+  // a CPU store - which faults and clears the page's bit under that lock -
+  // cannot land between the check and the copy. Spans the CPU wrote after the
+  // GPU are skipped: copying the buffer over them would revert newer CPU data.
+  // Returns false if a copy failed; skipped_pages counts CPU-owned pages.
+  bool ForEachGpuWrittenSpan(
+      uint32_t start, uint32_t length,
+      const std::function<bool(uint32_t first, uint32_t end)>& copy,
+      uint32_t* skipped_pages = nullptr) const;
   // Whether any 4 KiB page intersecting the range has ever been written by
   // the GPU during this SharedMemory lifetime. The history is monotonic and
   // is not cleared when CPU writes invalidate or upload a page. Returns true

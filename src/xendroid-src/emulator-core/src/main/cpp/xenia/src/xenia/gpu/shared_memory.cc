@@ -1963,6 +1963,50 @@ uint32_t SharedMemory::GpuWrittenPageRanges(
   return it->second.count;
 }
 
+bool SharedMemory::ForEachGpuWrittenSpan(
+    uint32_t start, uint32_t length,
+    const std::function<bool(uint32_t first, uint32_t end)>& copy,
+    uint32_t* skipped_pages) const {
+  if (skipped_pages) *skipped_pages = 0;
+  if (!length || start >= kBufferSize) return true;
+  length = std::min(length, kBufferSize - start);
+  const uint32_t end = start + length;
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  bool ok = true;
+  uint32_t run_first = 0, run_end = 0;
+  auto flush = [&]() {
+    if (run_end > run_first && !copy(run_first, run_end)) ok = false;
+    run_first = run_end = 0;
+  };
+  for (uint32_t page_start = start & ~(page_size - 1); page_start < end;
+       page_start += page_size) {
+    const uint32_t page = page_start >> page_size_log2_;
+    if (!((system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) &
+          1)) {
+      flush();
+      if (skipped_pages) ++*skipped_pages;
+      continue;
+    }
+    std::pair<uint32_t, uint32_t> ranges[kGpuWrittenPartialRanges];
+    const uint32_t count = GpuWrittenPageRanges(page_start, ranges);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t first = std::max(ranges[i].first, start);
+      const uint32_t last = std::min(ranges[i].second, end);
+      if (first >= last) continue;
+      if (run_end > run_first && first == run_end) {
+        run_end = last;
+      } else {
+        flush();
+        run_first = first;
+        run_end = last;
+      }
+    }
+  }
+  flush();
+  return ok;
+}
+
 bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) const {
   if (!length) {
     return false;

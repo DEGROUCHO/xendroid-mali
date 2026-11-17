@@ -58,7 +58,8 @@ class VulkanSharedMemory : public SharedMemory {
   // buffer; with wait, also completes the GPU work so the CPU can read them.
   void PublishDepthSurface(uint32_t start, uint32_t length, uint64_t geometry,
                            std::function<bool(bool wait)> materialize,
-                           std::function<void()> discard);
+                           std::function<void()> discard,
+                           uint64_t uma_submission = 0);
   // A resolve rewriting exactly the bytes of a pending, unrequested record
   // makes its materialization dead: retire it without any GPU work.
   bool DiscardOverwrittenDepthSurface(uint32_t start, uint32_t length,
@@ -67,6 +68,18 @@ class VulkanSharedMemory : public SharedMemory {
   // the pending, unrequested records inside it dead too, whatever their
   // geometry. Returns how many were retired.
   uint32_t DiscardDepthSurfacesWithin(uint32_t start, uint32_t length);
+  // UMA resolve readback on demand: the buffer already holds the resolved
+  // bytes; the guest RAM copy is deferred to the first CPU access of the
+  // range, which waits only if `submission` has not completed yet. A record
+  // already covering the range is reused (its submission bumped). Returns
+  // false when the range overlaps another provider record or the cap is hit -
+  // the caller keeps its eager readback then.
+  bool PublishUmaResolve(uint32_t start, uint32_t length, uint64_t submission);
+  struct UmaProviderStats {
+    uint64_t published = 0, reused = 0, refused = 0;
+    uint64_t cpu_copies = 0, cpu_waits = 0, copied_bytes = 0;
+  };
+  UmaProviderStats TakeUmaProviderStats();
   bool IsRangeValidInSurface(uint32_t start, uint32_t length) const override;
   // for_gpu: the bytes are needed by GPU work recorded next (resolves, draws,
   // uploads) - the compute goes in the stream with no wait and no copy to
@@ -219,6 +232,13 @@ class VulkanSharedMemory : public SharedMemory {
   // the GPU stream, their pages stay protected until a real CPU access.
   bool ReadHostMapped(uint32_t guest_address, uint32_t length,
                       void* dest, bool gpu_ordered = false);
+  // Resolve readback into guest RAM of only the bytes whose newest data the GPU
+  // wrote (ForEachGpuWrittenSpan): pages the CPU wrote since the resolve keep
+  // the CPU's data instead of being reverted to the buffer's copy.
+  bool ReadHostMappedGpuWritten(uint32_t guest_address, uint32_t length,
+                                bool gpu_ordered, uint32_t* skipped_pages);
+  // ReadHostMapped without materializing pending depth surfaces first.
+  bool ReadHostMappedRaw(uint32_t guest_address, uint32_t length, void* dest);
   // Save states capture guest RAM. Pages whose newest data a resolve wrote
   // exist only in this buffer (without zero-copy): copy them into guest RAM
   // first. Must be called with the GPU idle. Returns false if a GPU-written
@@ -258,7 +278,11 @@ class VulkanSharedMemory : public SharedMemory {
     // doesn't yet.
     bool gpu_materialized = false;
     bool requested = false;
+    // Non-zero: an UMA resolve record - the buffer already holds the bytes,
+    // the CPU copy waits for this submission only.
+    uint64_t uma_submission = 0;
   };
+  UmaProviderStats uma_provider_stats_;
   // Only the CP retires records. CPU waiters never hold a vector reference
   // while unlocked, and rescan after every wake before permitting access.
   std::vector<DepthSurfaceSnapshot> depth_surfaces_;
@@ -282,6 +306,11 @@ class VulkanSharedMemory : public SharedMemory {
   // publish, shrinks when the publish drops retired records.
   uint32_t depth_pending_lo_ = UINT32_MAX;
   uint32_t depth_pending_hi_ = 0;
+  // PublishDepthSurface with the global critical region already held.
+  void PublishSurfaceLocked(uint32_t start, uint32_t length, uint64_t geometry,
+                            std::function<bool(bool wait)> materialize,
+                            std::function<void()> discard,
+                            uint64_t uma_submission);
   void AwaitDepthSurfaces(global_unique_lock_type& lock,
                           uint32_t start, uint32_t length);
   static void DepthReadCallback(void* context, global_unique_lock_type& lock,

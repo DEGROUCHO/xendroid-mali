@@ -205,6 +205,13 @@ DEFINE_bool(vulkan_resolve_texture_copy_partial, true,
             "of the texture is up to date, instead of reloading the whole "
             "texture from guest memory.",
             "GPU");
+DEFINE_bool(vulkan_texture_expand_float32, true,
+            "Load the k_16_EXPAND, k_16_16_EXPAND and k_16_16_16_16_EXPAND "
+            "textures as 32-bit floats. Their Xenos halves have no infinity "
+            "or NaN (exponent 31 is a normal number up to 131008), which "
+            "host half floats turn into infinity/NaN (for example world-space "
+            "bone matrices stretched into black spikes).",
+            "GPU");
 DEFINE_bool(vulkan_resolve_texture_copy_norm16, false,
             "With vulkan_resolve_texture_copy, also fill k_16_16 and "
             "k_16_16_16_16 textures that the device samples as half floats "
@@ -287,6 +294,9 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rg16_unorm_float_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rg16_unorm_float_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_snorm_float_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_r16_xenos_half_float32_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rg16_xenos_half_float32_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_xenos_half_float32_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_snorm_float_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_unorm_float_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_unorm_float_scaled_cs.h"
@@ -5065,6 +5075,31 @@ bool VulkanTextureCache::Initialize() {
        host_format_16_16_16_16.format_signed.format ==
            VK_FORMAT_R16G16B16A16_SFLOAT);
 
+  if (cvars::vulkan_texture_expand_float32) {
+    // Xenos halves of the _EXPAND formats -> exact float32 (see the cvar).
+    const struct {
+      xenos::TextureFormat format;
+      LoadShaderIndex load_shader;
+      VkFormat host_format;
+    } kExpandFormats[] = {
+        {xenos::TextureFormat::k_16_EXPAND,
+         kLoadShaderIndexR16XenosHalfToFloat32, VK_FORMAT_R32_SFLOAT},
+        {xenos::TextureFormat::k_16_16_EXPAND,
+         kLoadShaderIndexRG16XenosHalfToFloat32, VK_FORMAT_R32G32_SFLOAT},
+        {xenos::TextureFormat::k_16_16_16_16_EXPAND,
+         kLoadShaderIndexRGBA16XenosHalfToFloat32,
+         VK_FORMAT_R32G32B32A32_SFLOAT},
+    };
+    for (const auto& expand : kExpandFormats) {
+      HostFormatPair& pair = host_formats_[uint32_t(expand.format)];
+      pair.format_unsigned.load_shader = expand.load_shader;
+      pair.format_unsigned.format = expand.host_format;
+      pair.format_signed.load_shader = expand.load_shader;
+      pair.format_signed.format = expand.host_format;
+      pair.unsigned_signed_compatible = true;
+    }
+  }
+
   // Normalize format information structures.
   for (size_t i = 0; i < xe::countof(host_formats_); ++i) {
     HostFormatPair& host_format = host_formats_[i];
@@ -5401,6 +5436,15 @@ bool VulkanTextureCache::Initialize() {
   load_shader_code[kLoadShaderIndexRGBA16SNormToFloat] =
       std::make_pair(shaders::texture_load_rgba16_snorm_float_cs,
                      sizeof(shaders::texture_load_rgba16_snorm_float_cs));
+  load_shader_code[kLoadShaderIndexR16XenosHalfToFloat32] = std::make_pair(
+      shaders::texture_load_r16_xenos_half_float32_cs,
+      sizeof(shaders::texture_load_r16_xenos_half_float32_cs));
+  load_shader_code[kLoadShaderIndexRG16XenosHalfToFloat32] = std::make_pair(
+      shaders::texture_load_rg16_xenos_half_float32_cs,
+      sizeof(shaders::texture_load_rg16_xenos_half_float32_cs));
+  load_shader_code[kLoadShaderIndexRGBA16XenosHalfToFloat32] = std::make_pair(
+      shaders::texture_load_rgba16_xenos_half_float32_cs,
+      sizeof(shaders::texture_load_rgba16_xenos_half_float32_cs));
   load_shader_code[kLoadShaderIndexDXT1ToRGBA8] =
       std::make_pair(shaders::texture_load_dxt1_rgba8_cs,
                      sizeof(shaders::texture_load_dxt1_rgba8_cs));

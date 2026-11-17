@@ -37,6 +37,13 @@ DEFINE_bool(
     "take, be exercised on such a device; expect the errata's artifacts.",
     "Vulkan");
 
+DEFINE_string(
+    vulkan_mali_driver_override, "",
+    "Diagnostic: treat the Arm Mali driver as this release (\"r43p0\"; add "
+    "\"-jm\" for a Job Manager GPU) so the workarounds for older drivers are "
+    "taken and can be verified on a newer one.",
+    "Vulkan");
+
 DEFINE_int32(
     vulkan_clamp_storage_buffer_range, 0,
     "If > 0, clamp the reported maxStorageBufferRange to this many bytes. "
@@ -1174,13 +1181,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // there too), e.g. erratum 3786926 (r49p1-r51p0): vkCmdBeginRendering
       // reuses stale internal resources (black tiles). Arm's workaround is
       // static render passes. driverInfo looks like "v1.r49p1-03bet0.<hash>".
+      // vulkan_mali_driver_override ("r43p0", "r46p0-jm") makes a new driver
+      // take every old-driver workaround path, so they can be verified.
+      const std::string& mali_override = cvars::vulkan_mali_driver_override;
+      const char* mali_info = mali_override.empty()
+                                  ? properties_1_2_KHR_driver_properties.driverInfo
+                                  : mali_override.c_str();
+      if (!mali_override.empty()) {
+        XELOGW("Mali driver overridden as \"{}\" (diagnostic)", mali_override);
+        device->properties_.maliJobManager =
+            mali_override.find("-jm") != std::string::npos;
+      }
       unsigned r = 0, p = 0;
-      for (const char* s = properties_1_2_KHR_driver_properties.driverInfo;
-           *s; ++s) {
+      for (const char* s = mali_info; *s; ++s) {
         if (*s == 'r' && std::sscanf(s, "r%up%u", &r, &p) == 2) {
           mali_dynamic_rendering_erratum =
               r < 52 && !cvars::vulkan_mali_dynamic_rendering_erratum_ignore;
           device->properties_.maliDriverRelease = r;
+          device->properties_.maliDriverPatch = p;
           break;
         }
       }
@@ -1497,6 +1515,30 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_gpu_emulation) {
     device->properties_.extendedDynamicState =
         properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+    // Arm proprietary drivers: multiple extended dynamic state bugs fixed in
+    // r44p1, and regressions on Job Manager GPUs (Bifrost, Valhall up to G78)
+    // in r46-r50 fixed in r51 - same gate as ANGLE
+    // (isARMExtendedDynamicStateBuggy, issuetracker.google.com/336411904).
+    // Without it every state lives in the pipeline, which is always correct.
+    // An unparsed Arm driver version is treated as old.
+    if (device->properties_.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+        device->properties_.extendedDynamicState) {
+      const Properties& dp = device->properties_;
+      bool job_manager = dp.maliJobManager || dp.maxDrawIndirectCount <= 1;
+      uint32_t rp = dp.maliDriverRelease * 100 + dp.maliDriverPatch;
+      bool eds_buggy =
+          rp < 4401 || (job_manager && dp.maliDriverRelease >= 46 &&
+                        dp.maliDriverRelease < 51);
+      device->properties_.maliJobManager = job_manager;
+      if (eds_buggy) {
+        device->properties_.extendedDynamicState = false;
+        XELOGI(
+            "Mali r{}p{} ({}): extended dynamic state disabled (driver "
+            "errata), state baked into pipelines",
+            dp.maliDriverRelease, dp.maliDriverPatch,
+            job_manager ? "Job Manager" : "CSF");
+      }
+    }
     if (device->properties_.extendedDynamicState) {
       XELOGI("* extendedDynamicState (core 1.3)");
     }

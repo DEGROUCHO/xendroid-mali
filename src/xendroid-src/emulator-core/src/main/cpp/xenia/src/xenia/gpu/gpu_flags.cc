@@ -324,10 +324,43 @@ UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 15, 2, false);
 // Most Wanted and Assassin's Creed lost everything below the first strip.
 UPDATE_from_bool(gpu_untile_predicated_tiling, 2026, 11, 15, 4, true);
 
+DEFINE_bool(readback_resolve_uma_skip_cpu_written, true,
+            "uma readback copies into guest RAM only the bytes whose newest "
+            "data the GPU wrote: pages the CPU wrote since the resolve (memory "
+            "reused for CPU data) keep the CPU's data instead of being reverted "
+            "to the buffer's older copy (Assassin's Creed Rogue crash).",
+            "GPU");
+
 DEFINE_bool(readback_resolve_sync, true,
             "Stall the GPU after each readback_resolve copy so guest RAM is "
             "coherent in "
             "the same frame, instead of copying asynchronously.",
+            "GPU");
+
+DEFINE_bool(readback_resolve_uma_sync, false,
+            "Diagnostic: in uma readback, drain the current resolve and copy "
+            "it on every resolve of a range, instead of reusing the previous "
+            "completed submission. uma normally reads the older resolve on "
+            "later uses; a title that needs the current one (Assassin's Creed "
+            "Rogue: a bitset built by the resolve) sees stale bits.",
+            "GPU");
+
+DEFINE_bool(readback_resolve_uma_provider, true,
+            "In uma readback, later resolves of a range are not copied into "
+            "guest RAM eagerly: the range is protected and the first CPU "
+            "access copies the CURRENT resolve, waiting for the GPU only if "
+            "its submission has not completed. Fixes CPU reads seeing the "
+            "previous resolve (Assassin's Creed Rogue crash) and skips the "
+            "copies of resolves the CPU never reads.",
+            "GPU");
+
+DEFINE_bool(readback_resolve_uma_readwatch, false,
+            "In uma readback, once the CPU has read a resolve destination, "
+            "stop deferring that range and copy the current resolve (draining "
+            "the GPU) on every later resolve of it. Ranges the CPU never reads "
+            "keep the cheap deferred path. General fix for CPU-read resolves "
+            "seeing the previous resolve's bytes (Assassin's Creed Rogue "
+            "crash); not a per-title quirk.",
             "GPU");
 
 DEFINE_bool(gpu_resolve_watch_fastpath, true,

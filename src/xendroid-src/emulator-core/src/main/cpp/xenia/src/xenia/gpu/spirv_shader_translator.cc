@@ -299,7 +299,8 @@ SpirvShaderTranslator::Features::Features(
       samples_as_pixels_coarse(
           cvars::vulkan_msaa_2x2_pixel_rate &&
           cvars::vulkan_fragment_shading_rate_dynamic &&
-          !cvars::vulkan_compatibility_rendering &&
+          !(cvars::vulkan_compatibility_rendering ||
+            ui::vulkan::mali_auto_compatibility_rendering) &&
           vulkan_device->extensions().ext_KHR_fragment_shading_rate),
       bindless_textures(
           cvars::vulkan_bindless_textures &&
@@ -316,7 +317,8 @@ SpirvShaderTranslator::Features::Features(
       multiply_zero_nan_select(
           cvars::spirv_multiply_zero_nan_select > 0 ||
           (cvars::spirv_multiply_zero_nan_select < 0 &&
-           !cvars::vulkan_compatibility_rendering &&
+           !(cvars::vulkan_compatibility_rendering ||
+            ui::vulkan::mali_auto_compatibility_rendering) &&
            vulkan_device->properties().driverID ==
                VK_DRIVER_ID_ARM_PROPRIETARY &&
            vulkan_device->properties().maliDriverRelease >= 49 &&

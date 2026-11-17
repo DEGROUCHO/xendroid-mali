@@ -354,7 +354,7 @@ private fun GlobalsEditor(
             Switch(checked = globals.enabled, onCheckedChange = { v -> mutate { it.copy(enabled = v) } })
         }
         Text(l10n("Opacity: ${(globals.opacity * 100).roundToInt()}%", "Opacità: ${(globals.opacity * 100).roundToInt()}%"))
-        Slider(value = globals.opacity, valueRange = 0.2f..1.0f,
+        Slider(value = globals.opacity, valueRange = 0.05f..1.0f,
             onValueChange = { v -> mutate { it.copy(opacity = v) } })
         Text(l10n("Auto-hide: ${globals.autoHideSeconds.roundToInt()}s (0 = off)", "Nascondi automaticamente: ${globals.autoHideSeconds.roundToInt()}s (0 = disattivato)"))
         Slider(value = globals.autoHideSeconds, valueRange = 0f..20f,

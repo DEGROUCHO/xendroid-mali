@@ -2066,7 +2066,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 scaleAllControls(1f / 1.1f)
             },
             QmSlider(l10n("Opacity", "Opacità"), l10n("How visible the controls are", "Quanto si vedono i comandi"), QmIcons.Opacity,
-                g.opacity, 0.2f, 1f, 0.05f, pct(g.opacity)) { v ->
+                g.opacity, 0.05f, 1f, 0.05f, pct(g.opacity)) { v ->
                 updateGamepadGlobals { it.copy(opacity = v) }
             },
             QmSlider(l10n("Auto-hide", "Nascondi da soli"), l10n("They fade after this time without touches", "Svaniscono dopo questo tempo senza tocchi"),

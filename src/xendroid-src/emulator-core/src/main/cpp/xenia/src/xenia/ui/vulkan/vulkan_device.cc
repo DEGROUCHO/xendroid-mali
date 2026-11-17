@@ -1202,6 +1202,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           break;
         }
       }
+      // r44 (Mali-G615 r44p1): the guest image is black unless extended
+      // dynamic state, the render target shortcuts and the dynamic shading
+      // rate are all off - compatibility rendering without extended dynamic
+      // state still drew black (1.0.0), with it the picture is right (1.0.2).
+      if (r == 44 && with_gpu_emulation) {
+        mali_auto_compatibility_rendering = true;
+        XELOGI("Mali r{}p{}: compatibility rendering on (black image otherwise)",
+               r, p);
+      }
       if (mali_dynamic_rendering_erratum) {
         XELOGI("Mali r{}p{}: using render passes instead of dynamic rendering",
                r, p);

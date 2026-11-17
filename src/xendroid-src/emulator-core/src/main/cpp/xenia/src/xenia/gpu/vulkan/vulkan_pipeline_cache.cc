@@ -267,7 +267,7 @@ bool VulkanPipelineCache::Initialize() {
     // Compatibility rendering is the conservative path: state baked into
     // pipelines (correct on every driver) instead of extended dynamic state.
     if (cvars::vulkan_dynamic_pipeline_state &&
-        !cvars::vulkan_compatibility_rendering &&
+        !CompatibilityRendering() &&
         !edram_fragment_shader_interlock &&
         device_properties.extendedDynamicState) {
       caps.extended_dynamic_state = true;
@@ -288,7 +288,7 @@ bool VulkanPipelineCache::Initialize() {
            caps.extended_dynamic_state ? "on" : "off");
     caps.fragment_shading_rate =
         cvars::vulkan_fragment_shading_rate_dynamic &&
-        !cvars::vulkan_compatibility_rendering &&
+        !CompatibilityRendering() &&
         !edram_fragment_shader_interlock &&
         vulkan_device->extensions().ext_KHR_fragment_shading_rate;
     if (cvars::vulkan_fragment_shading_rate_dynamic) {

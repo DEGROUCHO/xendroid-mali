@@ -21,6 +21,10 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+// Compatibility rendering forced by the driver (Arm r44, see vulkan_device.cc),
+// on top of the vulkan_compatibility_rendering cvar.
+inline bool mali_auto_compatibility_rendering = false;
+
 class VulkanDevice {
  public:
   // log_vk_memory: live Vulkan device memory by allocation site.

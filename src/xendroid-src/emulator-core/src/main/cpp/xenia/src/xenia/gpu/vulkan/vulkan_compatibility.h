@@ -10,6 +10,7 @@
 #define XENIA_GPU_VULKAN_VULKAN_COMPATIBILITY_H_
 
 #include "xenia/base/cvar.h"
+#include "xenia/ui/vulkan/vulkan_device.h"
 
 DECLARE_bool(vulkan_compatibility_rendering);
 
@@ -22,8 +23,12 @@ namespace vulkan {
 // in-pass transfers) are on only while vulkan_compatibility_rendering is off.
 // Some drivers (Mali-G615 r44p1) output a black image with them; with the
 // switch on, resolves take the plain compute path.
+inline bool CompatibilityRendering() {
+  return cvars::vulkan_compatibility_rendering ||
+         ui::vulkan::mali_auto_compatibility_rendering;
+}
 inline bool RenderTargetShortcut(bool cvar_value) {
-  return cvar_value && !cvars::vulkan_compatibility_rendering;
+  return cvar_value && !CompatibilityRendering();
 }
 
 }  // namespace vulkan

@@ -10,6 +10,7 @@
 #include "xenia/gpu/shader_translator.h"
 
 #include <cstdarg>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -42,7 +43,18 @@ using namespace ucode;
 // and dumps of d3dcompiler and games: https://pastebin.com/i4kAv7bB
 
 void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
-  if (is_ucode_analyzed_) {
+  if (is_ucode_analyzed_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // Pipeline creation threads analyze shaders on their own while the command
+  // processor thread analyzes and translates the shader storage, all with the
+  // same disassembly buffer. Without the lock a second analysis of a shader
+  // could reset its results (float constant count, register bound) while a
+  // translation of the first one reads them: a 0 count leaves the constant or
+  // register storage uncreated and the translator crashes on it.
+  static std::mutex analyze_mutex;
+  std::lock_guard<std::mutex> analyze_lock(analyze_mutex);
+  if (is_ucode_analyzed_.load(std::memory_order_relaxed)) {
     return;
   }
 
@@ -388,7 +400,7 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
     }
   }
 
-  is_ucode_analyzed_ = true;
+  is_ucode_analyzed_.store(true, std::memory_order_release);
 
   // An empty shader can be created internally by shader translators as a dummy,
   // don't dump it.

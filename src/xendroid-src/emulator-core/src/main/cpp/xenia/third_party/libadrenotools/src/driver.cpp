@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // Copyright © 2021 Billy Laws
 
+#include <cerrno>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -193,7 +194,7 @@ bool adrenotools_validate_gpu_mapping(void *handle) {
     return importMapping->gpu_addr == ADRENOTOOLS_GPU_MAPPING_SUCCEEDED_MAGIC;
 }
 
-void adrenotools_set_turbo(bool turbo) {
+bool adrenotools_set_turbo(bool turbo) {
     uint32_t enable{turbo ? 0U : 1U};
     kgsl_device_getproperty prop{
         .type = KGSL_PROP_PWRCTRL,
@@ -203,8 +204,11 @@ void adrenotools_set_turbo(bool turbo) {
 
     int kgslFd{open("/dev/kgsl-3d0", O_RDWR)};
     if (kgslFd < 0)
-        return;
+        return false;
 
-    ioctl(kgslFd, IOCTL_KGSL_SETPROPERTY, &prop);
+    int result{ioctl(kgslFd, IOCTL_KGSL_SETPROPERTY, &prop)};
+    int error{errno};
     close (kgslFd);
+    errno = error;
+    return result == 0;
 }

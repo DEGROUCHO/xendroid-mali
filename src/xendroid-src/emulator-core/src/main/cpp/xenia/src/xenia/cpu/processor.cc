@@ -200,6 +200,27 @@ void Processor::RemoveModule(const std::string_view name) {
   }
 }
 
+void Processor::RemoveModule(const Module* module) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  auto itr =
+      std::find_if(modules_.cbegin(), modules_.cend(),
+                   [module](std::unique_ptr<xe::cpu::Module> const& entry) {
+                     return entry.get() == module;
+                   });
+
+  if (itr != modules_.cend()) {
+    const std::vector<uint32_t> addressed_functions =
+        (*itr)->GetAddressedFunctions();
+
+    modules_.erase(itr);
+
+    for (const uint32_t entry : addressed_functions) {
+      RemoveFunctionByAddress(entry);
+    }
+  }
+}
+
 Module* Processor::GetModule(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
   for (const auto& module : modules_) {

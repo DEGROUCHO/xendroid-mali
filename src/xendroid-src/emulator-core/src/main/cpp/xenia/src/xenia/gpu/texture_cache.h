@@ -219,10 +219,10 @@ class TextureCache {
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
+  // For an invalid binding, the constant components of the fetch constant's
+  // destination swizzle, the others 0 (see RequestTextures).
   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
-    const TextureBinding* binding =
-        GetValidTextureBinding(fetch_constant_index);
-    return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
+    return texture_bindings_[fetch_constant_index].host_swizzle;
   }
   uint8_t GetActiveTextureSwizzledSigns(uint32_t fetch_constant_index) const {
     const TextureBinding* binding =
@@ -416,8 +416,17 @@ class TextureCache {
     }
     bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock,
                               bool allow_surface = false);
+    // Republish only the base level or only the mips (after a resolve copy
+    // filled exactly that part of the host image).
+    bool MakePartUpToDateAndWatch(const global_unique_lock_type& global_lock,
+                                  bool mips);
 
     void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip);
+    // Incremented by every base-level watch callback (any write to the base).
+    uint32_t base_invalidation_epoch() const { return base_invalidation_epoch_; }
+    // Keep watching an outdated base (without making it current), so writes
+    // to it still advance base_invalidation_epoch.
+    void WatchOutdatedBase(const global_unique_lock_type& global_lock);
     // Diagnostic: drop the watches and mark both levels outdated.
     void ForceOutdated() {
       if (base_watch_handle_) {
@@ -487,6 +496,7 @@ class TextureCache {
     bool mips_outdated_ = false;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
+    uint32_t base_invalidation_epoch_ = 0;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
 

@@ -45,7 +45,7 @@
 </p>
 
 > [!NOTE]
-> **New in 1.0.1:** games now **fill the whole screen automatically** on phones (no black bars on 20:9 screens), with a new **Settings → Display → Picture format** option (Original, Zoom, Stretch, 16:9, 4:3); **Need for Speed: Most Wanted** and **Assassin's Creed** draw their whole 3D scene again (1.0.0 showed only the upper part). 1.0.0 brought **up to 4 players**, **Black Ops** at 44–46 fps and a second fix for the **Mali-G615** black screen.
+> **New in 1.0.4:** **Halo: Reach is back to a locked 30 fps**, games with a **title update** start again, **Modern Warfare 2** textures and save states are fixed, plus many stability fixes. Update in place: games, settings and save states are kept.
 
 <br>
 
@@ -458,8 +458,11 @@ The lab scripts were written for one phone and one build machine. Read them as r
 | 10 Nov 2026 | q664 | **FIFA 16** player physics and black pitch fixed; **Dead or Alive Xtreme 2** no longer hangs on its menu: shaders with branches and loops are translated without the big dispatch loop that sent the Mali shader compiler into minutes-long compiles; a pipeline the driver never finishes no longer blacks out the next boots; cleaner XMA audio decoding; Battlefield 2: Modern Combat ground fix (needs player confirmation) |
 | 14 Nov 2026 | **1.0.0** | **Up to 4 players** with their own controllers and rumble; the **whole picture** on screens wider than 16:9 (no more 5% cut at the top and bottom); **Black Ops +15%** (faster CPU recompiler: short branchy functions inlined, no slowdown with savestates on); **GTA IV** split-screen tiling drawn once (−33% draws); second fix for the **Mali-G615** black screen; XMA audio and I/O completion fixes from upstream |
 | 15 Nov 2026 | **1.0.1** | Games **fill the whole screen automatically** (phones up to 21:9; tablets and 4:3 games keep their shape); new **Picture format** setting; **Need for Speed: Most Wanted** (16:9) and **Assassin's Creed** missing 3D fixed (the GTA IV tiling speed-up is now GTA IV only); logs now tell whether a black screen comes from rendering or from presenting |
+| 17 Nov 2026 | **1.0.2** | **Assassin's Creed Rogue** crash and spiky models fixed; exact half-float textures; safer on older Mali drivers with known errata |
+| 17 Nov 2026 | **1.0.3** | Compatibility rendering turns on by itself on Mali r44 drivers (**black screen on Mali-G615** fixed); on-screen controls opacity down to 5% |
+| 19 Nov 2026 | **1.0.4** | **Halo: Reach back to a locked 30 fps**; games with a **title update** start again; **Modern Warfare 2** textures and save states; Rogue crash fixed; Fable II and Kingdoms of Amalur rendering fixes; recompiler, kernel, timer and audio stability |
 
-Nearly 700 test builds, each measured on the phone before a change was kept.
+Over 750 test builds, each measured on the phone before a change was kept.
 
 </details>
 

@@ -244,8 +244,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // from the immutable R32 image, so no mutable RT lease/COW is needed.
   bool EnsureDepthSurfacePipeline();
   bool EnsureDepthMaterializePipeline();
-  bool EnsureColorSurfacePipeline();
-  bool EnsureColorMaterializePipeline();
+  bool EnsureColorSurfacePipeline(VulkanTextureCache::ColorSurfaceKind kind);
+  bool EnsureColorMaterializePipeline(
+      VulkanTextureCache::ColorSurfaceKind kind);
   bool DrawColorSurfaceResolve(const draw_util::ResolveInfo& info,
                                VulkanTextureCache& texture_cache,
                                const global_unique_lock_type& lock,
@@ -283,12 +284,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout depth_surface_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline depth_surface_pipeline_ = VK_NULL_HANDLE;
   bool depth_surface_pipeline_attempted_ = false;
-  // vulkan_color_surface_resolve: 8_8_8_8 render target -> k_8_8_8_8 texture.
-  VkRenderPass color_surface_render_pass_ = VK_NULL_HANDLE;
+  // vulkan_color_surface_resolve: render target -> texture of the same Vulkan
+  // format (8_8_8_8; with vulkan_color_surface_resolve_wide also 2_10_10_10,
+  // 16_16_FLOAT, 16_16_16_16_FLOAT), per VulkanTextureCache::ColorSurfaceKind.
+  VkRenderPass color_surface_render_pass_
+      [VulkanTextureCache::kColorSurfaceKindCount] = {};
   VkPipelineLayout color_surface_pipeline_layout_ = VK_NULL_HANDLE;
-  VkPipeline color_surface_pipeline_ = VK_NULL_HANDLE;
-  bool color_surface_pipeline_attempted_ = false;
-  VkPipeline color_materialize_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline color_surface_pipeline_
+      [VulkanTextureCache::kColorSurfaceKindCount] = {};
+  bool color_surface_pipeline_attempted_
+      [VulkanTextureCache::kColorSurfaceKindCount] = {};
+  VkPipeline color_materialize_pipeline_
+      [VulkanTextureCache::kColorSurfaceKindCount] = {};
   void RecordDepthSurfaceTextureHit(uint64_t payload) {
     ++depth_surface_stats_.texture_hits;
     depth_surface_stats_.estimated_bytes_saved += int64_t(payload) * 4;
@@ -302,6 +309,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint64_t fallback_schema = 0, fallback_msaa = 0;
     uint64_t fallback_owner = 0, fallback_texture = 0, fallback_resource = 0;
     uint64_t fallback_stencil = 0;
+    uint64_t fallback_cpu_read = 0;
+    uint64_t prefix_discards = 0;
   } depth_surface_stats_;
 
   bool GetResolveInfoForDefer(const Memory& memory,

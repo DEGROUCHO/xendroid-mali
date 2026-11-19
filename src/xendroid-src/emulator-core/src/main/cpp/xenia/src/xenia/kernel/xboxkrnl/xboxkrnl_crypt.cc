@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <tuple>
 
+#include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
+
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
@@ -27,6 +29,7 @@
 
 extern "C" {
 #include "third_party/FFmpeg/libavutil/md5.h"
+#include "third_party/FFmpeg/libavutil/mem.h"
 #include "third_party/FFmpeg/libavutil/sha512.h"
 #include "third_party/aes_128/aes.h"
 }
@@ -127,10 +130,27 @@ static_assert_size(XECRYPT_AES_STATE, 0x160);
 static constexpr uint8_t key14[] = {'0', '1', '2', '3', '4', '5',
                                     '6', '7', '8', '9', '1', '0'};  // string
 
+// Motherboard Serial Number Key, XeFu builds the Xbox 1 HD key from it
+static constexpr uint8_t key15[] = {'0', '1', '2', '3', '4', '5',
+                                    '6', '7', '8', '9', '1', '0'};  // string
+
 // Retail key 0x19
 static constexpr uint8_t key19[] = {0xE1, 0xBC, 0x15, 0x9C, 0x73, 0xB1,
                                     0xEA, 0xE9, 0xAB, 0x31, 0x70, 0xF3,
                                     0xAD, 0x47, 0xEB, 0xF3};
+
+// Devkit key 0x19
+static constexpr uint8_t key19_devkit[] = {0xDA, 0xB6, 0x9A, 0xD9, 0x8E, 0x28,
+                                           0x76, 0x4F, 0x97, 0x7E, 0xE2, 0x48,
+                                           0x7E, 0x4F, 0x3F, 0x68};
+
+const uint8_t* XeKeysGetKeyData(uint32_t idx, bool devkit) {
+  if (idx != 0x19) {
+    return nullptr;
+  }
+
+  return devkit ? key19_devkit : key19;
+}
 
 // Pirs Public Key
 struct XECRYPT_RSAPUB_2048 {
@@ -169,7 +189,7 @@ static constexpr uint8_t key39[] = {                 // pirs_retail_public
 
 const static std::map<uint16_t, std::span<const uint8_t>> key_vault = {
     {0x14, key14},
-    {0x19, key19},
+    {0x15, key15},
     {0x39, key39},
 };
 
@@ -515,13 +535,16 @@ void XeCryptHmacShaInit_entry(pointer_t<XECRYPT_HMACSHA_STATE> sha_state_ptr,
   std::copy_n(key_data_ptr, key_size_, key_1.begin());
   std::copy_n(key_data_ptr, key_size_, key_2.begin());
 
-  for (uint8_t i = 0; i < key_size_; i += 1) {
-    key_1[i] ^= 0x5C5C5C5Cu;
-    key_2[i] ^= 0x36363636u;
+  // The pads cover the whole block, not just the key.
+  for (size_t i = 0; i < key_1.size(); i++) {
+    key_1[i] ^= 0x5C;
+    key_2[i] ^= 0x36;
   }
 
-  XeCryptShaUpdate_entry(sha_state_ptr->sha_state, key_2.data(), key_size_);
-  XeCryptShaUpdate_entry(&sha_state_ptr->sha_state[1], key_1.data(), key_size_);
+  XeCryptShaUpdate_entry(sha_state_ptr->sha_state, key_2.data(),
+                         static_cast<uint32_t>(key_2.size()));
+  XeCryptShaUpdate_entry(&sha_state_ptr->sha_state[1], key_1.data(),
+                         static_cast<uint32_t>(key_1.size()));
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptHmacShaInit, kNone, kImplemented);
 
@@ -562,6 +585,7 @@ void XeCryptMd5_entry(lpvoid_t input_1, dword_t input_1_size, lpvoid_t input_2,
 
   uint8_t digest[16];
   av_md5_final(md5, digest);
+  av_free(md5);
 
   std::copy_n(digest, std::min<size_t>(xe::countof(digest), output_size),
               output.as<uint8_t*>());
@@ -619,6 +643,29 @@ void XeCryptSha256Final_entry(pointer_t<XECRYPT_SHA256_STATE> sha_state,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptSha256Final, kNone, kImplemented);
 
+void XeCryptSha256_entry(lpvoid_t input_1, dword_t input_1_size,
+                         lpvoid_t input_2, dword_t input_2_size,
+                         lpvoid_t input_3, dword_t input_3_size,
+                         lpvoid_t output, dword_t output_size) {
+  sha256::SHA256 sha;
+
+  if (input_1 && input_1_size) {
+    sha.add(input_1, input_1_size);
+  }
+  if (input_2 && input_2_size) {
+    sha.add(input_2, input_2_size);
+  }
+  if (input_3 && input_3_size) {
+    sha.add(input_3, input_3_size);
+  }
+
+  uint8_t hash[32];
+  sha.getHash(hash);
+  std::copy_n(hash, std::min<size_t>(xe::countof(hash), output_size),
+              output.as<uint8_t*>());
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptSha256, kNone, kImplemented);
+
 void XeCryptSha512Init_entry(pointer_t<XECRYPT_SHA512_STATE> sha_state) {
   sha_state.Zero();
 
@@ -656,7 +703,7 @@ void XeCryptSha512Update_entry(pointer_t<XECRYPT_SHA512_STATE> sha_state,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptSha512Update, kNone, kImplemented);
 
-void XeCryptSha512Final_entry(pointer_t<XECRYPT_SHA256_STATE> sha_state,
+void XeCryptSha512Final_entry(pointer_t<XECRYPT_SHA512_STATE> sha_state,
                               pointer_t<uint8_t> out, dword_t out_size) {
   AVSHA512* sha = av_sha512_alloc();
   av_sha512_init(sha, 512);
@@ -711,6 +758,8 @@ void XeCryptMd5Update_entry(pointer_t<XECRYPT_MD5_STATE> md5_state,
   std::copy_n(md5InternalState->block, xe::countof(md5_state->buffer),
               md5_state->buffer);
   md5_state->count = md5InternalState->len;
+
+  av_free(md5);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptMd5Update, kNone, kImplemented);
 
@@ -729,12 +778,27 @@ void XeCryptMd5Final_entry(pointer_t<XECRYPT_MD5_STATE> md5_state,
 
   uint8_t hash[16];
   av_md5_final(md5, hash);
+  av_free(md5);
 
   std::copy_n(hash, std::min<size_t>(xe::countof(hash), out_size),
               static_cast<uint8_t*>(out));
   std::copy(std::begin(hash), std::end(hash), md5_state->buffer);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptMd5Final, kNone, kImplemented);
+
+// Copies forward a dword at a time so an overlapping destination reads back
+// what was just stored.
+void XeCryptBnDw_Copy_entry(lpdword_t source, lpdword_t dest, dword_t count) {
+  if (source.guest_address() == dest.guest_address()) {
+    return;
+  }
+  const xe::be<uint32_t>* src = source;
+  xe::be<uint32_t>* dst = dest;
+  for (uint32_t i = 0; i < count; ++i) {
+    dst[i] = src[i];
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDw_Copy, kNone, kImplemented);
 
 // Byteswaps each 8 bytes
 void XeCryptBnQw_SwapDwQwLeBe_entry(pointer_t<uint64_t> qw_inp,
@@ -758,6 +822,31 @@ dword_result_t XeCryptBnQwNeRsaPubCrypt_entry(pointer_t<uint64_t> qw_a,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwNeRsaPubCrypt, kNone, kImplemented);
 
+// Builds the signature block that XeCryptBnQwBeSigVerify compares against, as a
+// XeCryptBnQwNe number. Based on ExCrypt (github.com/emoose/ExCrypt).
+void XeCryptBnQwBeSigFormat_entry(pointer_t<XECRYPT_SIG> sig, lpvoid_t hash,
+                                  lpvoid_t salt) {
+  // Built as a big-endian number: zero padding, 1, the salt, a hash of the
+  // inputs, then 0xBC
+  uint8_t block[sizeof(XECRYPT_SIG)] = {};
+  block[0xE0] = 1;
+  std::memcpy(&block[0xE1], salt, 0xA);
+  block[0xFF] = 0xBC;
+
+  XeCryptSha_entry(block, 8, hash, 0x14, salt, 0xA, &block[0xEB], 0x14);
+
+  // Everything before the hash is encrypted with it
+  XeCryptRc4_entry(&block[0xEB], 0x14, block, 0xEB);
+  block[0] &= 0x7F;
+
+  // Reverse the qword order
+  uint8_t* out = reinterpret_cast<uint8_t*>(sig.host_address());
+  for (size_t i = 0; i < sizeof(block) / 8; i++) {
+    std::memcpy(out + i * 8, block + sizeof(block) - (i + 1) * 8, 8);
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwBeSigFormat, kNone, kImplemented);
+
 dword_result_t XeCryptBnQwBeSigVerify_entry(pointer_t<XECRYPT_SIG> sig,
                                             lpvoid_t hash, lpstring_t salt,
                                             pointer_t<XECRYPT_RSA> rsa) {
@@ -767,12 +856,67 @@ dword_result_t XeCryptBnQwBeSigVerify_entry(pointer_t<XECRYPT_SIG> sig,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwBeSigVerify, kNone, kStub);
 
+// Builds a PKCS #1 v1.5 signature block for a SHA-1 hash, stored as a
+// little-endian number. format selects the DigestInfo: 0 is the standard
+// one, 1 omits the NULL parameters and 2 leaves it out.
+// Based on ExCrypt (github.com/emoose/ExCrypt).
+static void XeCryptPkcs1Format(const uint8_t* hash, uint32_t format,
+                               uint8_t* sig, uint32_t sig_size) {
+  // Reversed DigestInfo prefixes, each ending with the 0x00 separator
+  static constexpr uint8_t kDigestInfo0[] = {0x14, 0x04, 0x00, 0x05, 0x1A, 0x02,
+                                             0x03, 0x0E, 0x2B, 0x05, 0x06, 0x09,
+                                             0x30, 0x21, 0x30, 0x00};
+  static constexpr uint8_t kDigestInfo1[] = {0x14, 0x04, 0x1A, 0x02, 0x03,
+                                             0x0E, 0x2B, 0x05, 0x06, 0x07,
+                                             0x30, 0x1F, 0x30, 0x00};
+
+  std::memset(sig, 0xFF, sig_size);
+
+  if (sig_size < 39 || sig_size > 512) {
+    return;
+  }
+
+  sig[sig_size - 1] = 0;
+  sig[sig_size - 2] = 1;
+  std::reverse_copy(hash, hash + 0x14, sig);
+
+  switch (format) {
+    case 0:
+      std::ranges::copy(kDigestInfo0, sig + 0x14);
+      break;
+    case 1:
+      std::ranges::copy(kDigestInfo1, sig + 0x14);
+      break;
+    case 2:
+      sig[0x14] = 0;
+      break;
+  }
+}
+
+void XeCryptBnDwLePkcs1Format_entry(lpvoid_t hash, dword_t format, lpvoid_t sig,
+                                    dword_t sig_size) {
+  XeCryptPkcs1Format(hash, format, sig, sig_size);
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDwLePkcs1Format, kNone, kImplemented);
+
 dword_result_t XeCryptBnDwLePkcs1Verify_entry(lpvoid_t hash, lpvoid_t sig,
                                               dword_t size) {
-  // BOOL return value
-  return 1;
+  if (size < 39 || size > 512) {
+    return false;
+  }
+
+  // Byte 0x16 is 0x00 in type 0 and 0x1A in type 1.
+  const uint8_t* sig_data = sig.as<const uint8_t*>();
+  uint32_t format = 0;
+  if (sig_data[0x16] != 0) {
+    format = sig_data[0x16] == 0x1A ? 1 : 2;
+  }
+
+  std::vector<uint8_t> expected(size);
+  XeCryptPkcs1Format(hash, format, expected.data(), size);
+  return std::memcmp(expected.data(), sig_data, size) == 0;
 }
-DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDwLePkcs1Verify, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDwLePkcs1Verify, kNone, kImplemented);
 
 void XeCryptRandom_entry(lpvoid_t buf, dword_t buf_size) {
   std::memset(buf, 0xFD, buf_size);
@@ -798,9 +942,45 @@ void XeCryptDesEcb_entry(pointer_t<XECRYPT_DES_STATE> state_ptr, lpqword_t inp,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptDesEcb, kNone, kImplemented);
 
+void XeCryptDesCbc_entry(pointer_t<XECRYPT_DES_STATE> state_ptr, lpqword_t inp,
+                         dword_t inp_size, lpqword_t out, lpqword_t feed,
+                         dword_t encrypt) {
+  DES des(reinterpret_cast<uint64_t*>(state_ptr->keytab));
+
+  // DES can only do 8-byte chunks at a time!
+  assert_true(inp_size % 8 == 0);
+
+  uint64_t last_block = *feed;
+  for (uint32_t i = 0; i < inp_size / 8; i++) {
+    uint64_t block = inp[i];
+    if (encrypt) {
+      last_block = des.encrypt(block ^ last_block);
+      out[i] = last_block;
+    } else {
+      out[i] = des.decrypt(block) ^ last_block;
+      last_block = block;
+    }
+  }
+
+  *feed = last_block;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptDesCbc, kNone, kImplemented);
+
 // Sets bit 0 to make the parity odd
 void XeCryptDesParity_entry(lpvoid_t inp, dword_t inp_size, lpvoid_t out_ptr) {
-  DES::set_parity(inp, inp_size, out_ptr);
+  const uint8_t* in = inp.as<const uint8_t*>();
+  uint8_t* out = out_ptr.as<uint8_t*>();
+
+  // DES::set_parity counts the parity bit itself, so compute it from the
+  // upper 7 bits only.
+  for (uint32_t i = 0; i < inp_size; i++) {
+    uint8_t parity = in[i] & 0xFE;
+    parity ^= parity >> 4;
+    parity ^= parity >> 2;
+    parity ^= parity >> 1;
+
+    out[i] = (in[i] & 0xFE) | (~parity & 1);
+  }
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptDesParity, kNone, kImplemented);
 
@@ -937,16 +1117,13 @@ void XeCryptAesEcb_entry(pointer_t<XECRYPT_AES_STATE> state_ptr,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptAesEcb, kNone, kImplemented);
 
-void XeCryptAesCbc_entry(pointer_t<XECRYPT_AES_STATE> state_ptr,
-                         lpvoid_t inp_ptr, dword_t inp_size, lpvoid_t out_ptr,
-                         lpvoid_t feed_ptr, dword_t encrypt) {
-  const uint8_t* keytab =
-      reinterpret_cast<const uint8_t*>(state_ptr->keytabenc);
-  const uint8_t* inp = inp_ptr.as<const uint8_t*>();
-  uint8_t* out = out_ptr.as<uint8_t*>();
-  uint8_t* feed = feed_ptr.as<uint8_t*>();
+// Only whole blocks are processed, a partial last block is left alone.
+static void XeCryptAesCbcBlocks(const uint8_t* keytab, const uint8_t* inp,
+                                uint32_t inp_size, uint8_t* out, uint8_t* feed,
+                                bool encrypt) {
+  const uint32_t size = inp_size & ~15u;
   if (encrypt) {
-    for (uint32_t i = 0; i < inp_size; i += 16) {
+    for (uint32_t i = 0; i < size; i += 16) {
       for (uint32_t j = 0; j < 16; ++j) {
         feed[j] ^= inp[j];
       }
@@ -956,7 +1133,7 @@ void XeCryptAesCbc_entry(pointer_t<XECRYPT_AES_STATE> state_ptr,
       out += 16;
     }
   } else {
-    for (uint32_t i = 0; i < inp_size; i += 16) {
+    for (uint32_t i = 0; i < size; i += 16) {
       // In case inp == out.
       uint8_t tmp[16];
       std::memcpy(tmp, inp, 16);
@@ -970,7 +1147,38 @@ void XeCryptAesCbc_entry(pointer_t<XECRYPT_AES_STATE> state_ptr,
     }
   }
 }
+
+void XeCryptAesCbc_entry(pointer_t<XECRYPT_AES_STATE> state_ptr,
+                         lpvoid_t inp_ptr, dword_t inp_size, lpvoid_t out_ptr,
+                         lpvoid_t feed_ptr, dword_t encrypt) {
+  XeCryptAesCbcBlocks(reinterpret_cast<const uint8_t*>(state_ptr->keytabenc),
+                      inp_ptr.as<const uint8_t*>(), inp_size,
+                      out_ptr.as<uint8_t*>(), feed_ptr.as<uint8_t*>(),
+                      encrypt != 0);
+}
 DECLARE_XBOXKRNL_EXPORT1(XeCryptAesCbc, kNone, kImplemented);
+
+// The schedule is opaque to its caller, so it takes XeCryptAesKey's state. The
+// dashboard leaves 0x1D8 bytes for it and passes 128-bit keys.
+void XeCryptAesCreateKeySchedule_entry(lpvoid_t key, dword_t key_size,
+                                       pointer_t<XECRYPT_AES_STATE> schedule) {
+  if (key_size != 16) {
+    XELOGE("XeCryptAesCreateKeySchedule: {}-byte keys aren't supported",
+           uint32_t(key_size));
+    return;
+  }
+  XeCryptAesKey_entry(schedule, key);
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptAesCreateKeySchedule, kNone, kSketchy);
+
+void XeCryptAesCbcDecrypt_entry(pointer_t<XECRYPT_AES_STATE> schedule,
+                                lpvoid_t inp_ptr, dword_t inp_size,
+                                lpvoid_t out_ptr, lpvoid_t feed_ptr) {
+  XeCryptAesCbcBlocks(reinterpret_cast<const uint8_t*>(schedule->keytabenc),
+                      inp_ptr.as<const uint8_t*>(), inp_size,
+                      out_ptr.as<uint8_t*>(), feed_ptr.as<uint8_t*>(), false);
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptAesCbcDecrypt, kNone, kImplemented);
 
 void XeCryptHmacSha_entry(lpvoid_t key, dword_t key_size_in, lpvoid_t inp_1,
                           dword_t inp_1_size, lpvoid_t inp_2,
@@ -985,16 +1193,9 @@ void XeCryptHmacSha_entry(lpvoid_t key, dword_t key_size_in, lpvoid_t inp_1,
   std::memset(kpad_o, 0x5C, 0x40);
 
   // Setup HMAC key
-  // If > block size, use its hash
-  if (key_size > 0x40) {
-    sha1::SHA1 sha_key;
-    sha_key.processBytes(key, key_size);
-    sha_key.finalize((uint8_t*)tmp_key);
-
-    key_size = 0x14u;
-  } else {
-    std::memcpy(tmp_key, key, key_size);
-  }
+  // Console uses only the first block of a longer key instead of hashing it.
+  key_size = std::min(key_size, 0x40u);
+  std::memcpy(tmp_key, key, key_size);
 
   for (uint32_t i = 0; i < key_size; i++) {
     kpad_i[i] = tmp_key[i] ^ 0x36;
@@ -1029,6 +1230,67 @@ void XeCryptHmacSha_entry(lpvoid_t key, dword_t key_size_in, lpvoid_t inp_1,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptHmacSha, kNone, kImplemented);
 
+dword_result_t XeCryptHmacShaVerify_entry(lpvoid_t key, dword_t key_size,
+                                          lpvoid_t inp_1, dword_t inp_1_size,
+                                          lpvoid_t inp_2, dword_t inp_2_size,
+                                          lpvoid_t inp_3, dword_t inp_3_size,
+                                          lpvoid_t ver, dword_t ver_size) {
+  uint8_t digest[0x14];
+  XeCryptHmacSha_entry(key, key_size, inp_1, inp_1_size, inp_2, inp_2_size,
+                       inp_3, inp_3_size, digest, sizeof(digest));
+
+  const size_t compare_size = std::min<size_t>(sizeof(digest), ver_size);
+  return std::memcmp(digest, ver, compare_size) == 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptHmacShaVerify, kNone, kImplemented);
+
+void XeCryptHmacMd5_entry(lpvoid_t key, dword_t key_size_in, lpvoid_t inp_1,
+                          dword_t inp_1_size, lpvoid_t inp_2,
+                          dword_t inp_2_size, lpvoid_t inp_3,
+                          dword_t inp_3_size, lpvoid_t out, dword_t out_size) {
+  uint8_t kpad_i[0x40];
+  uint8_t kpad_o[0x40];
+  std::memset(kpad_i, 0x36, 0x40);
+  std::memset(kpad_o, 0x5C, 0x40);
+
+  // Assumed to truncate long keys like XeCryptHmacSha.
+  const uint32_t key_size = std::min<uint32_t>(key_size_in, 0x40);
+  const uint8_t* key_data = key.as<const uint8_t*>();
+  for (uint32_t i = 0; i < key_size; i++) {
+    kpad_i[i] ^= key_data[i];
+    kpad_o[i] ^= key_data[i];
+  }
+
+  AVMD5* md5 = av_md5_alloc();
+
+  // Inner
+  av_md5_init(md5);
+  av_md5_update(md5, kpad_i, sizeof(kpad_i));
+  if (inp_1 && inp_1_size) {
+    av_md5_update(md5, inp_1, inp_1_size);
+  }
+  if (inp_2 && inp_2_size) {
+    av_md5_update(md5, inp_2, inp_2_size);
+  }
+  if (inp_3 && inp_3_size) {
+    av_md5_update(md5, inp_3, inp_3_size);
+  }
+
+  uint8_t digest[16];
+  av_md5_final(md5, digest);
+
+  // Outer
+  av_md5_init(md5);
+  av_md5_update(md5, kpad_o, sizeof(kpad_o));
+  av_md5_update(md5, digest, sizeof(digest));
+  av_md5_final(md5, digest);
+  av_free(md5);
+
+  std::copy_n(digest, std::min<size_t>(xe::countof(digest), out_size),
+              out.as<uint8_t*>());
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptHmacMd5, kNone, kImplemented);
+
 dword_result_t XeKeysGetKeyProperties_entry(dword_t key) {
   if (X_Key_Properties.contains(key)) {
     auto& key_info = X_Key_Properties.at(key);
@@ -1043,7 +1305,12 @@ dword_result_t XeKeysGetKey_entry(word_t key, lpvoid_t key_buffer,
                                   lpdword_t key_length) {
   if (key_vault.contains(key)) {
     std::span<const uint8_t> key_needed = key_vault.at(key);
-    std::memcpy(key_buffer, key_needed.data(), *key_length);
+    // The hypervisor returns a fixed size key only into a buffer of its size.
+    if (*key_length != key_needed.size()) {
+      return 0xC8000004;
+    }
+    std::memcpy(key_buffer, key_needed.data(), key_needed.size());
+    *key_length = static_cast<uint32_t>(key_needed.size());
   } else {
     XELOGW("Key 0x{:04X} not implemented", static_cast<uint16_t>(key));
   }

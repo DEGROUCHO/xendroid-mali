@@ -87,6 +87,10 @@ namespace cpu {
 
 using xe::kernel::KernelState;
 
+void DecryptXex2ImageKey(const uint8_t* encrypted_key, uint8_t* key) {
+  aes_decrypt_buffer(xe_xex2_retail_key, encrypted_key, 16, key, 16);
+}
+
 XexModule::XexModule(Processor* processor, KernelState* kernel_state)
     : Module(processor), kernel_state_(kernel_state) {}
 
@@ -193,6 +197,42 @@ uint32_t XexModule::GetProcAddress(const std::string_view name) const {
   return 0;
 }
 
+bool XexModule::PageDigestsMatch() const {
+  // Only the XEX2 layout is checked.
+  if (xex_format_ != kFormatXex2) {
+    return true;
+  }
+  const auto* security =
+      static_cast<const xex2_security_info*>(GetSecurityInfo(xex_header()));
+  const uint32_t page_size = memory()->LookupHeap(base_address_)->page_size();
+  const uint8_t* image = memory()->TranslateVirtual<uint8_t*>(base_address_);
+  // The image was allocated by this size, which the regions mustn't run past.
+  const size_t total = image_size();
+  const char* expected = security->section_digest;
+  size_t offset = 0;
+  for (uint32_t i = 0; i < security->page_descriptor_count; ++i) {
+    const xex2_page_descriptor& entry = security->page_descriptors[i];
+    // Byteswap the bitfield manually.
+    xex2_page_descriptor descriptor;
+    descriptor.value = xe::byte_swap(entry.value);
+    const size_t length = size_t(descriptor.page_count) * page_size;
+    if (length > total - offset) {
+      return false;
+    }
+    uint8_t digest[0x14];
+    sha1::SHA1 s;
+    s.processBytes(image + offset, length);
+    s.processBytes(&entry, sizeof(entry));
+    s.finalize(digest);
+    if (std::memcmp(digest, expected, sizeof(digest))) {
+      return false;
+    }
+    expected = entry.data_digest;
+    offset += length;
+  }
+  return true;
+}
+
 int XexModule::ApplyPatch(XexModule* module) {
   if (!is_patch()) {
     // This isn't a XEX2 patch.
@@ -294,6 +334,15 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   uint32_t new_image_size = module->image_size();
 
+  // Unload releases only the allocation at the base, not the range the image
+  // grew into.
+  uint32_t grown_address = 0;
+  auto release_growth = [&]() {
+    if (grown_address) {
+      memory()->LookupHeap(grown_address)->Release(grown_address);
+    }
+  };
+
   // Check if we need to alloc new memory for the patched xex
   if (new_image_size > original_image_size) {
     uint32_t size_delta = new_image_size - original_image_size;
@@ -332,6 +381,10 @@ int XexModule::ApplyPatch(XexModule* module) {
       assert_always();
       return 6;
     }
+    // A moved image is released at its new base by the unload.
+    if (original_base_address == new_base_address) {
+      grown_address = addr_new_mem;
+    }
 
     // For base_address change we need to copy data from previous allocation to
     // new one
@@ -365,6 +418,7 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   if (memcmp(test_delta_key, orig_session_key, 0x10) != 0) {
     XELOGE("XEX patch image key doesn't match original XEX!");
+    release_growth();
     return 7;
   }
 
@@ -388,6 +442,7 @@ int XexModule::ApplyPatch(XexModule* module) {
       break;
     default:
       assert_always();
+      release_growth();
       return 8;
   }
 
@@ -450,6 +505,13 @@ int XexModule::ApplyPatch(XexModule* module) {
     cur_block = next_block;
   }
 
+  // A patch made for other code can apply without an error and still build an
+  // image other than the one it was made to build.
+  if (!result_code && !module->PageDigestsMatch()) {
+    XELOGE("XEX patch built an image its headers don't describe");
+    result_code = 10;
+  }
+
   if (!result_code) {
     // Decommit unused pages if new image size is smaller than original
     if (original_image_size > new_image_size) {
@@ -477,6 +539,7 @@ int XexModule::ApplyPatch(XexModule* module) {
         target_ver.major, target_ver.minor, target_ver.build, target_ver.qfe);
   } else {
     XELOGE("XEX patch application failed, error code {}", result_code);
+    release_growth();
   }
 
   if (free_input) {
@@ -485,33 +548,10 @@ int XexModule::ApplyPatch(XexModule* module) {
   return result_code;
 }
 
-// Also tells ReadImage whether its key was the right one. CLR native images
-// (.ni.dll) don't have the usual DOS stub after MZ. The PE header that e_lfanew
-// points at is checked instead.
-bool XexModule::is_valid_executable() const {
-  assert_not_zero(base_address_);
-  if (!base_address_) {
-    return false;
-  }
-  const uint8_t* image = memory()->TranslateVirtual(base_address_);
-  auto dos_header = reinterpret_cast<const XIMAGE_DOS_HEADER*>(image);
-  if (dos_header->e_magic != XIMAGE_DOS_SIGNATURE) {
-    return false;
-  }
-  const uint32_t nt_offset = uint32_t(dos_header->e_lfanew);
-  const uint32_t size = image_size();
-  if (size < sizeof(XIMAGE_NT_HEADERS32) ||
-      nt_offset > size - sizeof(XIMAGE_NT_HEADERS32)) {
-    return false;
-  }
-  auto nt_headers =
-      reinterpret_cast<const XIMAGE_NT_HEADERS32*>(image + nt_offset);
-  return nt_headers->Signature == XIMAGE_NT_SIGNATURE;
-}
-
 int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
                          const uint8_t* key) {
-  if (!opt_file_format_info()) {
+  // The encryption and compression types follow the size.
+  if (!opt_file_format_info() || opt_file_format_info()->info_size < 8) {
     return 1;
   }
 
@@ -626,6 +666,17 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
   uint32_t uncompressed_size = 0;
 
   auto* file_info = opt_file_format_info();
+  // The block list comes from the file and must lie inside the header that was
+  // read, or both loops below read past it.
+  const uintptr_t header_begin = uintptr_t(xex_header_mem_.data());
+  const uintptr_t header_end = header_begin + xex_header_mem_.size();
+  const uintptr_t info_begin = uintptr_t(file_info);
+  if (!file_info || info_begin < header_begin || info_begin > header_end ||
+      header_end - info_begin < 8 || file_info->info_size < 8 ||
+      file_info->info_size > header_end - info_begin) {
+    XELOGE("XEX: the basic compression block list is outside the header");
+    return 1;
+  }
   auto& comp_info = file_info->compression_info.basic;
 
   uint32_t block_count = (file_info->info_size - 8) / 8;
@@ -667,6 +718,26 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
   for (size_t n = 0; n < block_count; n++) {
     const uint32_t data_size = comp_info.blocks[n].data_size;
     const uint32_t zero_size = comp_info.blocks[n].zero_size;
+
+    // A block must fit what was allocated and what is left of the file, or a
+    // crafted header reads and writes past them - the library scan loads the
+    // XEX of every game it lists. A block of zeros only writes nothing.
+    // Decryption works in whole 16-byte blocks (canary PR 1311).
+    const size_t copy_size =
+        opt_file_format_info()->encryption_type == XEX_ENCRYPTION_NORMAL
+            ? xe::align<size_t>(data_size, 16)
+            : data_size;
+    const size_t written = size_t(d - buffer);
+    const size_t consumed = size_t(p - source_buffer);
+    if (consumed > exe_length || copy_size > exe_length - consumed ||
+        (copy_size &&
+         (written > total_size || copy_size > total_size - written))) {
+      XELOGE(
+          "XEX: basic compression block {} does not fit: {} bytes at {} of a "
+          "{}-byte image, {} of a {}-byte file",
+          n, data_size, written, total_size, consumed, exe_length);
+      return 1;
+    }
 
     switch (opt_file_format_info()->encryption_type) {
       case XEX_ENCRYPTION_NONE:
@@ -745,17 +816,37 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
   const auto* compression_info = &opt_file_format_info()->compression_info;
   const xex2_compressed_block_info* cur_block =
       &compression_info->normal.first_block;
+  if (opt_file_format_info()->info_size <
+      offsetof(xex2_opt_file_format_info, compression_info) +
+          sizeof(xex2_file_normal_compression_info)) {
+    if (free_input) {
+      free((void*)input_buffer);
+    }
+    return 4;
+  }
 
   compress_buffer = (uint8_t*)calloc(1, exe_length);
 
   p = input_buffer;
   d = compress_buffer;
+  const uint8_t* const input_end = input_buffer + input_size;
+  const uint8_t* const compress_end = compress_buffer + exe_length;
 
   // De-block.
   int result_code = 0;
 
   uint8_t block_calced_digest[0x14];
   while (cur_block->block_size) {
+    // The sizes come from the file, and a crafted one can carry hashes that
+    // match: a block (the next one's size and hash, then the chunks) and each
+    // chunk must be inside the data.
+    if (cur_block->block_size < sizeof(xex2_compressed_block_info) ||
+        cur_block->block_size > size_t(input_end - p)) {
+      XELOGE("XEX: compressed block of {} bytes does not fit in the {} left",
+             uint32_t(cur_block->block_size), size_t(input_end - p));
+      result_code = 4;
+      break;
+    }
     const uint8_t* pnext = p + cur_block->block_size;
     const auto* next_block = (const xex2_compressed_block_info*)p;
 
@@ -772,16 +863,26 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
     p += 4;
     p += 20;
 
-    while (true) {
+    while (pnext - p >= 2) {
       const size_t chunk_size = (p[0] << 8) | p[1];
       p += 2;
       if (!chunk_size) {
+        break;
+      }
+      if (chunk_size > size_t(pnext - p) ||
+          chunk_size > size_t(compress_end - d)) {
+        XELOGE("XEX: compressed chunk of {} bytes does not fit in its block",
+               chunk_size);
+        result_code = 4;
         break;
       }
 
       memcpy(d, p, chunk_size);
       p += chunk_size;
       d += chunk_size;
+    }
+    if (result_code) {
+      break;
     }
 
     p = pnext;
@@ -926,11 +1027,20 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
                      const void* xex_addr, size_t xex_length) {
   auto src_header = reinterpret_cast<const xex2_header*>(xex_addr);
 
+  if (xex_length < sizeof(src_header->magic)) {
+    return false;
+  }
   if (src_header->magic == kXEX1Signature) {
     xex_format_ = kFormatXex1;
   } else if (src_header->magic == kXEX2Signature) {
     xex_format_ = kFormatXex2;
   } else {
+    return false;
+  }
+
+  // Everything below reads the header as the file gives it.
+  if (const char* problem = XexHeaderProblem(xex_addr, xex_length)) {
+    XELOGE("XEX {}: {}", path, problem);
     return false;
   }
 

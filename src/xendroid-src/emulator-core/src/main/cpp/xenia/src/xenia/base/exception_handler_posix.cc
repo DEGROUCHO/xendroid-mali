@@ -225,10 +225,13 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       // For a Data Abort (EC - ESR_EL1 bits 31:26 - 0b100100 from a lower
       // Exception Level, 0b100101 without a change in the Exception Level),
       // bit 6 is 0 for reading from a memory location, 1 for writing to a
-      // memory location.
+      // memory location. Bit 8 marks cache maintenance, which sets bit 6 but
+      // needs only read access. DC ZVA leaves bit 8 clear.
       if (mcontext_esr && ((mcontext_esr->esr >> 26) & 0b111110) == 0b100100) {
+        constexpr uint64_t kEsrWnR = UINT64_C(1) << 6;
+        constexpr uint64_t kEsrCm = UINT64_C(1) << 8;
         access_violation_operation =
-            (mcontext_esr->esr & (UINT64_C(1) << 6))
+            (mcontext_esr->esr & (kEsrWnR | kEsrCm)) == kEsrWnR
                 ? Exception::AccessViolationOperation::kWrite
                 : Exception::AccessViolationOperation::kRead;
       } else {

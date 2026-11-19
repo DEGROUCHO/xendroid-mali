@@ -498,6 +498,11 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
+  // For command_processor_memexport.inc.
+  void AwaitMemexportOutput() { AwaitAllQueueOperationsCompletion(); }
+  bool IsMemexportOutputRange(uint32_t base_bytes, uint32_t size_bytes) const {
+    return IsMemexportRange(base_bytes, size_bytes);
+  }
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletion(GetCurrentSubmission());
     return GetCompletedSubmission() + 1u >= GetCurrentSubmission();

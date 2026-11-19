@@ -168,6 +168,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // The label stays valid for the whole function, even as more tails are
+  // added.
   Xbyak_aarch64::Label& AddToTail(TailEmitCallback callback,
                                   uint32_t alignment = 0);
   Xbyak_aarch64::Label& NewCachedLabel();
@@ -321,7 +323,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   std::unordered_map<uint64_t, std::pair<uint32_t, Xbyak_aarch64::Label*>>
       pinned_preempt_paths_;
 
-  std::vector<TailEmitter> tail_code_;
+  // A deque, so adding a tail doesn't move the labels already handed out.
+  std::deque<TailEmitter> tail_code_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // Map from HIR label IDs to xbyak_aarch64 Labels.

@@ -1868,9 +1868,12 @@ void VulkanDevice::LogFaultInfo() {
   VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
   info.pAddressInfos = address_infos.empty() ? nullptr : address_infos.data();
   info.pVendorInfos = vendor_infos.empty() ? nullptr : vendor_infos.data();
-  // Skip vendor binary - we don't have a place to dump it anyway.
+  // Skip vendor binary - we don't have a place to dump it anyway. A driver
+  // that has one reports VK_INCOMPLETE for the rest, which is still valid.
   counts.vendorBinarySize = 0;
-  if (vkGetDeviceFaultInfoEXT_(device_, &counts, &info) != VK_SUCCESS) {
+  const VkResult fault_info_result =
+      vkGetDeviceFaultInfoEXT_(device_, &counts, &info);
+  if (fault_info_result != VK_SUCCESS && fault_info_result != VK_INCOMPLETE) {
     XELOGE("VK_EXT_device_fault: failed to query fault info");
     return;
   }

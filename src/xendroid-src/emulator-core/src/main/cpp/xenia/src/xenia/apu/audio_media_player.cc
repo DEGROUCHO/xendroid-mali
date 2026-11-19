@@ -473,19 +473,21 @@ std::span<uint8_t> AudioMediaPlayer::LoadSongToMemory() {
     return {};
   }
 
-  std::span<uint8_t> buffer = {
-      static_cast<uint8_t*>(av_malloc(vfs_file->entry()->size())),
-      vfs_file->entry()->size()};
-
-  if (buffer.empty()) {
+  const size_t file_size = vfs_file->entry()->size();
+  uint8_t* data =
+      file_size ? static_cast<uint8_t*>(av_malloc(file_size)) : nullptr;
+  if (!data) {
+    vfs_file->Destroy();
     return {};
   }
+  std::span<uint8_t> buffer = {data, file_size};
 
   size_t bytes_read = 0;
   result = vfs_file->ReadSync(buffer, 0, &bytes_read);
+  vfs_file->Destroy();
   if (result != X_ERROR_SUCCESS) {
     // Read failed. We need to manually release resources from av_malloc.
-    av_freep(buffer.data());
+    av_free(data);
     return {};
   }
 
@@ -506,9 +508,9 @@ void AudioMediaPlayer::AddPlaylist(uint32_t handle,
   playlists_.insert({handle, std::move(playlist)});
 }
 
-void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
+bool AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
   if (playlists_.count(handle) == 0) {
-    return;
+    return false;
   }
 
   // TODO: Check if currently played song is from that playlist and stop
@@ -517,7 +519,12 @@ void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
     Stop();
   }
 
+  const bool current = active_playlist_ && active_playlist_->handle == handle;
+  if (current) {
+    active_playlist_ = nullptr;
+  }
   playlists_.erase(handle);
+  return current;
 }
 
 X_STATUS AudioMediaPlayer::SetVolume(float volume) {
@@ -555,8 +562,9 @@ void AudioMediaPlayer::SetCaptureCallback(uint32_t callback, uint32_t context,
 }
 
 void AudioMediaPlayer::OnStateChanged() {
+  // The parameter says whether a song is playing or paused.
   kernel_state_->BroadcastNotification(kXNotificationXmpStateChanged,
-                                       static_cast<uint32_t>(state_));
+                                       state_ != XmpApp::State::kIdle);
 }
 
 void AudioMediaPlayer::ProcessAudioBuffer(std::vector<float>* buffer) {
@@ -606,9 +614,10 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
   }
 
   if (!driver_->Initialize()) {
-    driver_semaphore_.reset();
+    // The driver before its semaphore, as in DeleteDriver.
     driver_->Shutdown();
     driver_.reset();
+    driver_semaphore_.reset();
     return false;
   }
 
@@ -618,12 +627,12 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
 void AudioMediaPlayer::DeleteDriver() {
   std::unique_lock<xe_mutex> guard(driver_mutex_);
   if (driver_) {
-    if (driver_semaphore_) {
-      driver_semaphore_.reset();
-    }
-
+    // The driver first: its device callbacks (AAudio, OpenSL ES, on threads of
+    // their own) release the semaphore until it is shut down. Freed first, the
+    // semaphore could be released after it was gone.
     driver_->Shutdown();
     driver_.reset();
+    driver_semaphore_.reset();
   }
 }
 

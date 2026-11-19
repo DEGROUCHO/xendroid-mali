@@ -72,6 +72,15 @@ namespace shaders {
 
 DECLARE_bool(log_vk_memory);
 
+DEFINE_bool(force_depth_clamp, false,
+            "Clamp depth instead of clipping at the near and far planes for "
+            "every draw, not only those that disable clipping. A per-game fix "
+            "(game_quirks): Spider-Man: Shattered Dimensions lost a band of "
+            "the screen to black or duplicated geometry, Rise of the Tomb "
+            "Raider its opening scene geometry. "
+            "Needs the Vulkan depthClamp feature; a driver without it keeps "
+            "clipping as before.",
+            "GPU");
 DEFINE_bool(vulkan_pipeline_cache_mapped_input, true,
             "Read the persistent driver pipeline cache from a read-only file "
             "mapping instead of duplicating it in the native heap. Release "
@@ -1530,7 +1539,10 @@ void VulkanPipelineCache::TranslateShadersForStorage(
           static_cast<VulkanShader::VulkanTranslation*>(
               shader->GetTranslation(modification));
       if (translation && !translation->is_translated()) {
-        if (TranslateAnalyzedShader(translator, *translation)) {
+        // Pipeline creation threads left running by earlier draws may reach
+        // the same modification: claim it like they do.
+        if (TranslateAnalyzedShader(translator, *translation,
+                                    /*use_try_claim=*/true)) {
           translations_completed.fetch_add(1);
         }
       }
@@ -1787,7 +1799,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
 
   description_out.depth_clamp_enable =
       device_properties.depthClamp &&
-      regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+       cvars::force_depth_clamp);
 
   // TODO(Triang3l): Tessellation.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);

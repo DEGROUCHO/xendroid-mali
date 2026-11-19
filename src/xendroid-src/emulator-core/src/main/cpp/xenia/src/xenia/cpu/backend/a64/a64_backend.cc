@@ -949,11 +949,15 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
         for (auto* entry : processor->FindFunctionsWithAddress(
                  static_cast<uint32_t>(target_address))) {
           auto* afunc = static_cast<A64Function*>(entry);
+          // Landing on a function's first instruction would skip its prolog.
+          // (Comparing host addresses never caught it: the first guest
+          // instruction maps past the host prolog.)
+          if (afunc->address() == static_cast<uint32_t>(target_address)) {
+            continue;
+          }
           host_address = afunc->MapGuestAddressToMachineCode(
               static_cast<uint32_t>(target_address));
-          if (host_address &&
-              afunc->machine_code() !=
-                  reinterpret_cast<const uint8_t*>(host_address)) {
+          if (host_address) {
             auto* backend = static_cast<A64Backend*>(processor->backend());
             auto* backend_context =
                 backend->BackendContextForGuestContext(guest_context);

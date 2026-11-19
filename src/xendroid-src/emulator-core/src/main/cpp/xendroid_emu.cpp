@@ -133,6 +133,14 @@ void AndroidWindowedAppContext::NotifyUILoopOfPendingFunctions() {
     pthread_mutex_unlock(&mutex);
 }
 
+void AndroidWindowedAppContext::NotifyUILoopOfPendingFunctionsAsync() {
+    // Wake the loop and return: the next drain runs the queued function.
+    pthread_mutex_lock(&mutex);
+    pending_events |= EVENT_EXECUTE_PENDING_FUNCTIONS;
+    pthread_cond_signal(&wake_cond);
+    pthread_mutex_unlock(&mutex);
+}
+
 void AndroidWindowedAppContext::PlatformQuitFromUIThread() {
     if(WindowedAppContext::ui_thread_id_==std::this_thread::get_id()){
         pthread_mutex_lock(&mutex);
@@ -168,6 +176,7 @@ void AndroidWindowedAppContext::setup_ui_thr_id(std::thread::id id){
 
 void AndroidWindowedAppContext::main_loop(){
     assert(WindowedAppContext::ui_thread_id_==std::this_thread::get_id());
+    xe::ui::ui_loop_thread_tid.store(int(gettid()));
     while(!WindowedAppContext::HasQuitFromUIThread()){
         // Snapshot the pending bits, then run all work UNLOCKED. Holding `mutex`
         // across ExecutePendingFunctions / Paint would self-deadlock: those can
@@ -677,7 +686,12 @@ void EmulatorApp::emu_thr_main() {
     emu->on_shader_storage_initialization.AddListener(
             [this](bool initializing) {
                 XELOGI("Shader storage initialization: {}", initializing);
-                app_context().CallInUIThread([this, initializing]() {
+                // Async: the end of loading may be reported from the command
+                // processor thread while the UI thread waits on that thread
+                // (a savestate restore launches the title from the UI thread
+                // and waits there for the command processor): a synchronous
+                // call deadlocked both.
+                app_context().CallInUIThreadAsync([this, initializing]() {
                     emu_window->SetInitializingShaderStorage(initializing);
 
                 });
@@ -738,8 +752,11 @@ void EmulatorApp::emu_thr_main() {
         }
     }
 
-    auto xam = emu->kernel_state()->GetKernelModule<xe::kernel::xam::XamModule>(
-            "xam.xex");
+    // Unowned: this frame lives as long as the process, past every relaunch,
+    // and a reference would keep the first session's XamModule alive.
+    auto* xam = emu->kernel_state()
+                        ->GetKernelModule<xe::kernel::xam::XamModule>("xam.xex")
+                        .get();
 
     if (xam) {
         // XenDroid: edge removed XamModule::LoadLoaderData(); loader_data_ is now populated

@@ -10,6 +10,7 @@
 #include "xenia/kernel/xsocket.h"
 
 #include <cstring>
+#include <optional>
 #include <thread>
 
 #include "xenia/base/clock.h"
@@ -167,6 +168,17 @@ uint32_t AsioErrorToWSAError(const asio::error_code& ec) {
   return static_cast<uint32_t>(ec.value());
 }
 
+// The Winsock code of the last call that failed on a host socket.
+static uint32_t HostSocketError() {
+#if XE_PLATFORM_WIN32
+  const int host_error = WSAGetLastError();
+#else
+  const int host_error = errno;
+#endif  // XE_PLATFORM_WIN32
+  return AsioErrorToWSAError(
+      asio::error_code(host_error, asio::error::get_system_category()));
+}
+
 XSocket::XSocket(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType) {}
 
@@ -222,12 +234,13 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // Allow port reuse so that in-process relaunches can rebind ports
-  // immediately without waiting for TIME_WAIT to expire.  Duplicate active
-  // binds are caught by the object-table check in Bind() instead.
-  int reuse = 1;
-  setsockopt(static_cast<int>(native_handle()), SOL_SOCKET, SO_REUSEADDR,
-             reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  // Lets a relaunched title listen on a port its closed connections still
+  // hold in TIME_WAIT.
+  if (type == Type::X_SOCK_STREAM) {
+    int reuse = 1;
+    setsockopt(static_cast<int>(native_handle()), SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -263,6 +276,7 @@ X_STATUS XSocket::Close() {
 X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
                             uint32_t* optlen) {
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
+    last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
 
@@ -285,14 +299,14 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
 
   int native_handle_val = static_cast<int>(native_handle());
   if (native_handle_val == -1) {
+    last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
 
   int ret = getsockopt(native_handle_val, native_level, native_optname,
                        static_cast<char*>(optval_ptr), &native_optlen);
   if (ret < 0) {
-    last_error_ = AsioErrorToWSAError(
-        asio::error_code(errno, asio::error::get_system_category()));
+    last_error_ = HostSocketError();
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -309,7 +323,15 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
   }
 
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
+    last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
+  }
+
+  // SO_EXCLUSIVEADDRUSE. Bind already refuses a port another socket holds.
+  // Windows refuses the option next to the SO_REUSEADDR of stream sockets and
+  // other hosts have no such option.
+  if (level == 0xFFFF && optname == ~0x0004u) {
+    return X_STATUS_SUCCESS;
   }
 
   // Map Xbox socket levels to native
@@ -328,14 +350,14 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
 
   int native_handle_val = static_cast<int>(native_handle());
   if (native_handle_val == -1) {
+    last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
 
   int ret = setsockopt(native_handle_val, native_level, native_optname,
                        static_cast<char*>(optval_ptr), optlen);
   if (ret < 0) {
-    last_error_ = AsioErrorToWSAError(
-        asio::error_code(errno, asio::error::get_system_category()));
+    last_error_ = HostSocketError();
     XELOGE("XSocket::SetOption: failed with error {:08X}", last_error_);
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -515,7 +537,7 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
       return X_STATUS_UNSUCCESSFUL;
     }
 
-    *reinterpret_cast<uint32_t*>(arg_ptr) = static_cast<uint32_t>(available);
+    xe::store_and_swap<uint32_t>(arg_ptr, static_cast<uint32_t>(available));
     return X_STATUS_SUCCESS;
   }
 
@@ -543,8 +565,8 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
     return;
   }
 
-  // Enforced here because the host option only applies in blocking mode.
-  // Connect is left unbounded, Winsock not applying SO_SNDTIMEO to it.
+  // Enforced here because the host option only applies in blocking mode. No
+  // socket timeout bounds a connect or accept.
   uint32_t timeout_ms = 0;
   if (mode == RetryMode::kReceive) {
     timeout_ms = recv_timeout_ms_;
@@ -558,12 +580,13 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
     SetHostNonBlocking(true);
   }
   auto* scheduler = self->kernel_state()->guest_scheduler();
-  while (true) {
+  for (bool retried = false;; retried = true) {
     attempt();
     bool retry = ec == asio::error::would_block || ec == asio::error::try_again;
     if (mode == RetryMode::kConnect) {
-      // A retried connect reports success by refusing to connect twice.
-      if (ec == asio::error::already_connected) {
+      // A retried connect reports success by refusing to connect twice. A
+      // socket connected before the call fails with WSAEISCONN.
+      if (ec == asio::error::already_connected && retried) {
         ec.clear();
         break;
       }
@@ -650,7 +673,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   uint16_t port = name->sin_port;
 
   // Reject duplicate active binds (Xbox 360 behaviour).  SO_REUSEADDR is set
-  // on the OS socket for TIME_WAIT reclaiming, but games expect a second bind
+  // on stream sockets for TIME_WAIT reclaiming but games expect a second bind
   // to the same port to fail with WSAEADDRINUSE.  Query the kernel's live
   // object table so the check is naturally correct across in-process relaunches
   // (Shutdown destroys the old object table).
@@ -718,8 +741,39 @@ X_STATUS XSocket::Listen(int backlog) {
   return X_STATUS_SUCCESS;
 }
 
+namespace {
+// Host byte order.
+struct AcceptedPeer {
+  uint32_t address;
+  uint16_t port;
+};
+}  // namespace
+
+// Writes the accepted peer as a guest sockaddr_in or clears it without one.
+// Host sockaddr_in layouts differ (macOS starts with sin_len).
+static void AcceptedName(N_XSOCKADDR* name, int* name_len,
+                         std::optional<AcceptedPeer> peer) {
+  if (name) {
+    std::memset(name, 0, sizeof(*name));
+  }
+  if (!peer) {
+    *name_len = 0;
+    return;
+  }
+  if (name) {
+    const xe::be<uint16_t> port = peer->port;
+    const xe::be<uint32_t> address = peer->address;
+    name->address_family = AF_INET;
+    std::memcpy(name->sa_data, &port, sizeof(port));
+    std::memcpy(name->sa_data + sizeof(port), &address, sizeof(address));
+  }
+  *name_len = sizeof(N_XSOCKADDR);
+}
+
 object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   if (!acceptor_) {
+    // WSAEOPNOTSUPP for a datagram socket, WSAEINVAL before listen().
+    last_error_ = udp_socket_ ? 10045 : uint32_t(X_WSAError::X_WSAEINVAL);
     return nullptr;
   }
 
@@ -728,38 +782,34 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   // Accept a new connection
   asio::ip::tcp::socket new_socket(GetIoContext());
   asio::ip::tcp::endpoint peer_endpoint;
-  RunCooperatively(ec, RetryMode::kReceive,
+  RunCooperatively(ec, RetryMode::kAccept,
                    [&]() { acceptor_->accept(new_socket, peer_endpoint, ec); });
 
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
-    if (name) {
-      std::memset(name, 0, *name_len);
-    }
-    *name_len = 0;
+    AcceptedName(name, name_len, std::nullopt);
     return nullptr;
   }
-
-  // Fill in the client address
-  if (name && *name_len >= static_cast<int>(sizeof(sockaddr_in))) {
-    sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(name);
-    addr->sin_family = AF_INET;
-    addr->sin_port = htons(peer_endpoint.port());
-    addr->sin_addr.s_addr = htonl(peer_endpoint.address().to_v4().to_uint());
-    std::memset(reinterpret_cast<char*>(addr) + 8, 0, 8);  // Zero sin_zero
-  }
-  *name_len = sizeof(sockaddr_in);
+  AcceptedName(name, name_len,
+               AcceptedPeer{peer_endpoint.address().to_v4().to_uint(),
+                            peer_endpoint.port()});
 
   // Create a kernel object to represent the new socket
   auto socket =
       object_ref<XSocket>(new XSocket(kernel_state_, std::move(new_socket)));
   socket->bound_ = true;
+  // An accepted socket starts in the listener's non-blocking mode.
+  if (guest_non_blocking_) {
+    socket->SetHostNonBlocking(true);
+    socket->guest_non_blocking_ = true;
+  }
 
   return socket;
 }
 
 int XSocket::Shutdown(int how) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -794,6 +844,7 @@ int XSocket::Shutdown(int how) {
 
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -812,6 +863,10 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
     });
   }
 
+  // A stream peer that closed the connection reads as 0 bytes.
+  if (ec == asio::error::eof) {
+    return 0;
+  }
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
     return -1;
@@ -823,6 +878,7 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                       N_XSOCKADDR_IN* from, uint32_t* from_len) {
   if (!udp_socket_ && !tcp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -852,6 +908,10 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
     });
   }
 
+  // A stream peer that closed the connection reads as 0 bytes.
+  if (ec == asio::error::eof) {
+    return 0;
+  }
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
     return -1;
@@ -862,6 +922,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
 int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -889,6 +950,7 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                     N_XSOCKADDR_IN* to, uint32_t to_len) {
   if (!udp_socket_ && !tcp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -1029,42 +1091,36 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port,
   return true;
 }
 
-X_STATUS XSocket::GetSockName(uint8_t* buf, int* buf_len) {
+X_STATUS XSocket::QueryName(bool peer, N_XSOCKADDR_IN* name) {
   auto handle = native_handle();
   if (handle == static_cast<uint64_t>(-1)) {
+    last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
 
-  socklen_t len = static_cast<socklen_t>(*buf_len);
-  int result = getsockname(static_cast<int>(handle),
-                           reinterpret_cast<sockaddr*>(buf), &len);
+  sockaddr_in host_name = {};
+  socklen_t len = sizeof(host_name);
+  auto host_address = reinterpret_cast<sockaddr*>(&host_name);
+  int result = peer ? getpeername(static_cast<int>(handle), host_address, &len)
+                    : getsockname(static_cast<int>(handle), host_address, &len);
   if (result == -1) {
-    last_error_ = AsioErrorToWSAError(
-        asio::error_code(errno, asio::error::get_system_category()));
+    last_error_ = HostSocketError();
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  *buf_len = static_cast<int>(len);
+  name->sin_family = host_name.sin_family;
+  name->sin_port = ntohs(host_name.sin_port);
+  name->sin_addr = ntohl(host_name.sin_addr.s_addr);
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
   return X_STATUS_SUCCESS;
 }
 
-X_STATUS XSocket::GetPeerName(uint8_t* buf, int* buf_len) {
-  auto handle = native_handle();
-  if (handle == static_cast<uint64_t>(-1)) {
-    return X_STATUS_INVALID_HANDLE;
-  }
+X_STATUS XSocket::GetSockName(N_XSOCKADDR_IN* name) {
+  return QueryName(false, name);
+}
 
-  socklen_t len = static_cast<socklen_t>(*buf_len);
-  int result = getpeername(static_cast<int>(handle),
-                           reinterpret_cast<sockaddr*>(buf), &len);
-  if (result == -1) {
-    last_error_ = AsioErrorToWSAError(
-        asio::error_code(errno, asio::error::get_system_category()));
-    return X_STATUS_UNSUCCESSFUL;
-  }
-
-  *buf_len = static_cast<int>(len);
-  return X_STATUS_SUCCESS;
+X_STATUS XSocket::GetPeerName(N_XSOCKADDR_IN* name) {
+  return QueryName(true, name);
 }
 
 uint32_t XSocket::GetLastWSAError() const { return last_error_; }

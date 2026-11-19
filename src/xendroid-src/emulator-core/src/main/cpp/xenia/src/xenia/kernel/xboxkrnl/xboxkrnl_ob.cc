@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/string.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -311,8 +312,12 @@ dword_result_t ObReferenceObjectByName_entry(pointer_t<X_ANSI_STRING> name,
   X_STATUS result =
       kernel_state()->object_table()->GetObjectByName(name_str, &handle);
   if (XSUCCEEDED(result)) {
-    return ObReferenceObjectByHandle_entry(handle, object_type_ptr,
-                                           out_object_ptr);
+    result = ObReferenceObjectByHandle_entry(handle, object_type_ptr,
+                                             out_object_ptr);
+    // The reference is ObReferenceObjectByHandle's, not the lookup's.
+    kernel_state()->object_table()->ReleaseHandle(handle);
+  } else if (out_object_ptr.guest_address()) {
+    *out_object_ptr = 0;
   }
 
   return result;
@@ -364,15 +369,21 @@ void ObReferenceObject_entry(dword_t native_ptr) {
 }
 DECLARE_XBOXKRNL_EXPORT1(ObReferenceObject, kNone, kImplemented);
 
+void xeObStripDosDevicesPrefix(std::string& path) {
+  // Bytes, as a guest name need not be valid UTF-8.
+  constexpr std::string_view kSystemDosDevices = "\\System??\\";
+  if (path.starts_with("\\??\\")) {
+    path.erase(0, 4);
+  } else if (path.size() >= kSystemDosDevices.size() &&
+             !xe_strncasecmp(path.c_str(), kSystemDosDevices.data(),
+                             kSystemDosDevices.size())) {
+    path.erase(0, kSystemDosDevices.size());
+  }
+}
+
 std::string xeObSymbolicLinkName(const std::string_view name) {
   auto path = xe::utf8::canonicalize_guest_path(name);
-  if (xe::utf8::starts_with_case(path, "\\??\\")) {
-    path.erase(0, 4);
-  }
-
-  if (xe::utf8::starts_with_case(path, "\\System??\\")) {
-    path.erase(0, 10);
-  }
+  xeObStripDosDevicesPrefix(path);
   return path;
 }
 

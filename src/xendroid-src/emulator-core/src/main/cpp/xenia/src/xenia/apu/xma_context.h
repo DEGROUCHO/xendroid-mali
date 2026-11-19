@@ -227,7 +227,17 @@ class XmaContext {
     is_allocated_.store(is_allocated, std::memory_order_release);
   }
   void set_is_enabled(bool is_enabled) {
-    is_enabled_.store(is_enabled, std::memory_order_release);
+    is_enabled_.store(is_enabled, std::memory_order_seq_cst);
+    // Only set here: the worker clears the bit itself once it sees the context
+    // disabled (re-checking, so an enable racing the clear is never lost).
+    if (is_enabled && enabled_mask_word_) {
+      enabled_mask_word_->fetch_or(enabled_mask_bit_, std::memory_order_seq_cst);
+    }
+  }
+  // The XmaDecoder's mask of the contexts to visit - the enabled ones.
+  void set_enabled_mask(std::atomic<uint64_t>* word, uint64_t bit) {
+    enabled_mask_word_ = word;
+    enabled_mask_bit_ = bit;
   }
 
   // Kick handshake. The event is only a doorbell: correctness lives in the
@@ -301,6 +311,8 @@ class XmaContext {
   xe_mutex lock_;
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
+  std::atomic<uint64_t>* enabled_mask_word_ = nullptr;
+  uint64_t enabled_mask_bit_ = 0;
   std::unique_ptr<xe::threading::Event> work_completion_event_;
 
   // Monotonic: a cancellation must never be regressed by a Work() that

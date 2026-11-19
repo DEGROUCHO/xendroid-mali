@@ -101,7 +101,8 @@ class AudioMediaPlayer {
                           bool title_render);
 
   void AddPlaylist(uint32_t handle, std::unique_ptr<XmpApp::Playlist> playlist);
-  void RemovePlaylist(uint32_t handle);
+  // Whether it was the current playlist.
+  bool RemovePlaylist(uint32_t handle);
 
   XmpApp::Song* GetCurrentSong() const { return active_song_; }
 

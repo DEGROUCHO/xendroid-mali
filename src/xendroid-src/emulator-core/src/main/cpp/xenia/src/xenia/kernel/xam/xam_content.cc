@@ -14,6 +14,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/smc.h"
@@ -289,6 +290,37 @@ DECLARE_XAM_EXPORT1(XamContentCreateEnumerator, kContent, kImplemented);
 
 enum class kDispositionState : uint32_t { Unknown = 0, Create = 1, Open = 2 };
 
+// xam refuses root names with these characters after an optional
+// \??\ or \System??\ prefix in any case.
+static bool ValidRootName(std::string_view name) {
+  if (name.empty()) {
+    return false;
+  }
+  for (std::string_view prefix : {"\\??\\", "\\System??\\"}) {
+    if (xe::utf8::starts_with_case(name, prefix)) {
+      name.remove_prefix(prefix.size());
+      break;
+    }
+  }
+  return name.find_first_of(":;<=>?@!\"#$%&'()*+,-./[\\]") ==
+         std::string_view::npos;
+}
+
+// xam takes an ASCII file name but lets its first byte have the top bit set.
+static bool ValidFileName(const XCONTENT_DATA& content_data) {
+  const auto& name = content_data.file_name_raw;
+  if (!name[0]) {
+    return false;
+  }
+  for (size_t i = (uint8_t(name[0]) & 0x80) ? 1 : 0;
+       i < xe::countof(name) && name[i]; ++i) {
+    if (uint8_t(name[i]) & 0x80) {
+      return false;
+    }
+  }
+  return true;
+}
+
 dword_result_t xeXamContentCreate(dword_t user_index, lpstring_t root_name,
                                   lpvoid_t content_data_ptr,
                                   dword_t content_data_size, dword_t flags,
@@ -296,6 +328,20 @@ dword_result_t xeXamContentCreate(dword_t user_index, lpstring_t root_name,
                                   lpdword_t license_mask_ptr,
                                   dword_t cache_size, qword_t content_size,
                                   pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (cache_size > 0xEF000) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
+  }
+  // xam clears them before looking anything up.
+  if (disposition_ptr) {
+    *disposition_ptr = 0;
+  }
+  if (license_mask_ptr) {
+    *license_mask_ptr = 0;
+  }
+
   uint64_t xuid = 0;
   if (user_index != XUserIndexNone && user_index != XUserIndexAny) {
     const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
@@ -307,16 +353,8 @@ dword_result_t xeXamContentCreate(dword_t user_index, lpstring_t root_name,
     xuid = user->xuid();
   }
 
-  if (!root_name || *root_name == '\0') {
-    return X_ERROR_INVALID_NAME;
-  }
-
   // Check if we have something under provided symlink.
-  std::string symlink_path = root_name.value();
-  if (!symlink_path.ends_with(':')) {
-    symlink_path += ':';
-  }
-
+  const std::string symlink_path = root_name.value() + ':';
   if (kernel_state()->file_system()->IsSymbolicLinkRegistered(symlink_path)) {
     return X_ERROR_INVALID_PARAMETER;
   }
@@ -336,10 +374,6 @@ dword_result_t xeXamContentCreate(dword_t user_index, lpstring_t root_name,
   }
 
   auto content_manager = kernel_state()->content_manager();
-
-  if (overlapped_ptr && disposition_ptr) {
-    *disposition_ptr = 0;
-  }
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags,
               content_data, disposition_ptr, license_mask_ptr, overlapped_ptr](
@@ -434,9 +468,8 @@ dword_result_t XamContentCreateEx_entry(
     dword_t flags, lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     dword_t cache_size, qword_t content_size,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  auto content_data = *content_data_ptr.as<XCONTENT_DATA*>();
-  if (content_data.file_name_raw[0] == '\0') {
-    return X_ERROR_INVALID_NAME;
+  if (!ValidFileName(*content_data_ptr.as<XCONTENT_DATA*>())) {
+    return X_ERROR_INVALID_PARAMETER;
   }
   return xeXamContentCreate(user_index, root_name, content_data_ptr,
                             sizeof(XCONTENT_DATA), flags, disposition_ptr,
@@ -459,9 +492,8 @@ dword_result_t XamContentCreateInternal_entry(
     lpstring_t root_name, lpvoid_t content_data_ptr, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr, dword_t cache_size,
     qword_t content_size, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  auto content_data_internal = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
-  if (content_data_internal.file_name_raw[0] == '\0') {
-    return X_ERROR_INVALID_NAME;
+  if (!ValidFileName(*content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>())) {
+    return X_ERROR_INVALID_PARAMETER;
   }
   return xeXamContentCreate(XUserIndexNone, root_name, content_data_ptr,
                             sizeof(XCONTENT_AGGREGATE_DATA), flags,
@@ -481,6 +513,9 @@ DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
+  }
   X_RESULT result = X_ERROR_SUCCESS;
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
@@ -493,12 +528,16 @@ DECLARE_XAM_EXPORT1(XamContentFlush, kContent, kStub);
 
 dword_result_t XamContentClose_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
+  }
   // Closes a previously opened root from XamContentCreate*.
   auto result =
       kernel_state()->content_manager()->CloseContent(root_name.value());
 
   if (overlapped_ptr) {
-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    kernel_state()->CompleteOverlappedImmediateEx(
+        overlapped_ptr, result, X_HRESULT_FROM_WIN32(result), 0);
     return X_ERROR_IO_PENDING;
   } else {
     return result;
@@ -512,44 +551,44 @@ dword_result_t XamContentGetCreator_entry(
   if (!is_creator_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
-
-  const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
-
-  if (!user) {
-    return X_ERROR_NO_SUCH_USER;
-  }
+  // xam clears it before anything can fail.
+  *is_creator_ptr = 0;
 
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
-  auto run = [content_data, xuid = user->xuid(), user_index, is_creator_ptr,
-              creator_xuid_ptr, overlapped_ptr](uint32_t& extended_error,
-                                                uint32_t& length) -> X_RESULT {
+  auto run = [content_data, user_index, is_creator_ptr, creator_xuid_ptr,
+              overlapped_ptr](uint32_t& extended_error,
+                              uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_SUCCESS;
+    // xam looks the user up as the request runs and uses XUID 0 for indices
+    // past the four users.
+    uint64_t xuid = 0;
+    if (user_index < XUserMaxUserCount) {
+      const auto& user =
+          kernel_state()->xam_state()->GetUserProfile(user_index);
+      if (user) {
+        xuid = user->xuid();
+      } else {
+        result = X_ERROR_NO_SUCH_USER;
+      }
+    }
 
-    bool content_exists =
-        kernel_state()->content_manager()->ContentExists(xuid, content_data);
-
-    if (content_exists) {
-      if (content_data.content_type == XContentType::kSavedGame) {
+    if (!result) {
+      uint64_t creator = 0;
+      if (kernel_state()->content_manager()->ContentExists(xuid,
+                                                           content_data)) {
         // User always creates saves.
-        *is_creator_ptr = 1;
+        if (content_data.content_type == XContentType::kSavedGame) {
+          creator = xuid;
+        }
         if (creator_xuid_ptr) {
-          if (kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-            const auto& user_profile =
-                kernel_state()->xam_state()->GetUserProfile(user_index);
-            *creator_xuid_ptr = user_profile->xuid();
-          } else {
-            result = X_ERROR_NO_SUCH_USER;
-          }
+          *creator_xuid_ptr = creator;
         }
       } else {
-        *is_creator_ptr = 0;
-        if (creator_xuid_ptr) {
-          *creator_xuid_ptr = 0;
-        }
+        result = X_ERROR_PATH_NOT_FOUND;
       }
-    } else {
-      result = X_ERROR_PATH_NOT_FOUND;
+      // xam compares even when the content is missing.
+      *is_creator_ptr = creator == xuid;
     }
 
     extended_error = X_HRESULT_FROM_WIN32(result);

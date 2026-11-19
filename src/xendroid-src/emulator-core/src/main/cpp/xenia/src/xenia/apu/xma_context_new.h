@@ -288,6 +288,10 @@ class XmaContextNew : public XmaContext {
   uint32_t held_offset_ = 0;
   uint32_t held_subframe_ = 0;
   uint32_t held_buffer_ = 0;
+
+  // Set by ClearLocked to recreate the decoder on the next frame (the
+  // xmaframes decoder keeps its overlap history across avcodec_flush_buffers).
+  bool reset_decoder_ = false;
 };
 
 }  // namespace apu

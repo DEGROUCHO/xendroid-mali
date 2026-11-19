@@ -36,6 +36,7 @@ DECLARE_string(readback_resolve);
 DECLARE_bool(log_cp_wait_stats);
 DECLARE_bool(shared_memory_unwatch_dynamic_pages);
 DECLARE_bool(vulkan_pass_head_overlap);
+DECLARE_bool(vulkan_surface_skip_cpu_read);
 
 DEFINE_bool(log_depth_materialize_callers, false,
             "With vulkan_texture_from_render_target, add the call stacks "
@@ -553,6 +554,12 @@ void VulkanSharedMemory::MaterializeDepthSurfaces(uint32_t start,
     MakeRangeValid(base, size, true);
     ++depth_provider_stats_.materializations;
     depth_provider_stats_.cpu_accesses += depth_surfaces_[i].requested;
+    if (depth_surfaces_[i].requested && cvars::vulkan_surface_skip_cpu_read &&
+        (surface_cpu_read_skips_.size() < 256 ||
+         surface_cpu_read_skips_.count(base))) {
+      // Retried after this many resolves: the guest may stop reading it.
+      surface_cpu_read_skips_[base] = 240;
+    }
     depth_provider_stats_.materialized_bytes += size;
     depth_provider_stats_.pending_bytes -= size;
     depth_materializing_ = false;
@@ -613,6 +620,14 @@ std::string VulkanSharedMemory::TakeMaterializeCallers() {
 
 void VulkanSharedMemory::OnCpuRangeAccess(uint32_t start, uint32_t length) {
   PrepareForCpuAccess(start, length);
+}
+
+bool VulkanSharedMemory::ConsumeSurfaceCpuReadSkip(uint32_t start) {
+  if (!cvars::vulkan_surface_skip_cpu_read) return false;
+  auto it = surface_cpu_read_skips_.find(start);
+  if (it == surface_cpu_read_skips_.end()) return false;
+  if (!--it->second) surface_cpu_read_skips_.erase(it);
+  return true;
 }
 
 bool VulkanSharedMemory::OnRangeRequested(uint32_t start, uint32_t length) {
@@ -1075,12 +1090,13 @@ void VulkanSharedMemory::EndSubmission() {
 }
 
 void VulkanSharedMemory::Use(Usage usage,
-                             std::pair<uint32_t, uint32_t> written_range) {
+                             std::pair<uint32_t, uint32_t> written_range,
+                             bool materialize) {
   // Guest draws declare kGuestDrawReadWrite without a range up front for
   // in-pass resolves; those request their destination range themselves, so
   // the declaration alone must not materialize every pending surface (it did
   // so at the draw right after each publish, idling the GPU every time).
-  if (usage != Usage::kRead && !depth_surfaces_.empty() &&
+  if (materialize && usage != Usage::kRead && !depth_surfaces_.empty() &&
       (written_range.second || usage != Usage::kGuestDrawReadWrite)) {
     MaterializeDepthSurfaces(written_range.second ? written_range.first : 0,
                             written_range.second ? written_range.second

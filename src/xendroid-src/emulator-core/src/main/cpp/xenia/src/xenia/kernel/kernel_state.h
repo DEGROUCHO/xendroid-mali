@@ -238,6 +238,9 @@ class KernelState {
 
   object_ref<XThread> LaunchModule(object_ref<UserModule> module);
   object_ref<UserModule> GetExecutableModule();
+  // Set when the executable's title update failed to apply and it started
+  // without it; modules loaded later then skip the update too.
+  void ResetTitleUpdateState() { title_update_failed_ = false; }
   void SetExecutableModule(object_ref<UserModule> module);
   object_ref<UserModule> LoadUserModule(const std::string_view name,
                                         bool call_entry = true);
@@ -302,8 +305,10 @@ class KernelState {
   util::NativeList* dpc_list() { return &dpc_list_; }
 
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
+  // The completion routine runs on thread_handle, the requester's thread.
   void CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
-                            uint32_t extended_error, uint32_t length);
+                            uint32_t extended_error, uint32_t length,
+                            X_HANDLE thread_handle);
 
   void CompleteOverlappedImmediate(uint32_t overlapped_ptr, X_RESULT result);
   void CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESULT result,
@@ -391,6 +396,7 @@ class KernelState {
   util::ObjectTable object_table_;
   std::unordered_map<uint32_t, XThread*> threads_by_id_;
   std::vector<object_ref<XNotifyListener>> notify_listeners_;
+  bool title_update_failed_ = false;
   bool has_notified_startup_ = false;
   bool has_notified_live_startup_ = false;
   bool has_notified_xmp_startup_ = false;

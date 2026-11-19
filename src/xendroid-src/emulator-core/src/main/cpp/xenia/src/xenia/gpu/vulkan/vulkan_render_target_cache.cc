@@ -184,6 +184,7 @@ DEFINE_bool(
     "Vulkan");
 
 DECLARE_int32(log_draw_overwrite_cutouts);
+DECLARE_bool(vulkan_deferred_surface_resolve);
 DEFINE_bool(
     vulkan_color_surface_resolve, true,
     "With vulkan_texture_from_render_target, also serve raw 8_8_8_8 resolves "
@@ -191,6 +192,26 @@ DEFINE_bool(
     "reads them, writing guest memory only if something else reads it.",
     "GPU");
 UPDATE_from_bool(vulkan_color_surface_resolve, 2026, 10, 24, 18, false);
+DEFINE_bool(
+    vulkan_surface_skip_cpu_read, false,
+    "A zero-copy resolve surface the CPU read back (a compute plus a GPU wait "
+    "at the access) makes the next 240 resolves to the same address take the "
+    "plain memory path: the guest reads them on the CPU, the texture draw and "
+    "the write-back compute are pure cost there (Assassin's Creed Rogue: "
+    "about 70 per second, never sampled as a texture).",
+    "GPU");
+DEFINE_bool(
+    vulkan_color_surface_resolve_wide, false,
+    "With vulkan_color_surface_resolve, also draw raw 1x resolves of "
+    "2_10_10_10, 16_16_FLOAT and 16_16_16_16_FLOAT render targets straight "
+    "into the texture of the same format (bloom chains, HDR copies) instead "
+    "of resolving to memory and loading the texture back.",
+    "GPU");
+DEFINE_bool(vulkan_resolve_prefix_overwrite_discard, false,
+            "A resolve from the origin across the whole pitch also drops the "
+            "older pending resolves inside the whole 32-row tile rows it "
+            "rewrites when its extent is not exactly its page range.",
+            "GPU");
 DEFINE_bool(vulkan_resolve_full_overwrite_discard, true,
             "A resolve rewriting every byte of its destination range drops the "
             "older pending (not yet written back) resolves inside that range "
@@ -266,7 +287,7 @@ DEFINE_bool(
     vulkan_same_depth_stencil_ops, false,
     "Give the depth and the stencil aspect of a guest render pass the same "
     "load and store operations (the one keeping more of the contents), the "
-    "workaround of PPSSPP, ARMSX2 and hakuX for Mali drivers corrupting "
+    "workaround for Mali drivers corrupting "
     "depth / stencil attachments whose two aspects have different load "
     "operations. Off: it didn't remove the Black Ops squares (BO-DS1, q612).",
     "Vulkan");
@@ -1923,15 +1944,17 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                          depth_surface_render_pass_);
   depth_surface_pipeline_attempted_ = false;
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
-                                         color_materialize_pipeline_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
-                                         color_surface_pipeline_);
+  for (uint32_t i = 0; i < VulkanTextureCache::kColorSurfaceKindCount; ++i) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                           color_materialize_pipeline_[i]);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                           color_surface_pipeline_[i]);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                                           color_surface_render_pass_[i]);
+    color_surface_pipeline_attempted_[i] = false;
+  }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          color_surface_pipeline_layout_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
-                                         color_surface_render_pass_);
-  color_surface_pipeline_attempted_ = false;
   pending_clear_render_target_ = nullptr;
   pending_clear_transfers_.clear();
   deferred_clear_render_target_ = nullptr;
@@ -2308,6 +2331,7 @@ bool VulkanRenderTargetCache::TransferRuntimeHostTargets(
         staging, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
   }
+  if (restore) XELOGI("GPU restore: EDRAM upload submitted, waiting for the GPU");
   if (!command_processor_.EndSubmission(false) ||
       !command_processor_.AwaitAllQueueOperationsCompletion()) {
     snapshot_quarantine_.push_back({staging, allocation});
@@ -2379,6 +2403,10 @@ void VulkanRenderTargetCache::ClearCache() {
   }
   render_passes_.clear();
   render_pass_keys_.clear();
+
+  // Queued in-pass transfers point to render targets that the common
+  // ClearCache may delete (a source that just lost its EDRAM range).
+  ClearPendingDrawPassTransfers();
 
   RenderTargetCache::ClearCache();
 }
@@ -4381,7 +4409,11 @@ bool VulkanRenderTargetCache::BeginDeferredResolve(
   info.GetCopyEdramTileSpan(base, width, rows, pitch);
   GetResolveCopyRectanglesToDump(base, width, rows, pitch, dump_rectangles_);
   MaterializePendingConstantRowsForDump(base, pitch, dump_rectangles_);
-  if (dump_rectangles_.empty()) return false;
+  // Materializing clears out of the pass: it executed the pending tail and
+  // ended the pass, so there is nothing left to defer behind.
+  if (dump_rectangles_.empty() || !command_processor_.in_render_pass_) {
+    return false;
+  }
   for (const auto& rectangle : dump_rectangles_) {
     const auto* target =
         static_cast<const VulkanRenderTarget*>(rectangle.render_target);
@@ -4663,17 +4695,27 @@ bool VulkanRenderTargetCache::EnsureDepthSurfacePipeline() {
   return result == VK_SUCCESS;
 }
 
-bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
-  if (color_surface_pipeline_ != VK_NULL_HANDLE) return true;
-  if (color_surface_pipeline_attempted_) return false;
-  color_surface_pipeline_attempted_ = true;
+bool VulkanRenderTargetCache::EnsureColorSurfacePipeline(
+    VulkanTextureCache::ColorSurfaceKind kind) {
+  if (kind >= VulkanTextureCache::kColorSurfaceKindCount) return false;
+  if (color_surface_pipeline_[kind] != VK_NULL_HANDLE) return true;
+  if (color_surface_pipeline_attempted_[kind]) return false;
+  color_surface_pipeline_attempted_[kind] = true;
+  // Float render targets are sampled through their ownership transfer (uint)
+  // view: the exact half bits, converted to float for the float attachment.
+  const bool source_uint =
+      kind == VulkanTextureCache::kColorSurface16_16Float ||
+      kind == VulkanTextureCache::kColorSurface16_16_16_16Float;
+  const uint32_t tile_width_pixels =
+      xenos::kEdramTileWidthSamples >>
+      uint32_t(VulkanTextureCache::IsColorSurface64bpp(kind));
   const auto* vk = command_processor_.GetVulkanDevice();
   const auto& dfn = vk->functions();
   const VkDevice device = vk->device();
-  if (color_surface_render_pass_ == VK_NULL_HANDLE) {
-    // The k_8_8_8_8 texture the guest samples, written whole.
+  if (color_surface_render_pass_[kind] == VK_NULL_HANDLE) {
+    // The texture the guest samples, written whole.
     VkAttachmentDescription attachment = {};
-    attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachment.format = VulkanTextureCache::GetColorSurfaceVulkanFormat(kind);
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -4693,7 +4735,7 @@ bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
     pass.subpassCount = 1;
     pass.pSubpasses = &subpass;
     if (dfn.vkCreateRenderPass(device, &pass, nullptr,
-                              &color_surface_render_pass_) != VK_SUCCESS)
+                              &color_surface_render_pass_[kind]) != VK_SUCCESS)
       return false;
   }
   if (color_surface_pipeline_layout_ == VK_NULL_HANDLE) {
@@ -4721,7 +4763,7 @@ bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
   const auto f4 = b.makeVectorType(f, 4), u2 = b.makeVectorType(u, 2);
   const auto boolean = b.makeBoolType();
   auto image = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
-      b.makeImageType(f, spv::Dim2D, false, false, false, 1,
+      b.makeImageType(source_uint ? u : f, spv::Dim2D, false, false, false, 1,
                        spv::ImageFormatUnknown), "color_source");
   b.addDecoration(image, spv::DecorationDescriptorSet, 0);
   b.addDecoration(image, spv::DecorationBinding, 0);
@@ -4758,7 +4800,7 @@ bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
       b.createCompositeExtract(coord, f, 0)), constant(4));
   auto y = add(b.createUnaryOp(spv::OpConvertFToU, u,
       b.createCompositeExtract(coord, f, 1)), constant(5));
-  auto tx = div(x, b.makeUintConstant(80));
+  auto tx = div(x, b.makeUintConstant(tile_width_pixels));
   auto ty = div(y, b.makeUintConstant(16));
   // Disjoint ownership rectangles in resolve-tile coordinates. Padding is
   // never published: preflight proves exactly one owner for every tile.
@@ -4784,17 +4826,45 @@ bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
   }
   auto local_tile = b.createBinOp(spv::OpISub, u,
       add(constant(0), add(mul(ty, constant(1)), tx)), constant(2));
-  auto sx = add(mul(mod(local_tile, constant(3)), b.makeUintConstant(80)),
-                 mod(x, b.makeUintConstant(80)));
+  auto sx = add(mul(mod(local_tile, constant(3)),
+                    b.makeUintConstant(tile_width_pixels)),
+                mod(x, b.makeUintConstant(tile_width_pixels)));
   auto sy = add(mul(div(local_tile, constant(3)), b.makeUintConstant(16)),
                  mod(y, b.makeUintConstant(16)));
   spv::Builder::TextureParameters sample = {};
   sample.sampler = b.createLoad(image, spv::NoPrecision);
   sample.coords = b.createCompositeConstruct(u2, std::vector<spv::Id>{sx, sy});
   sample.lod = b.makeIntConstant(0);
-  auto texel = b.createTextureCall(spv::NoPrecision, f4, false, true, false,
+  spv::Id texel;
+  if (source_uint) {
+    // The raw halves (unpackHalf2x16 is exact; the attachment write converts
+    // back to the same half for every finite value).
+    auto raw = b.createTextureCall(spv::NoPrecision, u4, false, true, false,
                                    false, false, sample,
                                    spv::ImageOperandsMaskNone);
+    const auto f2 = b.makeVectorType(f, 2);
+    auto halves = [&](uint32_t first) {
+      auto packed = b.createBinOp(spv::OpBitwiseOr, u,
+          b.createCompositeExtract(raw, u, first),
+          b.createBinOp(spv::OpShiftLeftLogical, u,
+                        b.createCompositeExtract(raw, u, first + 1),
+                        b.makeUintConstant(16)));
+      return b.createBuiltinCall(f2, glsl, GLSLstd450UnpackHalf2x16,
+                                 std::vector<spv::Id>{packed});
+    };
+    auto rg = halves(0);
+    spv::Id ba = b.makeCompositeConstant(
+        f2, std::vector<spv::Id>{b.makeFloatConstant(0.0f),
+                                 b.makeFloatConstant(1.0f)});
+    if (VulkanTextureCache::IsColorSurface64bpp(kind)) ba = halves(2);
+    texel = b.createCompositeConstruct(f4, std::vector<spv::Id>{
+        b.createCompositeExtract(rg, f, 0), b.createCompositeExtract(rg, f, 1),
+        b.createCompositeExtract(ba, f, 0), b.createCompositeExtract(ba, f, 1)});
+  } else {
+    texel = b.createTextureCall(spv::NoPrecision, f4, false, true, false,
+                                false, false, sample,
+                                spv::ImageOperandsMaskNone);
+  }
   auto swapped = b.createRvalueSwizzle(spv::NoPrecision, f4, texel,
                                        std::vector<unsigned>{2, 1, 0, 3});
   auto swap = b.createBinOp(spv::OpINotEqual, boolean, constant(11),
@@ -4868,10 +4938,10 @@ bool VulkanRenderTargetCache::EnsureColorSurfacePipeline() {
   pipeline.pColorBlendState = &blend;
   pipeline.pDynamicState = &dynamic;
   pipeline.layout = color_surface_pipeline_layout_;
-  pipeline.renderPass = color_surface_render_pass_;
+  pipeline.renderPass = color_surface_render_pass_[kind];
   pipeline.basePipelineIndex = -1;
   const auto result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-      &pipeline, nullptr, &color_surface_pipeline_);
+      &pipeline, nullptr, &color_surface_pipeline_[kind]);
   dfn.vkDestroyShaderModule(device, fragment, nullptr);
   return result == VK_SUCCESS;
 }
@@ -5040,11 +5110,39 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
     std::vector<VulkanTextureCache::DepthSurfaceTarget>& targets) {
   assert_true(lock.owns_lock());
   auto& stats = depth_surface_stats_;
+  // Render target formats whose resolve to the texture format is a raw copy
+  // with the same Vulkan format on both sides.
+  const auto edram_format =
+      xenos::ColorRenderTargetFormat(info.color_edram_info.format);
+  const auto kind = VulkanTextureCache::GetColorSurfaceKind(
+      xenos::TextureFormat(info.copy_dest_info.copy_dest_format));
+  auto rt_format_matches = [&](xenos::ColorRenderTargetFormat format) {
+    switch (kind) {
+      case VulkanTextureCache::kColorSurface8888:
+        return format == xenos::ColorRenderTargetFormat::k_8_8_8_8;
+      case VulkanTextureCache::kColorSurface2101010:
+        return format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+               format ==
+                   xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10;
+      case VulkanTextureCache::kColorSurface16_16Float:
+        return format == xenos::ColorRenderTargetFormat::k_16_16_FLOAT;
+      case VulkanTextureCache::kColorSurface16_16_16_16Float:
+        return format == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT;
+      default:
+        return false;
+    }
+  };
+  // The red / blue swap is exact for the 4-component 32bpp unorm formats; the
+  // float ones are taken only unswapped.
+  const bool swap_supported =
+      kind == VulkanTextureCache::kColorSurface8888 ||
+      kind == VulkanTextureCache::kColorSurface2101010;
   if (GetPath() != Path::kHostRenderTargets || info.IsCopyingDepth() ||
-      info.color_edram_info.format !=
-          uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8) ||
-      uint32_t(info.copy_dest_info.copy_dest_format) !=
-          uint32_t(xenos::TextureFormat::k_8_8_8_8) ||
+      kind == VulkanTextureCache::kColorSurfaceKindCount ||
+      (kind != VulkanTextureCache::kColorSurface8888 &&
+       !cvars::vulkan_color_surface_resolve_wide) ||
+      !rt_format_matches(edram_format) ||
+      (info.copy_dest_info.copy_dest_swap && !swap_supported) ||
       IsDrawResolutionScaled() || info.copy_dest_info.copy_dest_array ||
       uint32_t(info.copy_dest_info.copy_dest_endian) >= 4 ||
       info.copy_dest_x0 || info.copy_dest_y0 ||
@@ -5075,6 +5173,19 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
     ++stats.fallback_msaa;
     return false;
   }
+  if (kind != VulkanTextureCache::kColorSurface8888) {
+    // Exactly the resolves the guest-memory path copies raw (fast shader):
+    // number format, exponent bias and gamma conversions stay there.
+    draw_util::ResolveCopyShaderConstants copy_constants;
+    uint32_t group_count_x, group_count_y;
+    const auto copy_shader =
+        info.GetCopyShader(1, 1, copy_constants, group_count_x, group_count_y);
+    if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA &&
+        copy_shader != draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA) {
+      ++stats.fallback_schema;
+      return false;
+    }
+  }
   uint32_t base, width_tiles, rows, pitch;
   info.GetCopyEdramTileSpan(base, width_tiles, rows, pitch);
   GetResolveCopyRectanglesToDump(base, width_tiles, rows, pitch, dump_rectangles_);
@@ -5092,8 +5203,7 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
       return false;
     }
     const auto key = rt->key();
-    if (key.is_depth ||
-        key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+    if (key.is_depth || !rt_format_matches(key.GetColorFormat()) ||
         key.msaa_samples != xenos::MsaaSamples::k1X || GetKeyScaleX(key) != 1 ||
         GetKeyScaleY(key) != 1 || !key.GetPitchTiles() ||
         rt->current_layout() == VK_IMAGE_LAYOUT_UNDEFINED ||
@@ -5122,11 +5232,19 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
     ++stats.fallback_owner;
     return false;
   }
-  if (!EnsureColorSurfacePipeline()) {
+  if (!EnsureColorSurfacePipeline(kind)) {
     ++stats.fallback_resource;
     return false;
   }
-  targets = texture_cache.PrepareDepthSurfaceTargets(info, color_surface_render_pass_, lock);
+  targets = texture_cache.PrepareDepthSurfaceTargets(
+      info, color_surface_render_pass_[kind], lock);
+  // Only textures made renderable for this kind (the framebuffer format).
+  targets.erase(std::remove_if(targets.begin(), targets.end(),
+                    [kind](const VulkanTextureCache::DepthSurfaceTarget& t) {
+                      return VulkanTextureCache::GetTextureColorSurfaceKind(
+                                 *t.texture) != kind;
+                    }),
+                targets.end());
   if (targets.empty()) {
     ++stats.fallback_texture;
     return false;
@@ -5164,11 +5282,12 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
     texture_cache.BeginDepthSurfaceTarget(target);
     command_processor_.SubmitBarriers(true);
     VkRenderPassBeginInfo begin = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    begin.renderPass = color_surface_render_pass_;
+    begin.renderPass = color_surface_render_pass_[kind];
     begin.framebuffer = target.framebuffer;
     begin.renderArea.extent = {target.width, target.height};
     commands.CmdVkBeginRenderPass(&begin, VK_SUBPASS_CONTENTS_INLINE);
-    command_processor_.BindExternalGraphicsPipeline(color_surface_pipeline_);
+    command_processor_.BindExternalGraphicsPipeline(
+        color_surface_pipeline_[kind]);
     VkViewport viewport = {0, 0, float(target.width), float(target.height), 0, 1};
     command_processor_.SetViewport(viewport);
     VkRect2D scissor = {{0, 0}, {target.width, target.height}};
@@ -5193,8 +5312,12 @@ bool VulkanRenderTargetCache::DrawColorSurfaceResolve(
     command_processor_.SubmitBarriers(true);
     ++stats.snapshots;
     // Logical payload only; AFBC and physical bus transactions are not inferred.
-    stats.surface_read_bytes += uint64_t(target.width) * target.height * 4;
-    stats.surface_write_bytes += uint64_t(target.width) * target.height * 4;
+    const uint64_t texel_bytes =
+        VulkanTextureCache::IsColorSurface64bpp(kind) ? 8 : 4;
+    stats.surface_read_bytes +=
+        uint64_t(target.width) * target.height * texel_bytes;
+    stats.surface_write_bytes +=
+        uint64_t(target.width) * target.height * texel_bytes;
   }
   return true;
 }
@@ -5512,7 +5635,7 @@ void VulkanRenderTargetCache::DiscardSurfaceOverwrittenByResolve(
       uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5;
   const uint32_t rows = info.height_div_8 << 3;
   if (cvars::log_depth_materialize_callers &&
-      info.copy_dest_extent_length >= (UINT32_C(4) << 20)) {
+      info.copy_dest_extent_length >= (UINT32_C(1) << 20)) {
     static uint32_t logged = 0;
     if (logged < 40) {
       ++logged;
@@ -5530,19 +5653,42 @@ void VulkanRenderTargetCache::DiscardSurfaceOverwrittenByResolve(
   if (!format_info || (format_info->bits_per_pixel & 7) ||
       info.copy_dest_info.copy_dest_array || info.copy_dest_x0 ||
       info.copy_dest_y0 || (info.coordinate_info.width_div_8 << 3) < pitch ||
-      (rows & 31) || start != info.copy_dest_extent_start ||
-      end - start != info.copy_dest_extent_length ||
-      uint64_t(pitch) * rows * (format_info->bits_per_pixel >> 3) !=
-          info.copy_dest_extent_length) {
+      start != info.copy_dest_extent_start) {
     return;
   }
-  if (shared_memory.DiscardDepthSurfacesWithin(start, uint32_t(end - start))) {
-    shared_memory.RangeWrittenByGpu(start, uint32_t(end - start));
+  // Tiled (and linear) 2D layouts store each run of 32 rows across the whole
+  // pitch contiguously, so a resolve from the origin over the whole pitch
+  // writes every byte of [extent start, start + pitch * full tile rows * bpp)
+  // even when its last tile row is partial: pending surfaces inside that
+  // prefix are dead too.
+  const uint64_t covered =
+      uint64_t(pitch) * rows * (format_info->bits_per_pixel >> 3);
+  uint64_t covered_end = end;
+  if ((rows & 31) || end - start != info.copy_dest_extent_length ||
+      covered != info.copy_dest_extent_length) {
+    if (!cvars::vulkan_resolve_prefix_overwrite_discard) return;
+    covered_end = (uint64_t(start) + uint64_t(pitch) * (rows & ~uint32_t(31)) *
+                                         (format_info->bits_per_pixel >> 3)) &
+                  ~uint64_t(page_mask);
+    if (covered_end > uint64_t(info.copy_dest_extent_start) +
+                          info.copy_dest_extent_length) {
+      return;
+    }
+    if (covered_end <= start) return;
+  }
+  const uint32_t dropped =
+      shared_memory.DiscardDepthSurfacesWithin(start, uint32_t(covered_end - start));
+  if (dropped) {
+    shared_memory.RangeWrittenByGpu(start, uint32_t(covered_end - start));
+    if (covered_end != end) depth_surface_stats_.prefix_discards += dropped;
   }
 }
 
-bool VulkanRenderTargetCache::EnsureColorMaterializePipeline() {
-  if (color_materialize_pipeline_ != VK_NULL_HANDLE) return true;
+bool VulkanRenderTargetCache::EnsureColorMaterializePipeline(
+    VulkanTextureCache::ColorSurfaceKind kind) {
+  if (kind >= VulkanTextureCache::kColorSurfaceKindCount) return false;
+  if (color_materialize_pipeline_[kind] != VK_NULL_HANDLE) return true;
+  const bool is_64bpp = VulkanTextureCache::IsColorSurface64bpp(kind);
   // Same layout as the depth provider (binding 1 unused here).
   if (!EnsureDepthMaterializePipeline()) return false;
   const auto* vk = command_processor_.GetVulkanDevice();
@@ -5611,25 +5757,65 @@ bool VulkanRenderTargetCache::EnsureColorMaterializePipeline() {
   auto texel = b.createTextureCall(spv::NoPrecision, f4, false, true, false,
                                    false, false, sample,
                                    spv::ImageOperandsMaskNone);
-  auto value = b.createBuiltinCall(u, glsl, GLSLstd450PackUnorm4x8,
-                                   std::vector<spv::Id>{texel});
+  // The guest words of the texel, as the texture loader reads them back.
+  const auto f2 = b.makeVectorType(f, 2);
+  auto component = [&](uint32_t i) { return b.createCompositeExtract(texel, f, i); };
+  auto pack_half = [&](uint32_t first) {
+    return b.createBuiltinCall(u, glsl, GLSLstd450PackHalf2x16,
+        std::vector<spv::Id>{b.createCompositeConstruct(
+            f2, std::vector<spv::Id>{component(first), component(first + 1)})});
+  };
+  auto unorm = [&](uint32_t i, float scale) {
+    // round(x * scale), x already in [0, 1] (a unorm texel).
+    return b.createUnaryOp(spv::OpConvertFToU, u,
+        b.createBinOp(spv::OpFAdd, f,
+            b.createBinOp(spv::OpFMul, f, component(i), b.makeFloatConstant(scale)),
+            b.makeFloatConstant(0.5f)));
+  };
+  spv::Id values[2] = {};
+  switch (kind) {
+    case VulkanTextureCache::kColorSurface2101010:
+      values[0] = join(join(unorm(0, 1023.0f), shl(unorm(1, 1023.0f), 10)),
+                       join(shl(unorm(2, 1023.0f), 20), shl(unorm(3, 3.0f), 30)));
+      break;
+    case VulkanTextureCache::kColorSurface16_16Float:
+      values[0] = pack_half(0);
+      break;
+    case VulkanTextureCache::kColorSurface16_16_16_16Float:
+      values[0] = pack_half(0);
+      values[1] = pack_half(2);
+      break;
+    default:
+      values[0] = b.createBuiltinCall(u, glsl, GLSLstd450PackUnorm4x8,
+                                      std::vector<spv::Id>{texel});
+      break;
+  }
   auto endian = constant(4);
   auto eq = [&](uint32_t n) { return b.createBinOp(spv::OpIEqual, boolean, endian, b.makeUintConstant(n)); };
-  value = b.createTriOp(spv::OpSelect, u, b.createBinOp(spv::OpLogicalOr, boolean, eq(1), eq(2)),
-      join(shl(mask(value, 0x00FF00FF), 8), shr(mask(value, 0xFF00FF00), 8)), value);
-  value = b.createTriOp(spv::OpSelect, u, b.createBinOp(spv::OpLogicalOr, boolean, eq(2), eq(3)),
-      join(shl(value, 16), shr(value, 16)), value);
-  // XenosTextureTiledAddress2D, fixed 32bpp. No offset/array/mip variants.
+  for (auto& value : values) {
+    if (!value) continue;
+    value = b.createTriOp(spv::OpSelect, u, b.createBinOp(spv::OpLogicalOr, boolean, eq(1), eq(2)),
+        join(shl(mask(value, 0x00FF00FF), 8), shr(mask(value, 0xFF00FF00), 8)), value);
+    value = b.createTriOp(spv::OpSelect, u, b.createBinOp(spv::OpLogicalOr, boolean, eq(2), eq(3)),
+        join(shl(value, 16), shr(value, 16)), value);
+  }
+  // XenosTextureTiledAddress2D (texture_util GetTiledOffset2D), 32 or 64bpp.
+  // No offset/array/mip variants.
   auto outer = shl(op(spv::OpIAdd, op(spv::OpIMul, shr(y, 5), constant(2)), shr(x, 5)), 6);
   auto inner = join(shl(mask(shr(y, 1), 7), 3), mask(x, 7));
-  auto oi = shl(join(outer, inner), 2);
+  auto oi = shl(join(outer, inner), is_64bpp ? 3 : 2);
   auto pipe = op(spv::OpBitwiseXor, mask(shr(x, 3), 3), shl(mask(shr(y, 3), 1), 1));
   auto offset = join(join(shl(mask(y, 1), 4), shl(pipe, 6)), shl(mask(shr(y, 4), 1), 11));
   offset = join(offset, join(mask(oi, 15), shl(mask(shr(oi, 4), 1), 5)));
   offset = join(offset, join(shl(mask(shr(oi, 5), 7), 8), shl(shr(oi, 8), 12)));
   auto address = shr(op(spv::OpIAdd, constant(3), offset), 2);
-  b.createStore(value, b.createAccessChain(storage, dest,
+  b.createStore(values[0], b.createAccessChain(storage, dest,
       std::vector<spv::Id>{b.makeIntConstant(0), address}));
+  if (values[1]) {
+    b.createStore(values[1], b.createAccessChain(storage, dest,
+        std::vector<spv::Id>{b.makeIntConstant(0),
+                             op(spv::OpIAdd, address, b.makeUintConstant(1))}));
+  }
   b.leaveFunction();
   b.addExecutionMode(main, spv::ExecutionModeLocalSize, 8, 8, 1);
   auto ep = b.addEntryPoint(spv::ExecutionModelGLCompute, main, "main");
@@ -5648,7 +5834,7 @@ bool VulkanRenderTargetCache::EnsureColorMaterializePipeline() {
   ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = module; ci.stage.pName = "main";
   ci.layout = depth_materialize_pipeline_layout_;
   const auto result = dfn.vkCreateComputePipelines(vk->device(), VK_NULL_HANDLE, 1, &ci,
-      nullptr, &color_materialize_pipeline_);
+      nullptr, &color_materialize_pipeline_[kind]);
   dfn.vkDestroyShaderModule(vk->device(), module, nullptr);
   return result == VK_SUCCESS;
 }
@@ -5674,12 +5860,18 @@ bool VulkanRenderTargetCache::TryDeferredDepthSurfaceResolve(
   }
   const uint32_t page_mask = (1u << shared_memory.depth_surface_page_size_log2()) - 1;
   const uint32_t start = info.copy_dest_extent_start & ~page_mask;
+  if (shared_memory.ConsumeSurfaceCpuReadSkip(start)) {
+    ++depth_surface_stats_.fallback_cpu_read;
+    return false;
+  }
   const uint64_t end = (uint64_t(info.copy_dest_extent_start) + info.copy_dest_extent_length + page_mask) & ~uint64_t(page_mask);
   if (end > SharedMemory::kBufferSize || end <= start || end - start > (8u << 20) ||
       command_processor_.memory_->GetPhysicalHeap()->QueryRangeAccess(start, uint32_t(end - 1)) !=
           xe::memory::PageAccess::kReadWrite ||
       !(depth ? EnsureDepthMaterializePipeline()
-              : EnsureColorMaterializePipeline())) {
+              : EnsureColorMaterializePipeline(
+                    VulkanTextureCache::GetColorSurfaceKind(xenos::TextureFormat(
+                        info.copy_dest_info.copy_dest_format))))) {
     ++depth_surface_stats_.fallback_schema;
     static uint32_t range_logged = 0;
     if (range_logged < 8) {
@@ -5784,8 +5976,11 @@ bool VulkanRenderTargetCache::MaterializeDepthSurface(
                     {info.copy_dest_extent_start, info.copy_dest_extent_length});
   auto& commands = command_processor_.deferred_command_buffer();
   command_processor_.BindExternalComputePipeline(
-      info.IsCopyingDepth() ? depth_materialize_pipeline_
-                            : color_materialize_pipeline_);
+      info.IsCopyingDepth()
+          ? depth_materialize_pipeline_
+          : color_materialize_pipeline_[VulkanTextureCache::
+                                            GetTextureColorSurfaceKind(
+                                                *target.texture)]);
   VkDescriptorSet sets[] = {source, dest};
   commands.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
       depth_materialize_pipeline_layout_, 0, 2, sets, 0, nullptr);
@@ -5981,7 +6176,8 @@ bool VulkanRenderTargetCache::Resolve(
       }
       if (!untile_row_offset_pixels_ &&
           RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
-          !command_processor_.deferred_resolve_recording_ &&
+          (!command_processor_.deferred_resolve_recording_ ||
+           cvars::vulkan_deferred_surface_resolve) &&
           TryDeferredDepthSurfaceResolve(resolve_info, shared_memory,
                                         texture_cache)) {
         copied = surface_resolve_taken = true;
@@ -6626,7 +6822,8 @@ void VulkanRenderTargetCache::LogResolveDetailsOnFrameEnd() {
              "cpu_provider={} discarded={} discarded_bytes={} pending_bytes={} estimated_bytes_saved={} "
              "logical_surface_read_bytes={} logical_surface_write_bytes={} "
              "fallback_schema={} fallback_msaa={} fallback_owner={} fallback_texture={} "
-             "fallback_resource={} fallback_stencil={} callers:{}",
+             "fallback_resource={} fallback_stencil={} fallback_cpu_read={} prefix_discards={} "
+             "callers:{}",
              seconds, d.surface_resolves, d.resolves_without_compute, d.snapshots, d.texture_hits,
              d.demand_computes, p.materializations, p.gpu_materializations,
              p.materialized_bytes, p.cpu_accesses,
@@ -6634,6 +6831,7 @@ void VulkanRenderTargetCache::LogResolveDetailsOnFrameEnd() {
              d.surface_read_bytes,
              d.surface_write_bytes, d.fallback_schema, d.fallback_msaa, d.fallback_owner,
              d.fallback_texture, d.fallback_resource, d.fallback_stencil,
+             d.fallback_cpu_read, d.prefix_discards,
              command_processor_.shared_memory_->TakeMaterializeCallers());
       d = {};
       d.last_report_ns = now;
@@ -8661,10 +8859,11 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     VkRenderingAttachmentInfo& color_attachment = color_attachments[i];
     std::memset(&color_attachment, 0, sizeof(VkRenderingAttachmentInfo));
+    // Unused slots below the last used one are passed too (with a null view).
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     if (!(key.depth_and_color_used & (1 << (1 + i)))) {
       continue;
     }
-    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     color_attachment_count = i + 1;
     if (!rts[1 + i]) {
       continue;

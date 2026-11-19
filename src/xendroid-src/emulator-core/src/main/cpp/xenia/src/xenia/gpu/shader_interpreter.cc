@@ -130,7 +130,7 @@ void ShaderInterpreter::Execute() {
             *reinterpret_cast<const ucode::ControlFlowLoopStartInstruction*>(
                 &cf_instr);
         assert_true(state_.loop_stack_depth < 4);
-        if (++state_.loop_stack_depth > 4) {
+        if (state_.loop_stack_depth >= 4) {
           cf_index_next = cf_loop_start.address();
           continue;
         }
@@ -152,11 +152,6 @@ void ShaderInterpreter::Execute() {
       case ucode::ControlFlowOpcode::kLoopEnd: {
         assert_not_zero(state_.loop_stack_depth);
         if (!state_.loop_stack_depth) {
-          continue;
-        }
-        assert_true(state_.loop_stack_depth <= 4);
-        if (state_.loop_stack_depth > 4) {
-          --state_.loop_stack_depth;
           continue;
         }
         ucode::ControlFlowLoopEndInstruction cf_loop_end =
@@ -1069,7 +1064,8 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(
     }
 
     uint32_t packed_components = 0b0000;
-    uint32_t packed_widths[4], packed_offsets[4];
+    // Component 0 (and 2 of 16_16_16_16, in the second dword) is at bit 0.
+    uint32_t packed_widths[4] = {}, packed_offsets[4] = {};
     uint32_t packed_dwords[] = {data[0], data[0]};
     switch (instr.data_format()) {
       case xenos::VertexFormat::k_8_8_8_8: {
@@ -1216,8 +1212,8 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(
             continue;
           }
           uint32_t packed_width = packed_widths[i];
-          result[i] = float(packed_dwords[i >> 1] &
-                            ((UINT32_C(1) << packed_widths[i]) - 1));
+          result[i] = float((packed_dwords[i >> 1] >> packed_offsets[i]) &
+                            ((UINT32_C(1) << packed_width) - 1));
         }
         if (instr.is_normalized()) {
           for (uint32_t i = 0; i < 4; ++i) {

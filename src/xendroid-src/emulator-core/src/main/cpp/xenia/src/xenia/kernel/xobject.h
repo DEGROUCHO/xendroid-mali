@@ -234,6 +234,8 @@ class XObject {
   void RetainHandle();
   bool ReleaseHandle();
   void Retain();
+  // Retains unless the last reference already went (destructor pending).
+  bool TryRetain();
   void Release();
   X_STATUS Delete();
 

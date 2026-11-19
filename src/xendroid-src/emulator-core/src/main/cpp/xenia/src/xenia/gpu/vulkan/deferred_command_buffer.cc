@@ -9,8 +9,14 @@
 
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 
+#include <dlfcn.h>
+#include <unwind.h>
+
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -49,9 +55,129 @@ DEFINE_bool(vulkan_deferred_cmd_size_cursor, true,
             "the GPU command processor thread).",
             "Vulkan");
 
+DEFINE_bool(log_vertex_wait_barrier_sites, false,
+            "Count the recording call stacks of pipeline barriers that make "
+            "vertex stages wait for fragment or compute work (they serialize "
+            "binning behind the previous pass on tilers) and log the top ones "
+            "with the GPU frame time breakdown.",
+            "GPU");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+namespace {
+struct VertexWaitSite {
+  uint64_t count = 0;
+  std::string description;
+};
+std::unordered_map<std::string, VertexWaitSite>& VertexWaitSites() {
+  static std::unordered_map<std::string, VertexWaitSite> sites;
+  return sites;
+}
+const char* LayoutName(VkImageLayout layout) {
+  switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED: return "undef";
+    case VK_IMAGE_LAYOUT_GENERAL: return "general";
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return "color";
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return "depth";
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return "read";
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return "xsrc";
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return "xdst";
+    default: return "other";
+  }
+}
+}  // namespace
+
+void DeferredCommandBuffer::RecordVertexWaitSite(
+    VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
+    uint32_t memory_barrier_count, uint32_t buffer_memory_barrier_count,
+    const VkBufferMemoryBarrier* buffer_memory_barriers,
+    uint32_t image_memory_barrier_count,
+    const VkImageMemoryBarrier* image_memory_barriers) {
+  constexpr VkPipelineStageFlags kVertex =
+      VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+      VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  constexpr VkPipelineStageFlags kWait =
+      VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  if (!(dst_stage_mask & kVertex) || !(src_stage_mask & kWait)) {
+    return;
+  }
+  struct Trace {
+    uintptr_t pcs[7];
+    int count = 0;
+  } trace;
+  _Unwind_Backtrace(
+      [](_Unwind_Context* c, void* arg) -> _Unwind_Reason_Code {
+        auto& t = *static_cast<Trace*>(arg);
+        if (t.count >= 7) return _URC_END_OF_STACK;
+        t.pcs[t.count++] = _Unwind_GetIP(c);
+        return _URC_NO_REASON;
+      },
+      &trace);
+  static uintptr_t base = 0;
+  if (!base) {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&LayoutName), &info)) {
+      base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    }
+  }
+  std::string key;
+  // Frame 0 is this function, frame 1 CmdVkPipelineBarrier.
+  for (int i = 2; i < trace.count; ++i) {
+    key += fmt::format("{:X}/", uint32_t(trace.pcs[i] - base));
+  }
+  auto& site = VertexWaitSites()[key];
+  if (!site.count) {
+    std::string image;
+    if (image_memory_barrier_count) {
+      const VkImageMemoryBarrier& b = image_memory_barriers[0];
+      image = fmt::format(" img {}>{} acc {:X}>{:X}", LayoutName(b.oldLayout),
+                          LayoutName(b.newLayout), b.srcAccessMask,
+                          b.dstAccessMask);
+    }
+    std::string buffer;
+    if (buffer_memory_barrier_count) {
+      const VkBufferMemoryBarrier& b = buffer_memory_barriers[0];
+      buffer = fmt::format(" buf size {:X} acc {:X}>{:X}", uint64_t(b.size),
+                           b.srcAccessMask, b.dstAccessMask);
+    }
+    site.description =
+        fmt::format("src {:X} dst {:X} n {}/{}/{}{}{}", src_stage_mask,
+                    dst_stage_mask, memory_barrier_count,
+                    buffer_memory_barrier_count, image_memory_barrier_count,
+                    image, buffer);
+  }
+  ++site.count;
+}
+
+void DeferredCommandBuffer::LogVertexWaitSites(uint32_t frames) {
+  auto& sites = VertexWaitSites();
+  if (sites.empty() || !frames) {
+    return;
+  }
+  std::vector<std::pair<uint64_t, const std::string*>> order;
+  order.reserve(sites.size());
+  for (const auto& site : sites) {
+    order.emplace_back(site.second.count, &site.first);
+  }
+  std::sort(order.begin(), order.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (size_t i = 0; i < std::min(order.size(), size_t(12)); ++i) {
+    const auto& site = sites[*order[i].second];
+    XELOGI("VertexWaitSite: {:.1f}/fr {} | {}",
+           double(order[i].first) / frames, site.description,
+           *order[i].second);
+  }
+  sites.clear();
+}
 
 DeferredCommandBuffer::DeferredCommandBuffer(
     const VulkanCommandProcessor& command_processor, size_t initial_size)
@@ -437,6 +563,9 @@ void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer,
           barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
           barrier.dstAccessMask =
               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+          // With the trailing TRANSFER -> ALL_COMMANDS barrier, later
+          // commands wait for src_stage_mask.
+          CountBarrier(src_stage_mask, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
           dfn.vkCmdPipelineBarrier(command_buffer, src_stage_mask,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                                    &barrier, 0, nullptr, 0, nullptr);
@@ -533,6 +662,7 @@ void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer,
           barrier_offset_bytes +=
               sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
         }
+        CountBarrier(args.src_stage_mask, args.dst_stage_mask);
         dfn.vkCmdPipelineBarrier(
             command_buffer, args.src_stage_mask, args.dst_stage_mask,
             args.dependency_flags, args.memory_barrier_count, memory_barriers,
@@ -780,6 +910,11 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
     const VkBufferMemoryBarrier* buffer_memory_barriers,
     uint32_t image_memory_barrier_count,
     const VkImageMemoryBarrier* image_memory_barriers) {
+  if (cvars::log_vertex_wait_barrier_sites) {
+    RecordVertexWaitSite(src_stage_mask, dst_stage_mask, memory_barrier_count,
+                         buffer_memory_barrier_count, buffer_memory_barriers,
+                         image_memory_barrier_count, image_memory_barriers);
+  }
   size_t arguments_size = sizeof(ArgsVkPipelineBarrier);
   size_t memory_barriers_offset = 0;
   if (memory_barrier_count) {

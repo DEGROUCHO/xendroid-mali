@@ -237,8 +237,37 @@ uint64_t Clock::QueryGuestSystemTime() {
   return guest_system_time_base_ + guest_system_time_offset;
 }
 
+namespace {
+// Added to the interrupt time derived from the guest clock, so it continues
+// from the value a restored snapshot left in the guest's timestamp bundle.
+std::atomic<uint64_t> guest_interrupt_time_offset_{0};
+
+uint64_t GuestInterruptTimeFromTicks(uint64_t ticks, uint64_t frequency) {
+  constexpr uint64_t units_per_second = 10000000ull;
+  return ticks / frequency * units_per_second +
+         ticks % frequency * units_per_second / frequency;
+}
+}  // namespace
+
 uint64_t Clock::QueryGuestInterruptTime() {
-  return Clock::QueryHostInterruptTime();
+  const uint64_t frequency = guest_tick_frequency_;
+  if (!frequency) {
+    return Clock::QueryHostInterruptTime();
+  }
+  // Modulo 2^64, like the offset.
+  return GuestInterruptTimeFromTicks(QueryGuestTickCount(), frequency) +
+         guest_interrupt_time_offset_.load(std::memory_order_relaxed);
+}
+
+void Clock::ContinueGuestInterruptTime(uint64_t interrupt_time) {
+  const uint64_t frequency = guest_tick_frequency_;
+  if (!frequency) {
+    return;
+  }
+  guest_interrupt_time_offset_.store(
+      interrupt_time -
+          GuestInterruptTimeFromTicks(QueryGuestTickCount(), frequency),
+      std::memory_order_relaxed);
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {

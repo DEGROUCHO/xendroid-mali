@@ -234,15 +234,21 @@ uint2_xe XePackR16G16B16A16(float4_xe f, uint num_format) {
   return n.rb | (n.ga << 16);
 }
 
+// Signed 16 bit EDRAM components have 10 fractional bits.
+// Real hardware rounds the value scaled by 1024 half up, including all negative
+// values (scaled -0.5 round to 0), then clamps to [-32768, 32767].
+// That translates to a somewhat unusual range of
+// [-32, 31 1023/1024], not [-31 1023/1024, 31 1023/1024].
+// -32 packs to 0x8000 and is read back -32.
 uint XePackR16G16Edram(float2_xe f) {
-  f = min(max(f, float_x2_xe(-32.0f)), float_x2_xe(32.0f));
-  int2_xe n = int2_xe(f * (32767.0f / 32.0f));
+  f = min(max(f, float_x2_xe(-32.0f)), float_x2_xe(32767.0f / 1024.0f));
+  int2_xe n = int2_xe(floor(f * 1024.0f + 0.5f));
   return uint(n.x & 0xFFFF) | (uint(n.y & 0xFFFF) << 16u);
 }
 
 uint2_xe XePackR16G16B16A16Edram(float4_xe f) {
-  f = min(max(f, float_x4_xe(-32.0f)), float_x4_xe(32.0f));
-  int4_xe n = int4_xe(f * (32767.0f / 32.0f));
+  f = min(max(f, float_x4_xe(-32.0f)), float_x4_xe(32767.0f / 1024.0f));
+  int4_xe n = int4_xe(floor(f * 1024.0f + 0.5f));
   return uint2_xe(uint(n.x & 0xFFFF) | (uint(n.y & 0xFFFF) << 16u),
                   uint(n.z & 0xFFFF) | (uint(n.w & 0xFFFF) << 16u));
 }
@@ -331,7 +337,14 @@ uint4_xe XePack32bpp4Pixels(float4_xe pixel_0, float4_xe pixel_1,
       packed.z = XePackR10G11B11(pixel_2.rgb, num_format);
       packed.w = XePackR10G11B11(pixel_3.rgb, num_format);
       break;
+    // The 16-bit fixed EDRAM encoding, for resolves that copy its integers
+    // (draw_util GetResolveInfo).
     case kXenosFormat_16_16_EDRAM:
+      packed.x = XePackR16G16Edram(pixel_0.rg);
+      packed.y = XePackR16G16Edram(pixel_1.rg);
+      packed.z = XePackR16G16Edram(pixel_2.rg);
+      packed.w = XePackR16G16Edram(pixel_3.rg);
+      break;
     case kXenosFormat_16_16:
       packed.x = XePackR16G16(pixel_0.rg, num_format);
       packed.y = XePackR16G16(pixel_1.rg, num_format);
@@ -362,6 +375,11 @@ void XePack64bpp4Pixels(float4_xe pixel_0, float4_xe pixel_1,
                         out_param_xe(uint4_xe, packed_23)) {
   switch (format) {
     case kXenosFormat_16_16_16_16_EDRAM:
+      packed_01.xy = XePackR16G16B16A16Edram(pixel_0);
+      packed_01.zw = XePackR16G16B16A16Edram(pixel_1);
+      packed_23.xy = XePackR16G16B16A16Edram(pixel_2);
+      packed_23.zw = XePackR16G16B16A16Edram(pixel_3);
+      break;
     case kXenosFormat_16_16_16_16:
       packed_01.xy = XePackR16G16B16A16(pixel_0, num_format);
       packed_01.zw = XePackR16G16B16A16(pixel_1, num_format);
@@ -458,31 +476,21 @@ float4_xe XeUnpackR10G10B10A2Float(uint p) {
 //  to 1. When sampling from this texture in a shader, the results must be
 //  scaled to a 0 to 1 range."
 
+// Keep negative values below -1 when resolving (xenia-project/xenia#2136).
 // Upper 16 bits are ignored by XeUnpackR16EdramX4.
 
 float4_xe XeUnpackR16EdramX4(uint4_xe p) {
-  // Clamp to -32.0 to match the actual k_16_16 format range [-32, 32].
-  // The previous -1.0 clamp was wrong: it destroyed negative values in
-  // [-32, -1], causing water/heightmap surfaces to bias upward.
-  return max(float_x4_xe(-32.0f),
-             float4_xe(int4_xe(p) << 16 >> 16) * (32.0f / 32767.0f));
+  return float4_xe(int4_xe(p) << 16 >> 16) * (1.0f / 1024.0f);
 }
 
 float2_xe XeUnpackR16G16Edram(uint p) {
-  // Clamp to -32.0 to match the actual k_16_16 format range [-32, 32].
-  // The previous -1.0 clamp was wrong: it destroyed negative values in
-  // [-32, -1], causing water/heightmap surfaces to bias upward
-  // (xenia-project/xenia#2136).
-  return max(float_x2_xe(-32.0f),
-             float2_xe(int_x2_xe(int(p)) << int2_xe(16, 0) >> 16) *
-                 (32.0f / 32767.0f));
+  return float2_xe(int_x2_xe(int(p)) << int2_xe(16, 0) >> 16) *
+         (1.0f / 1024.0f);
 }
 
 float4_xe XeUnpackR16G16B16A16Edram(uint2_xe p) {
-  // Clamp to -32.0 to match the actual k_16_16_16_16 format range [-32, 32].
-  return max(float_x4_xe(-32.0f),
-             float4_xe(int2_xe(p).xxyy << int2_xe(16, 0).xyxy >> 16) *
-                 (32.0f / 32767.0f));
+  return float4_xe(int2_xe(p).xxyy << int2_xe(16, 0).xyxy >> 16) *
+         (1.0f / 1024.0f);
 }
 
 // Xenos 16-bit packed textures are RGBA, but in Direct3D 12 they are BGRA.

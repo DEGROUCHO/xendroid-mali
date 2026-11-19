@@ -9,6 +9,7 @@
 
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -256,7 +257,19 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
                  custom_lib_path, dlerror());
         }
 
-        adrenotools_set_turbo(cvars::adrenotools_force_max_clocks);
+        // Made either way: KGSL power control is device-wide state, which a
+        // request with the option off returns to the governor.
+        if (adrenotools_set_turbo(cvars::adrenotools_force_max_clocks)) {
+          XELOGI("GPU clocks: KGSL power control {}",
+                 cvars::adrenotools_force_max_clocks
+                     ? "forced on at the maximum clock"
+                     : "returned to the kernel governor");
+        } else {
+          XELOGW("GPU clocks: KGSL power control request ({}) failed: {}",
+                 cvars::adrenotools_force_max_clocks ? "maximum clock"
+                                                     : "governor",
+                 std::strerror(errno));
+        }
     }
     else {
         if (!custom_lib_path.empty()) {

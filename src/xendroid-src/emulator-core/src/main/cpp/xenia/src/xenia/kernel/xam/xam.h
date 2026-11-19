@@ -23,10 +23,11 @@ namespace xam {
 #pragma pack(push, 4)
 struct X_XAMACCOUNTINFO {
   enum AccountReservedFlags {
+    kVersionMask = 0x000000FF,
     kPasswordProtected = 0x10000000,
     kLiveEnabled = 0x20000000,
     kRecovering = 0x40000000,
-    kVersionMask = 0x000000FF
+    KPartialProfile = 0x80000000
   };
 
   enum AccountUserFlags {
@@ -91,7 +92,7 @@ struct X_XAMACCOUNTINFO {
   }
 
   bool IsParentalControlled() const {
-    return static_cast<bool>((cached_user_flags & kLanguageMask) >> 24);
+    return static_cast<bool>(cached_user_flags & kParentalControlEnabled);
   }
 
   XLanguage GetLanguage() const {
@@ -201,11 +202,6 @@ struct X_DASH_APP_INFO {
   uint32_t unk2;
 };
 static_assert_size(X_DASH_APP_INFO, 0xC);
-
-struct X_DASH_BACKSTACK_DATA {
-  uint8_t unk1[0x314];
-};
-static_assert_size(X_DASH_BACKSTACK_DATA, 0x314);
 
 struct X_GUID {
   xe::be<uint32_t> Data1;
@@ -372,6 +368,8 @@ struct X_STATS_DETAILS {
   xe::be<uint16_t> stats[kStatsMaxAmount];
 };
 static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
+
+constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
 
 enum LoaderLaunchFlags : uint32_t {
   GetSystemVersion = 0x00000040,  // XamUpdateGetCurrentSystemVersion

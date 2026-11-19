@@ -10,11 +10,14 @@
 #ifndef XENIA_KERNEL_XAM_XAM_MODULE_H_
 #define XENIA_KERNEL_XAM_XAM_MODULE_H_
 
+#include <mutex>
+#include <span>
 #include <string>
 
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/xnet_startup_params.h"
 
 namespace xe {
 namespace kernel {
@@ -40,8 +43,19 @@ class XamModule : public KernelModule {
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }
 
+  // XNetStartup, or WSAStartup with |wsa| and no |params|. Only the first
+  // start since everything was cleaned up takes its parameters.
+  void StartXNet(bool wsa, std::span<const uint8_t> params);
+  // XNetCleanup, or WSACleanup with |wsa|.
+  void CleanupXNet(bool wsa);
+  StartupParams xnet_startup_params();
+
  private:
   LoaderData loader_data_;
+
+  std::mutex xnet_mutex_;
+  uint32_t xnet_starts_ = 0, wsa_starts_ = 0;
+  StartupParams xnet_startup_params_ = NormalizeStartupParams({});
 };
 
 }  // namespace xam

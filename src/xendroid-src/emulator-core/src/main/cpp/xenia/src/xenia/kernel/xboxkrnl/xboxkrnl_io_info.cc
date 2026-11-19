@@ -14,6 +14,7 @@
 #include "xenia/kernel/info/volume.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
@@ -105,16 +106,30 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileXctdCompressionInformation: {
-      XELOGE(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      // Only disc file systems answer. Their directory entries flag compressed
+      // files but rebuilt images can lose the flag, unlike the magic those
+      // files start with.
+      if (!file->device()->is_gdfx()) {
+        status = X_STATUS_INVALID_PARAMETER;
+        out_length = 0;
+        break;
+      }
+      constexpr uint32_t kXctdMagic = 0x0FF512ED;
+      uint8_t magic[4] = {};
+      size_t bytes_read = 0;
+      if (!(file->entry()->attributes() & vfs::kFileAttributeDirectory)) {
+        if (file->file()->ReadSync(magic, 0, &bytes_read) != X_STATUS_SUCCESS) {
+          bytes_read = 0;
+        }
+      }
+      auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+      info->flags = bytes_read == sizeof(magic) &&
+                            xe::load_and_swap<uint32_t>(magic) == kXctdMagic
+                        ? 1
+                        : 0;
+      out_length = sizeof(*info);
       break;
-    };
+    }
     case XFileNetworkOpenInformation: {
       // Make sure we're working with up-to-date information, just in case the
       // file size has changed via something other than NtSetInfoFile
@@ -230,8 +245,10 @@ dword_result_t NtSetInformationFile_entry(
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       // Compute path, possibly attrs relative.
-      std::filesystem::path target_path =
+      auto target_name =
           util::TranslateAnsiPath(kernel_memory(), &info->ansi_string);
+      xeObStripDosDevicesPrefix(target_name);
+      std::filesystem::path target_path = target_name;
 
       // Place IsValidPath in path from where it can be accessed everywhere
       if (!IsValidPath(target_path.string(), false)) {

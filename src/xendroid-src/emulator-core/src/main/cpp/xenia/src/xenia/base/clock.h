@@ -86,7 +86,11 @@ class Clock {
   // Queries the milliseconds since the guest began, accounting for scaling.
   static uint32_t QueryGuestUptimeMillis();
 
+  // The interrupt time of the guest, in 100 ns units like the console's, from
+  // the guest clock (scaling and snapshot restores included).
   static uint64_t QueryGuestInterruptTime();
+  // Makes the guest interrupt time continue from a restored value.
+  static void ContinueGuestInterruptTime(uint64_t interrupt_time);
 
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);

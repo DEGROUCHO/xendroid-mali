@@ -88,7 +88,7 @@ As of **1 October 2026**, no public patch with controlled proof of **MW2 at stab
    **US/H:** possible basis for ARM64, not a ready Android port. **Estimate:** high potential but no defensible fps prediction. **Cost/risk:** very high; runtime, SIMD, renderer and Mali driver remain substantial work.
 
 9. **Fork status: choose verifiable sources, do not rename the emulator.**
-   **V:** Canary has A64; [XenDroid](https://github.com/rfandango/XenDroid) originates from [aX360e](https://github.com/aenu1/ax360e) and is rebased on [Edge](https://github.com/has207/xenia-edge). [X360 Mobile](https://github.com/Ashnar2602/X360-Mobile---OFFICIAL) does not publish the core; [Eugengtt](https://github.com/Eugengtt/Xendroid-Fork) declares overlay/limiter, without controlled MW2 benchmarks.
+   **V:** Canary has A64; [XenDroid](https://github.com/rfandango/XenDroid) originates from [aX360e](https://github.com/aenu1/ax360e) and is rebased on [Edge](https://github.com/has207/xenia-edge).
    **US:** Edge/XenDroid are the comparable sources. **Estimate:** no gain attributable to the fork change alone. **Cost/risk:** regressions; proprietary optimizations cannot be transferred for audit.
 
 10. **Community: compatibility is growing, evidence of stable 60 is insufficient.**

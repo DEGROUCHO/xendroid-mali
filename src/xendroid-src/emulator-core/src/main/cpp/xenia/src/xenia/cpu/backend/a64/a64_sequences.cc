@@ -4851,12 +4851,21 @@ EMITTER_OPCODE_TABLE(OPCODE_MUL_SUB, MUL_SUB_F32, MUL_SUB_F64, MUL_SUB_V128);
 // POW2 / LOG2 / DOT_PRODUCT C helper functions (called via CallNativeSafe)
 // ============================================================================
 
+// The helpers run with the host FPCR (no flush to zero), but VMX in the
+// non-Java mode the guest uses treats denormal operands and results as zero -
+// vlogefp of a denormal is -infinity, not about -149.
+static float FlushDenormalToZero(float value) {
+  return std::fpclassify(value) == FP_SUBNORMAL ? std::copysign(0.0f, value)
+                                                : value;
+}
+
 // POW2 (vexptefp): 2^x for each of 4 float lanes.
 // Args: x0=PPCContext* (unused), x1=pointer to vec128_t (in-place).
 static void EmulatePow2(void* /*ctx*/, void* vdata) {
   auto* data = reinterpret_cast<vec128_t*>(vdata);
   for (int i = 0; i < 4; i++) {
-    data->f32[i] = std::exp2(data->f32[i]);
+    data->f32[i] =
+        FlushDenormalToZero(std::exp2(FlushDenormalToZero(data->f32[i])));
   }
 }
 
@@ -4865,7 +4874,7 @@ static void EmulatePow2(void* /*ctx*/, void* vdata) {
 static void EmulateLog2(void* /*ctx*/, void* vdata) {
   auto* data = reinterpret_cast<vec128_t*>(vdata);
   for (int i = 0; i < 4; i++) {
-    data->f32[i] = std::log2(data->f32[i]);
+    data->f32[i] = std::log2(FlushDenormalToZero(data->f32[i]));
   }
 }
 

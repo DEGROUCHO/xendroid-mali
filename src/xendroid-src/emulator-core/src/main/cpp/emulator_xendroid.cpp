@@ -9,6 +9,7 @@
 #include "xe_android_input_driver.h"
 
 #include <atomic>   // single-xe::Memory-per-process guard in extract_xex_meta
+#include <mutex>    // one device report at a time (j_simple_device_info)
 #include <filesystem>  // std::filesystem::path/u8path for the zar extract/create JNI bridge
 
 #include "xenia/app/emulator_window.h"
@@ -81,6 +82,11 @@ static void j_setup_launch_args(JNIEnv* env,jobject self,jobjectArray args ){
 
 static jstring j_simple_device_info(JNIEnv* env, jobject thiz)
 {
+    // The report loads the Vulkan loader's entry points and unloads them when done: two reports
+    // at once (About asks for the device rows and the full report as it opens) had one unload the
+    // entry points while the other called vkCreateInstance through them, a jump to 0.
+    static std::mutex report_mutex;
+    std::lock_guard<std::mutex> report_lock(report_mutex);
     std::string info;
 
     auto get_gpu_info=[]()->std::string {

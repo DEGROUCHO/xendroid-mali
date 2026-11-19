@@ -1062,6 +1062,11 @@ void GuestScheduler::SwitchTo(XThread* next) {
     std::lock_guard<std::mutex> lock(lock_);
     links.running = false;
     cpus_[t_current_cpu].current_thread = nullptr;
+    // A bump that reached it while parking is moot but would head-queue it
+    // when its wait ends.
+    if (links.blocked) {
+      links.preempted = false;
+    }
   }
   XThread::SetCurrentThread(nullptr);
 }
@@ -1194,8 +1199,11 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower) {
   // Terminated while queued.
   ExitIfTerminated();
   // One dispatch is our own resume, more means another fiber ran in between.
-  // A migration to another CPU counts as scheduling activity outright.
-  return t_current_cpu != cpu_index ||
+  // A migration to another CPU counts as scheduling activity outright. Not
+  // t_current_cpu: the compiler reuses the thread pointer read before the
+  // fiber switch, which is the previous host thread's after a migration
+  // (RunLoop records the new CPU in links.cpu).
+  return links.cpu != cpu_index ||
          cpus_[cpu_index].switch_seq.load(std::memory_order_relaxed) -
                  seq_before >
              1;

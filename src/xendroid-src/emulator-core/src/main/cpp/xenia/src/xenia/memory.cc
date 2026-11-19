@@ -484,10 +484,12 @@ static const struct {
         0x0000000080000000ull,
     },
     //  (256mb) - xex 4k pages
+    // Own backing: aliasing the 64k xex range lets a module in one heap
+    // overwrite a module in the other.
     {
         0x90000000,
         0x9FFFFFFF,
-        0x0000000080000000ull,
+        0x0000000090000000ull,
     },
     //  (512mb) - physical 64k pages
     {
@@ -1942,7 +1944,8 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) / page_size_;
   auto base_page_entry = page_table_[base_page_number];
-  if (base_page_entry.base_address != base_page_number) {
+  if (!base_page_entry.state ||
+      base_page_entry.base_address != base_page_number) {
     XELOGE("BaseHeap::Release failed because address is not a region start");
     return false;
   }

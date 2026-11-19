@@ -105,9 +105,12 @@ Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
   return children_.back().get();
 }
 
-bool Entry::Delete(Entry* entry) {
+bool Entry::Delete(Entry* entry, bool detach_open) {
   auto global_lock = global_critical_region_.Acquire();
   if (is_read_only()) {
+    return false;
+  }
+  if (!detach_open && entry->has_open_files()) {
     return false;
   }
   if (entry->parent() != this) {
@@ -130,12 +133,12 @@ bool Entry::Delete(Entry* entry) {
   return true;
 }
 
-bool Entry::Delete() {
+bool Entry::Delete(bool detach_open) {
   if (deleted_) {
     return true;
   }
   assert_not_null(parent_);
-  return parent_->Delete(this);
+  return parent_->Delete(this, detach_open);
 }
 
 void Entry::AddOpenFile() {

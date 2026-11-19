@@ -45,6 +45,10 @@ void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
   if (key.version > max_version_) {
     return;
   }
+  // xam 816A8328.
+  if (key.system_only && !is_system_) {
+    return;
+  }
   auto global_lock = global_critical_region_.Acquire();
   // The same notification right behind an identical pending one carries
   // nothing new (only a repeat of the last one: an older duplicate would

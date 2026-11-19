@@ -8,6 +8,9 @@
  */
 
 #include "xenia/vfs/virtual_file_system.h"
+
+#include <cerrno>
+
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 
@@ -32,25 +35,46 @@ VirtualFileSystem::~VirtualFileSystem() {
 
 void VirtualFileSystem::Clear() {
   devices_.clear();
+  retired_devices_.clear();
   symlinks_.clear();
 }
 
 bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
   auto global_lock = global_critical_region_.Acquire();
+  ReleaseRetiredDevices();
   devices_.emplace_back(std::move(device));
   return true;
 }
 
 bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
+  ReleaseRetiredDevices();
   for (auto it = devices_.begin(); it != devices_.end(); ++it) {
     if ((*it)->mount_path() == path) {
       XELOGD("Unregistered device: {}", (*it)->mount_path());
+      // A handle the title still holds points at the device's entries, and
+      // closing it releases its entry (HostPathFile), so such a device stays
+      // alive, unmounted, until its handles are closed (XamSwapDisc of a game
+      // extracted to a folder, a profile or package closed under an open
+      // file).
+      auto root = (*it)->ResolvePath("");
+      if (root && root->has_open_files()) {
+        retired_devices_.push_back(std::move(*it));
+      }
       devices_.erase(it);
       return true;
     }
   }
   return false;
+}
+
+void VirtualFileSystem::ReleaseRetiredDevices() {
+  // Called under the global lock, which ReleaseFile holds too, so a device
+  // with no open handles has no close still running on its entries.
+  std::erase_if(retired_devices_, [](const auto& device) {
+    auto root = device->ResolvePath("");
+    return !root || !root->has_open_files();
+  });
 }
 
 Device* VirtualFileSystem::GetDevice(const std::string_view path) {
@@ -275,6 +299,16 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
     auto file_name = xe::utf8::find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+  } else if (path.empty() && root_entry) {
+    // An empty relative path is the root entry itself. Replacing it would
+    // delete what the root handle still refers to.
+    if (creation_disposition == FileDisposition::kSuperscede ||
+        creation_disposition == FileDisposition::kOverwrite ||
+        creation_disposition == FileDisposition::kOverwriteIf) {
+      *out_action = FileAction::kDoesNotExist;
+      return X_STATUS_ACCESS_DENIED;
+    }
+    entry = root_entry;
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -303,6 +337,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         }
       }
     }
+  }
+
+  // Its deletion waits for the last handle to close (see
+  // HostPathEntry::ReleaseFile). NT refuses to open it until then, and an
+  // overwrite here would write contents that the last close deletes.
+  if (entry && entry->delete_on_close()) {
+    return X_STATUS_DELETE_PENDING;
   }
 
   // Check if exists (if we need it to), or that it doesn't (if it shouldn't).
@@ -341,6 +382,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   }
 
   bool created = false;
+  bool truncate_in_place = false;
   if (!entry) {
     // Remember that we are creating this new, instead of replacing.
     created = true;
@@ -353,26 +395,34 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         assert_always();
         return X_STATUS_ACCESS_DENIED;
       case FileDisposition::kSuperscede:
+      case FileDisposition::kOverwrite:
+      case FileDisposition::kOverwriteIf:
+        if (entry->attributes() & kFileAttributeDirectory) {
+          // FAT only opens an existing directory. Replacing it deleted the
+          // whole tree (or, with handles open, truncated a directory fd).
+          *out_action = FileAction::kExists;
+          return X_STATUS_OBJECT_NAME_COLLISION;
+        }
+        *out_action = creation_disposition == FileDisposition::kSuperscede
+                          ? FileAction::kSuperseded
+                          : FileAction::kOverwritten;
+        if (entry->has_open_files()) {
+          // Other handles keep it open, so it can't be deleted and recreated
+          // under them (their entry would be freed). NT truncates it in place
+          // instead, and the other handles see the new contents.
+          truncate_in_place = true;
+          break;
+        }
         // Replace (by delete + recreate).
         if (!entry->Delete()) {
           return X_STATUS_ACCESS_DENIED;
         }
         entry = nullptr;
-        *out_action = FileAction::kSuperseded;
         break;
       case FileDisposition::kOpen:
       case FileDisposition::kOpenIf:
         // Normal open.
         *out_action = FileAction::kOpened;
-        break;
-      case FileDisposition::kOverwrite:
-      case FileDisposition::kOverwriteIf:
-        // Overwrite (we do by delete + recreate).
-        if (!entry->Delete()) {
-          return X_STATUS_ACCESS_DENIED;
-        }
-        entry = nullptr;
-        *out_action = FileAction::kOverwritten;
         break;
     }
   }
@@ -389,6 +439,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   auto result = entry->Open(desired_access, out_file);
   if (XFAILED(result)) {
     *out_action = FileAction::kDoesNotExist;
+  } else if (truncate_in_place) {
+    result = (*out_file)->SetLength(0);
+    if (XFAILED(result)) {
+      (*out_file)->Destroy();
+      *out_file = nullptr;
+      *out_action = FileAction::kDoesNotExist;
+    } else {
+      entry->update();
+    }
   }
   return result;
 }
@@ -418,7 +477,8 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
     std::error_code error_code;
     std::filesystem::create_directories(dest_name, error_code);
     if (error_code) {
-      return error_code.value();
+      XELOGE("Extracting {}: {}", entry->path(), error_code.message());
+      return X_STATUS_ACCESS_DENIED;
     }
     return 0;
   }
@@ -432,24 +492,38 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
   auto file = xe::filesystem::OpenFile(dest_name, "wb");
   if (!file) {
     in_file->Destroy();
-    return 1;
+    XELOGE("Extracting {}: cannot create {}", entry->path(),
+           xe::path_to_utf8(dest_name));
+    return X_STATUS_ACCESS_DENIED;
   }
   constexpr size_t write_buffer_size = 4_MiB;
 
-  if (entry->can_map()) {
+  // A package cut short reads nothing before the end (which used to loop
+  // forever), and a full disk writes short: either fails the file.
+  bool read_failed = false;
+  bool write_failed = false;
+  if (!entry->size()) {
+    // Nothing to copy (and nothing to map).
+  } else if (entry->can_map()) {
     auto map = entry->OpenMapped(xe::MappedMemory::Mode::kRead);
+    read_failed = !map;
 
-    size_t remaining_size = map->size();
+    size_t remaining_size = map ? map->size() : 0;
     size_t offset = 0;
 
     while (remaining_size > 0) {
       const auto bytes_to_read = std::min(write_buffer_size, remaining_size);
-      fwrite(map->data() + offset, bytes_to_read, 1, file);
+      if (fwrite(map->data() + offset, bytes_to_read, 1, file) != 1) {
+        write_failed = true;
+        break;
+      }
       offset += bytes_to_read;
       remaining_size -= bytes_to_read;
       progress += bytes_to_read;
     }
-    map->Close();
+    if (map) {
+      map->Close();
+    }
   } else {
     size_t remaining_size = entry->size();
     size_t offset = 0;
@@ -457,20 +531,42 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
 
     while (remaining_size > 0) {
       size_t bytes_read = 0;
-      in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size), offset,
-                        &bytes_read);
-      fwrite(buffer, bytes_read, 1, file);
+      X_STATUS read_status = in_file->ReadSync(
+          std::span<uint8_t>(buffer, std::min(write_buffer_size, remaining_size)),
+          offset, &bytes_read);
+      if (XFAILED(read_status) || !bytes_read) {
+        read_failed = true;
+        break;
+      }
+      if (fwrite(buffer, bytes_read, 1, file) != 1) {
+        write_failed = true;
+        break;
+      }
       offset += bytes_read;
       remaining_size -= bytes_read;
       progress += bytes_read;
     }
   }
 
-  fclose(file);
+  int write_errno = write_failed ? errno : 0;
+  if (fclose(file) != 0 && !write_failed) {
+    write_failed = true;
+    write_errno = errno;
+  }
   in_file->Destroy();
 
   if (buffer) {
     delete[] buffer;
+  }
+  if (read_failed || write_failed) {
+    XELOGE("Extracting {}: the {} failed", entry->path(),
+           read_failed ? "read" : "write");
+    std::error_code remove_ec;
+    std::filesystem::remove(dest_name, remove_ec);
+    if (read_failed) {
+      return X_STATUS_INVALID_PARAMETER;
+    }
+    return write_errno == ENOSPC ? X_STATUS_DISK_FULL : X_STATUS_ACCESS_DENIED;
   }
   return 0;
 }
@@ -504,7 +600,10 @@ X_STATUS VirtualFileSystem::ExtractContentFiles(
       }
     }
 
-    ExtractContentFile(entry, base_path, progress);
+    X_STATUS status = ExtractContentFile(entry, base_path, progress);
+    if (status != X_STATUS_SUCCESS) {
+      return status;
+    }
   }
   return X_STATUS_SUCCESS;
 }
@@ -514,17 +613,21 @@ void VirtualFileSystem::ExtractContentHeader(Device* device,
   const XContentContainerDevice* xcontent_device =
       ((XContentContainerDevice*)device);
 
-  if (!std::filesystem::exists(base_path.parent_path())) {
-    if (!std::filesystem::create_directories(base_path.parent_path())) {
-      return;
-    }
+  // Not throwing: this runs for a title opening its content too.
+  std::error_code ec;
+  std::filesystem::create_directories(base_path.parent_path(), ec);
+  if (ec) {
+    return;
   }
   auto header_filename = base_path.filename().string() + ".header";
   auto header_path = base_path.parent_path() / header_filename;
   xe::filesystem::CreateEmptyFile(header_path);
 
-  if (std::filesystem::exists(header_path)) {
+  if (std::filesystem::exists(header_path, ec)) {
     auto file = xe::filesystem::OpenFile(header_path, "wb");
+    if (!file) {
+      return;
+    }
     kernel::xam::XCONTENT_AGGREGATE_DATA data =
         xcontent_device->content_header();
     uint32_t license_mask = xcontent_device->license_mask();

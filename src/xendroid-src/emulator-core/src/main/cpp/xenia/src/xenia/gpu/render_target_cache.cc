@@ -356,6 +356,16 @@ DEFINE_bool(
     "increase the amount of copying that needs to be done sometimes.",
     "GPU");
 DEFINE_bool(
+    rt_cache_scissor_offset_claims, true,
+    "With 2 to 5 32bpp render targets bound and a scissor covering whole tile "
+    "rows from the left edge to the surface pitch but starting below the top, "
+    "claim the EDRAM from the scissor's top row instead of the base when the "
+    "rest fits between the render target bases. The draw can't touch the rows "
+    "above, and the claim from the base, clamped to the smallest distance "
+    "between the bases, would cut off the rows actually drawn (the lower part "
+    "of a frame drawn in horizontal parts, as in Kingdoms of Amalur).",
+    "GPU");
+DEFINE_bool(
     native_2x_msaa, true,
     "Use host 2x MSAA when available. Can be disabled for scalability testing "
     "on host GPU APIs where 2x is not mandatory, in this case, 2 samples of 4x "
@@ -455,9 +465,9 @@ void RenderTargetCache::GetPSIColorFormatInfo(
       // k_16_16 (the render target is fixed-point). There's one deviation from
       // how Direct3D 11.3 functional specification defines SNorm conversion
       // (NaN should be 0, not the lowest negative number), and that needs to be
-      // handled separately.
+      // handled separately. -32 is 0x8000 on real hardware.
       clamp_rgb_low = clamp_alpha_low = -32.0f;
-      clamp_rgb_high = clamp_alpha_high = 32.0f;
+      clamp_rgb_high = clamp_alpha_high = 32767.0f / 1024.0f;
       if (!(write_mask & 0b0001)) {
         keep_mask_low |= 0xFFFFu;
       }
@@ -1183,6 +1193,50 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
       xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  // rt_cache_scissor_offset_claims: tiles from the base to the scissor's top
+  // row skipped by every claim of this draw (0 = claims start at the bases).
+  uint32_t claim_offset_tiles = 0;
+  if (cvars::rt_cache_scissor_offset_claims &&
+      GetPath() == Path::kHostRenderTargets && pitch_pixels &&
+      edram_bases_sorted_count >= 2 && edram_bases_sorted_count <= 5 &&
+      !(rts_are_64bpp & depth_and_color_rts_used_bits)) {
+    draw_util::Scissor claim_scissor;
+    draw_util::GetScissor(regs, claim_scissor, true);
+    uint32_t top_samples =
+        claim_scissor.offset[1]
+        << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+    if (!claim_scissor.offset[0] && top_samples &&
+        claim_scissor.extent[0] == pitch_pixels &&
+        !(top_samples % xenos::kEdramTileHeightSamples)) {
+      uint32_t skip_tiles =
+          top_samples / xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+      if (length_used_tiles_at_32bpp > skip_tiles &&
+          edram_bases_sorted[edram_bases_sorted_count - 1].first +
+                  length_used_tiles_at_32bpp <=
+              xenos::kEdramTileCount) {
+        uint32_t min_distance_tiles =
+            xenos::kEdramTileCount + edram_bases_sorted[0].first -
+            edram_bases_sorted[edram_bases_sorted_count - 1].first;
+        for (uint32_t i = 1; i < edram_bases_sorted_count; ++i) {
+          min_distance_tiles =
+              std::min(min_distance_tiles, edram_bases_sorted[i].first -
+                                               edram_bases_sorted[i - 1].first);
+        }
+        if (length_used_tiles_at_32bpp - skip_tiles <= min_distance_tiles) {
+          claim_offset_tiles = skip_tiles;
+          length_used_tiles_at_32bpp -= skip_tiles;
+          static uint32_t scissor_offset_claims_logged = 0;
+          if (++scissor_offset_claims_logged <= 16) {
+            XELOGI(
+                "RTSCISSOR: claims start {} tiles below the bases ({} render "
+                "targets, pitch {} tiles, {} tiles claimed each)",
+                claim_offset_tiles, edram_bases_sorted_count,
+                pitch_tiles_at_32bpp, length_used_tiles_at_32bpp);
+          }
+        }
+      }
+    }
+  }
   // Immutable host image height class for this draw: full or base cap.
   uint32_t height_class = kRenderTargetHeightClassFull;
   // Whether this draw itself needs full height (then the full-height render
@@ -1308,15 +1362,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                      : 0);
       EdramStencilBitsMemo& bits_memo =
           edram_stencil_bits_memos_[edram_bases_sorted[i].second];
+      const uint32_t claim_start_tiles =
+          edram_bases_sorted[i].first + claim_offset_tiles;
       if (bits_memo.version == edram_stencil_bits_version_ &&
-          bits_memo.start_tiles == edram_bases_sorted[i].first &&
+          bits_memo.start_tiles == claim_start_tiles &&
           bits_memo.length_tiles >= rt_lengths_tiles[i] &&
           !(written_bits & ~bits_memo.bits)) {
         continue;
       }
-      AddEdramStencilMaybeSetBits(edram_bases_sorted[i].first,
-                                  rt_lengths_tiles[i], written_bits);
-      bits_memo.start_tiles = edram_bases_sorted[i].first;
+      AddEdramStencilMaybeSetBits(claim_start_tiles, rt_lengths_tiles[i],
+                                  written_bits);
+      bits_memo.start_tiles = claim_start_tiles;
       bits_memo.length_tiles = rt_lengths_tiles[i];
       bits_memo.bits = written_bits & 0xFF;
       bits_memo.version = edram_stencil_bits_version_;
@@ -1333,7 +1389,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
       const std::pair<uint32_t, uint32_t>& rt_base_index =
           edram_bases_sorted[i];
-      if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second], 0,
+      if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second],
+                                               claim_offset_tiles,
                                                rt_lengths_tiles[i])) {
         interlock_barrier_needed = true;
         break;
@@ -1360,6 +1417,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
     // Ownership changes still retain their transfers. The Vulkan backend
     // flushes unconfirmed draws without cutouts before the next update/resolve.
+    rts_fully_overwritten = 0;
+    last_update_full_host_overwrite_ = 0;
+  }
+  if (claim_offset_tiles) {
+    // Proven over claims from the bases; keep the transfers instead.
     rts_fully_overwritten = 0;
     last_update_full_host_overwrite_ = 0;
   }
@@ -1393,6 +1455,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // The retargeted draw is skipped, so it must have no effect but the clear
   // (no memory export).
   if (cvars::rt_cache_retarget_full_depth_clears && !interlock_barrier_only &&
+      !claim_offset_tiles &&
       !vertex_shader.memexport_eM_written() &&
       !(update_pixel_shader_ && update_pixel_shader_->memexport_eM_written()) &&
       (depth_and_color_rts_used_bits & 1) &&
@@ -1565,7 +1628,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       const OwnershipClaimMemo& rt_trace_memo =
           ownership_claim_memos_[rt_bit_index];
       const bool rt_trace_memo_hit =
-          cvars::rt_cache_ownership_claim_memo &&
+          cvars::rt_cache_ownership_claim_memo && !claim_offset_tiles &&
           rt_trace_memo.version == ownership_ranges_version_ &&
           rt_trace_memo.dest == rt_key &&
           rt_length_tiles <= rt_trace_memo.length_tiles;
@@ -1575,11 +1638,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
             "height_used={}",
             rt_bit_index, rt_key.base_tiles, rt_key.GetPitchTiles(),
             rt_key.resource_format, uint32_t(rt_key.msaa_samples),
-            uint32_t(rt_key.is_depth), rt_key.base_tiles,
-            rt_key.base_tiles + rt_length_tiles, height_used);
+            uint32_t(rt_key.is_depth), rt_key.base_tiles + claim_offset_tiles,
+            rt_key.base_tiles + claim_offset_tiles + rt_length_tiles,
+            height_used);
       }
     }
-    if (cvars::rt_cache_ownership_claim_memo) {
+    // The memo covers claims from the base only.
+    if (cvars::rt_cache_ownership_claim_memo && !claim_offset_tiles) {
       OwnershipClaimMemo& memo = ownership_claim_memos_[rt_bit_index];
       if (memo.version == ownership_ranges_version_ && memo.dest == rt_key &&
           rt_length_tiles <= memo.length_tiles) {
@@ -1602,7 +1667,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       memo.length_tiles = rt_length_tiles;
       memo.version = ownership_ranges_version_;
     } else {
-      ChangeOwnership(rt_key, 0, rt_length_tiles,
+      ChangeOwnership(rt_key, claim_offset_tiles, rt_length_tiles,
                       (interlock_barrier_only ||
                        (rts_fully_overwritten & (uint32_t(1) << rt_bit_index)))
                           ? nullptr
@@ -1615,6 +1680,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // written part of it) in its depth render target.
   constant_set_by_update_ = nullptr;
   if (cvars::rt_cache_transfer_known_constants && !interlock_barrier_only &&
+      !claim_offset_tiles &&
       (depth_and_color_rts_used_bits & 1) && rts[0] &&
       !update_draw_may_be_skipped_ && last_draw_covers_claimed_range_ &&
       last_full_clear_depth_value_valid_) {

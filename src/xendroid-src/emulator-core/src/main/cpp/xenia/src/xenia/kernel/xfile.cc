@@ -479,9 +479,17 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
     vfs::Entry* parent = fs->ResolvePath(xe::utf8::find_base_guest_path(abs_path));
     auto name = xe::utf8::find_name_from_guest_path(abs_path);
     vfs::Entry* entry = nullptr;
-    // A live file with the same name is another file: never reuse it.
-    if (parent && !name.empty() && !parent->GetChild(name)) {
-      entry = parent->CreateEntry(name, is_directory
+    // A live file with the same name is another file: never reuse it. It can
+    // be left over by a session closed after the snapshot, so the deleted file
+    // is recreated under a free name, which nothing sees once it is detached.
+    std::string create_name(name);
+    for (uint32_t i = 0; parent && !name.empty() &&
+                         parent->GetChild(create_name) && i < 1000;
+         ++i) {
+      create_name = fmt::format("{}.xd-restore-{}", name, i);
+    }
+    if (parent && !name.empty() && !parent->GetChild(create_name)) {
+      entry = parent->CreateEntry(create_name, is_directory
                                             ? vfs::kFileAttributeDirectory
                                             : vfs::kFileAttributeNormal);
     }
@@ -509,7 +517,9 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
       vfs_file->Destroy();
       return object_ref<XFile>(file);
     }
-    vfs_file->entry()->Delete();
+    // q741 made Delete refuse open files (NT delete-pending); this one is
+    // open by design, so it is detached.
+    vfs_file->entry()->Delete(true);
   }
 
   file->file_ = vfs_file;

@@ -8,6 +8,7 @@
  */
 
 #include "xenia/gpu/command_processor.h"
+#include "xenia/ui/windowed_app_context.h"
 
 #include <algorithm>
 #include <cstring>
@@ -1358,6 +1359,39 @@ void HeartbeatBacktraceSignal(int) {
   _Unwind_Backtrace(HeartbeatUnwind, &n);
   heartbeat_backtrace_count.store(n, std::memory_order_release);
 }
+// Stack of thread tid as "lib+offset" frames, empty if it did not answer.
+std::string CaptureThreadBacktrace(int tid) {
+  static const int backtrace_signal = [] {
+    const int signal = SIGRTMIN + 10;
+    struct sigaction action = {};
+    action.sa_handler = HeartbeatBacktraceSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    sigaction(signal, &action, nullptr);
+    return signal;
+  }();
+  heartbeat_backtrace_count.store(-1, std::memory_order_relaxed);
+  syscall(SYS_tgkill, getpid(), tid, backtrace_signal);
+  for (int i = 0; i < 100 && heartbeat_backtrace_count.load(
+                                 std::memory_order_acquire) < 0;
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const int frames = heartbeat_backtrace_count.load(std::memory_order_acquire);
+  std::string trace;
+  for (int i = 0; i < frames; ++i) {
+    Dl_info info = {};
+    const uintptr_t pc = heartbeat_backtrace[i];
+    if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
+      const char* base = strrchr(info.dli_fname, '/');
+      trace += fmt::format(" {}+{:X}", base ? base + 1 : info.dli_fname,
+                           pc - uintptr_t(info.dli_fbase));
+    } else {
+      trace += fmt::format(" {:X}", pc);
+    }
+  }
+  return trace;
+}
 }  // namespace
 #endif
 
@@ -1366,14 +1400,6 @@ void CommandProcessor::HeartbeatThreadMain() {
   uint64_t last_execs = 0, last_draws = 0;
   uint32_t last_counter = counter_;
   uint32_t idle_beats = 0;
-#if defined(__ANDROID__)
-  const int backtrace_signal = SIGRTMIN + 10;
-  struct sigaction action = {};
-  action.sa_handler = HeartbeatBacktraceSignal;
-  sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESTART;
-  sigaction(backtrace_signal, &action, nullptr);
-#endif
   while (!hb_stop_.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
 #if defined(__ANDROID__)
@@ -1385,28 +1411,8 @@ void CommandProcessor::HeartbeatThreadMain() {
         read_ptr_index_ != write_ptr_index_.load();
     idle_beats = cp_idle ? idle_beats + 1 : 0;
     if (idle_beats >= 3 && idle_beats % 5 == 3 && hb_cp_tid_.load()) {
-      heartbeat_backtrace_count.store(-1, std::memory_order_relaxed);
-      syscall(SYS_tgkill, getpid(), hb_cp_tid_.load(), backtrace_signal);
-      for (int i = 0; i < 100 && heartbeat_backtrace_count.load(
-                                     std::memory_order_acquire) < 0;
-           ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-      const int frames =
-          heartbeat_backtrace_count.load(std::memory_order_acquire);
-      std::string trace;
-      for (int i = 0; i < frames; ++i) {
-        Dl_info info = {};
-        const uintptr_t pc = heartbeat_backtrace[i];
-        if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
-          const char* base = strrchr(info.dli_fname, '/');
-          trace += fmt::format(" {}+{:X}", base ? base + 1 : info.dli_fname,
-                               pc - uintptr_t(info.dli_fbase));
-        } else {
-          trace += fmt::format(" {:X}", pc);
-        }
-      }
-      XELOGI("CpHeartbeat: CP stuck, backtrace ({} frames):{}", frames, trace);
+      XELOGI("CpHeartbeat: CP stuck, backtrace:{}",
+             CaptureThreadBacktrace(hb_cp_tid_.load()));
     }
 #endif
     long rss_pages = 0;
@@ -1474,9 +1480,26 @@ bool CommandProcessor::PauseForRuntimeSnapshot(std::function<bool()> operation,
   // Wake WAIT_REG_MEM even if the guest requested a long polling interval.
   write_ptr_index_event_->Set();
   const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (threading::Wait(request->done.get(), false,
                         std::chrono::milliseconds(1)) !=
          threading::WaitResult::kSuccess) {
+    if (std::chrono::steady_clock::now() >= next_report) {
+      next_report += std::chrono::seconds(10);
+      bool started;
+      { std::lock_guard lock(request->mutex); started = request->started; }
+      std::string trace;
+#if defined(__ANDROID__)
+      if (hb_cp_tid_.load()) trace = CaptureThreadBacktrace(hb_cp_tid_.load());
+      if (const int ui_tid = ui::ui_loop_thread_tid.load()) {
+        trace += " | UI thread at:" + CaptureThreadBacktrace(ui_tid);
+      }
+#endif
+      XELOGW("GPU snapshot: still waiting, operation {} (request state {}), "
+             "CP thread at:{}",
+             started ? "running in the CP thread" : "not started yet",
+             int(snapshot_request_state_.load()), trace);
+    }
     if (snapshot_request_state_.load(std::memory_order_acquire) !=
             SnapshotRequestState::kBlockedInNestedBuffer &&
         std::chrono::steady_clock::now() < deadline) {
@@ -1523,6 +1546,7 @@ bool CommandProcessor::CaptureRuntimeSnapshot(snapshot::GpuState& out) {
 }
 
 bool CommandProcessor::RestoreRuntimeSnapshot(const snapshot::GpuState& state) {
+  XELOGI("GPU restore: started in the CP thread");
   if (!state.Validate()) {
     XELOGE("GPU restore: snapshot GPU state failed validation");
     return false;
@@ -1543,6 +1567,7 @@ bool CommandProcessor::RestoreRuntimeSnapshot(const snapshot::GpuState& state) {
   active_pixel_shader_ = state.pixel_shader.empty() ? nullptr :
       LoadShader(xenos::ShaderType::kPixel, state.pixel_shader.data(), uint32_t(state.pixel_shader.size()));
   active_vertex_shader_ucode_address_ = state.vertex_ucode_address;
+  XELOGI("GPU restore: registers and active shaders loaded");
   const bool shaders = (state.vertex_shader.empty() || active_vertex_shader_) &&
                        (state.pixel_shader.empty() || active_pixel_shader_);
   if (!shaders) XELOGE("GPU restore: the active shaders could not be reloaded");

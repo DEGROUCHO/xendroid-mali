@@ -51,7 +51,14 @@ bool XModule::Matches(const std::string_view name) const {
 void XModule::OnLoad() { kernel_state_->RegisterModule(this); }
 
 void XModule::OnUnload() {
-  kernel_state_->processor()->RemoveModule(this->name());
+  // By pointer, not by name: when the title update module is freed after it
+  // was applied, removal by name ("default") destroyed the game's own
+  // executable module, and the launch then crashed in its import setup
+  // ("Pure virtual function called", every game with a title update).
+  if (processor_module_) {
+    kernel_state_->processor()->RemoveModule(processor_module_);
+    processor_module_ = nullptr;
+  }
   kernel_state_->UnregisterModule(this);
 }
 

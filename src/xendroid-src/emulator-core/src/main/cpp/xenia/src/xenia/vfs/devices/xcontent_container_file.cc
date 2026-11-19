@@ -54,7 +54,9 @@ X_STATUS XContentContainerFile::ReadSync(std::span<uint8_t> buffer,
     p += num_read;
     src_offset += record.length;
     remaining_length -= read_length;
-    if (remaining_length == 0) {
+    // A block cut short ends the read: the next ones would land early in the
+    // buffer.
+    if (remaining_length == 0 || num_read < read_length) {
       break;
     }
   }

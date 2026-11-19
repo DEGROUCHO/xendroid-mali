@@ -719,6 +719,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = true;
         break;
       }
+      case PM4_WAIT_IB_PFD_COMPLETE: {
+        // Waits for earlier INDIRECT_BUFFER_PFD base and size writes.
+        // No wait is needed since we process indirect buffers synchronously.
+        reader_.AdvanceRead(count * sizeof(uint32_t));
+        result = true;
+        break;
+      }
       case PM4_WAIT_FOR_IDLE: {
         XE_DRAW_CENSUS_BARRIER();
         // This opcode is used by 5454084E while going / being ingame.
@@ -837,7 +844,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
   // The handler runs as if everything before this point in the command stream
   // is done, so export output it may read has to be in guest RAM first.
   if (cvars::memexport_await_fences) {
-    COMMAND_PROCESSOR::AwaitMemexportForFence();
+    AwaitMemexportForFence();
   }
 
   for (int n = 0; n < 6; n++) {
@@ -941,10 +948,22 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         is_memory ? "mem" : "reg", poll_reg_addr, ref, mask);
   }
   assert_true(is_memory || poll_reg_addr < RegisterFile::kRegisterCount);
-  const volatile uint32_t& value_ref =
-      is_memory ? *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(
-                      poll_reg_addr & ~uint32_t(0x3)))
-                : register_file_->values[poll_reg_addr];
+  // The index comes from the guest and the assert is compiled out: like
+  // WriteRegister, treat a nonexistent register as such (reading 0) instead
+  // of reading past the register file.
+  static const uint32_t kNonexistentRegisterValue = 0;
+  const uint32_t* value_ptr;
+  if (is_memory) {
+    value_ptr = reinterpret_cast<uint32_t*>(
+        memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+  } else if (poll_reg_addr < RegisterFile::kRegisterCount) {
+    value_ptr = &register_file_->values[poll_reg_addr];
+  } else {
+    XELOGW("PM4_WAIT_REG_MEM: register index out of bounds: {}",
+           poll_reg_addr);
+    value_ptr = &kNonexistentRegisterValue;
+  }
+  const volatile uint32_t& value_ref = *value_ptr;
 
   bool matched = false;
   const uint64_t fs_wait_begin = COMMAND_PROCESSOR::FrameStatsBegin();
@@ -969,7 +988,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         // output landing there has to have reached guest RAM first.
         if (cvars::memexport_await_fences &&
             register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
-          COMMAND_PROCESSOR::AwaitMemexportForCoherency(
+          AwaitMemexportForCoherency(
               register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
               register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
         }
@@ -1095,7 +1114,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
   uint32_t reg_val;
 
   assert_true(reg_addr < RegisterFile::kRegisterCount);
-  reg_val = register_file_->values[reg_addr];
+  if (reg_addr < RegisterFile::kRegisterCount) {
+    reg_val = register_file_->values[reg_addr];
+  } else {
+    XELOGW("PM4_REG_TO_MEM: register index out of bounds: {}", reg_addr);
+    reg_val = 0;
+  }
 
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
@@ -1161,7 +1185,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
   } else {
     // Register.
     assert_true(poll_reg_addr < RegisterFile::kRegisterCount);
-    value = register_file_->values[poll_reg_addr];
+    if (poll_reg_addr < RegisterFile::kRegisterCount) {
+      value = register_file_->values[poll_reg_addr];
+    } else {
+      XELOGW("PM4_COND_WRITE: register index out of bounds: {}",
+             poll_reg_addr);
+      value = 0;
+    }
   }
   bool matched = MatchValueAndRef(value & mask, ref, wait_info);
 
@@ -1258,7 +1288,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   // The guest treats this fence as "the GPU is done", so any export output it
   // is about to read has to be in guest RAM first.
   if (cvars::memexport_await_fences) {
-    COMMAND_PROCESSOR::AwaitMemexportForFence();
+    AwaitMemexportForFence();
   }
 
   uint32_t data_value;

@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
 #include "xenia/base/logging.h"
+#include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -19,17 +20,14 @@ namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-dword_result_t XexCheckExecutablePrivilege_entry(dword_t privilege) {
-  // BOOL
-  // DWORD Privilege
-
+static bool HasExecutablePrivilege(uint32_t privilege) {
   // Privilege is bit position in xe_xex2_system_flags enum - so:
   // Privilege=6 -> 0x00000040 -> XEX_SYSTEM_INSECURE_SOCKETS
   uint32_t mask = 1 << privilege;
 
   auto module = kernel_state()->GetExecutableModule();
   if (!module) {
-    return 0;
+    return false;
   }
 
   uint32_t flags = 0;
@@ -37,7 +35,33 @@ dword_result_t XexCheckExecutablePrivilege_entry(dword_t privilege) {
 
   return (flags & mask) > 0;
 }
+
+dword_result_t XexCheckExecutablePrivilege_entry(dword_t privilege) {
+  // BOOL
+  // DWORD Privilege
+  return HasExecutablePrivilege(privilege);
+}
 DECLARE_XBOXKRNL_EXPORT1(XexCheckExecutablePrivilege, kModules, kImplemented);
+
+// Takes the signed part of an XEX2 header's security info, from its RSA
+// signature on. The hypervisor checks it and decrypts its image key in place,
+// which the dashboard needs to read a disc's executable.
+dword_result_t XexTransformImageKey_entry(lpvoid_t security_info,
+                                          dword_t size) {
+  constexpr uint32_t kImageKeyOffset =
+      offsetof(xex2_security_info, aes_key) -
+      offsetof(xex2_security_info, rsa_signature);
+  if (!HasExecutablePrivilege(0)) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+  if (!security_info || size < kImageKeyOffset + 0x10) {
+    return X_STATUS_TOO_MANY_SECRETS;
+  }
+  uint8_t* key = security_info.as<uint8_t*>() + kImageKeyOffset;
+  cpu::DecryptXex2ImageKey(key, key);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XexTransformImageKey, kModules, kImplemented);
 
 dword_result_t XexGetModuleHandle(std::string module_name,
                                   xe::be<uint32_t>* hmodule_ptr) {
@@ -115,8 +139,19 @@ dword_result_t xeXexLoadImage(
   } else {
     // Not found; attempt to load as a user module.
     auto user_module = load_callback();
+    // A patch that fails part way leaves the module unusable, so it is loaded
+    // again and runs without the update (xenia-edge 8984c68712).
+    if (user_module &&
+        XFAILED(kernel_state()->ApplyTitleUpdate(user_module))) {
+      XELOGE("Failed to apply title update, loading {} without it",
+             user_module->name());
+      kernel_state()->UnloadUserModule(user_module, false);
+      // Its image is freed with its last reference, which has to go before
+      // the reload maps the image at the same address.
+      user_module = nullptr;
+      user_module = load_callback();
+    }
     if (user_module) {
-      kernel_state()->ApplyTitleUpdate(user_module);
       kernel_state()->FinishLoadingUserModule(user_module);
       // Give up object ownership, this reference will be released by the last
       // XexUnloadImage call
@@ -309,6 +344,24 @@ dword_result_t XexLoadImageHeaders_entry(pointer_t<X_ANSI_STRING> path,
 
   } else {
     result_status = X_STATUS_BUFFER_TOO_SMALL;
+  }
+
+  // The security info's offset becomes its address in the buffer, which is
+  // how titles reach it.
+  if (result_status == X_STATUS_SUCCESS) {
+    const uint32_t security_offset = header->security_offset;
+    const uint32_t remaining =
+        security_offset < header_size ? header_size - security_offset : 0;
+    const uint8_t* data = reinterpret_cast<uint8_t*>(header.host_address());
+    const uint32_t security_size =
+        remaining >= 4 ? xe::load_and_swap<uint32_t>(data + security_offset)
+                       : 0;
+    // At least everything before the page descriptors.
+    if (security_size < 0x184 || security_size > remaining) {
+      result_status = X_STATUS_INVALID_IMAGE_FORMAT;
+    } else {
+      header->security_offset = header.guest_address() + security_offset;
+    }
   }
 
   vfs_file->Destroy();

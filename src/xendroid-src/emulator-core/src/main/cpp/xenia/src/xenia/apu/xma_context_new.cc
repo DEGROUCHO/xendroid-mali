@@ -354,8 +354,12 @@ RingBuffer XmaContextNew::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
   // Output buffer is a ring buffer. We need to write from the write offset
   // to the read offset.
   RingBuffer output_rb(output_buffer, output_capacity);
-  output_rb.set_read_offset(output_read_offset);
-  output_rb.set_write_offset(output_write_offset);
+  // The offsets wrap modulo the capacity, so skip them for an empty buffer,
+  // which titles can set and which is rejected before any decoding.
+  if (output_capacity) {
+    output_rb.set_read_offset(output_read_offset);
+    output_rb.set_write_offset(output_write_offset);
+  }
   remaining_subframe_blocks_in_output_buffer_ =
       (int32_t)output_rb.write_count() / kOutputBytesPerBlock;
 
@@ -575,6 +579,9 @@ void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data) {
   current_frame_remaining_subframes_ = 0;
   advance_ = {};
   FlushDecoder();
+  // The xmaframes decoder has no flush callback, so its overlap history would
+  // survive into the next stream: recreate it on the next frame.
+  reset_decoder_ = true;
 }
 
 void XmaContextNew::FlushDecoder() {
@@ -1313,8 +1320,9 @@ int XmaContextNew::PrepareDecoder(int sample_rate, bool is_two_channel) {
 
   // Re-initialize the context with new sample rate and channels.
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (!av_context_ || av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || reset_decoder_ || av_context_->sample_rate != sample_rate ||
       av_context_->ch_layout.nb_channels != (int)channels) {
+    reset_decoder_ = false;
     XELOGAPU("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}",
              id(), av_context_ ? av_context_->sample_rate : 0, sample_rate,
              av_context_ ? av_context_->ch_layout.nb_channels : 0, channels);

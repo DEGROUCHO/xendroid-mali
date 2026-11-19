@@ -20,7 +20,7 @@
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
-#include "xenia/kernel/util/crypto_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
 #include "xenia/vfs/devices/host_path_device.h"
 
 #if XE_PLATFORM_xendroid
@@ -43,25 +43,26 @@ namespace xam {
 
 bool ProfileManager::DecryptAccountFile(const uint8_t* data,
                                         X_XAMACCOUNTINFO* output, bool devkit) {
-  const uint8_t* key = util::GetXeKey(0x19, devkit);
+  uint8_t* key = const_cast<uint8_t*>(xboxkrnl::XeKeysGetKeyData(0x19, devkit));
   if (!key) {
     return false;  // this shouldn't happen...
   }
 
   // Generate RC4 key from data hash
   uint8_t rc4_key[0x14];
-  util::HmacSha(key, 0x10, data, 0x10, 0, 0, 0, 0, rc4_key, 0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, const_cast<uint8_t*>(data), 0x10,
+                                 nullptr, 0, nullptr, 0, rc4_key, 0x14);
 
   uint8_t dec_data[sizeof(X_XAMACCOUNTINFO) + 8];
 
   // Decrypt data
-  util::RC4(rc4_key, 0x10, data + 0x10, sizeof(dec_data), dec_data,
-            sizeof(dec_data));
+  std::memcpy(dec_data, data + 0x10, sizeof(dec_data));
+  xboxkrnl::XeCryptRc4_entry(rc4_key, 0x10, dec_data, sizeof(dec_data));
 
   // Verify decrypted data against hash
   uint8_t data_hash[0x14];
-  util::HmacSha(key, 0x10, dec_data, sizeof(dec_data), 0, 0, 0, 0, data_hash,
-                0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, dec_data, sizeof(dec_data), nullptr,
+                                 0, nullptr, 0, data_hash, 0x14);
 
   if (std::memcmp(data, data_hash, 0x10) == 0) {
     // Copy account data to output
@@ -74,7 +75,7 @@ bool ProfileManager::DecryptAccountFile(const uint8_t* data,
 
 void ProfileManager::EncryptAccountFile(const X_XAMACCOUNTINFO* input,
                                         uint8_t* output, bool devkit) {
-  const uint8_t* key = util::GetXeKey(0x19, devkit);
+  uint8_t* key = const_cast<uint8_t*>(xboxkrnl::XeKeysGetKeyData(0x19, devkit));
   if (!key) {
     return;  // this shouldn't happen...
   }
@@ -91,18 +92,18 @@ void ProfileManager::EncryptAccountFile(const X_XAMACCOUNTINFO* input,
 
   // Set data hash
   uint8_t data_hash[0x14];
-  util::HmacSha(key, 0x10, output + 0x10, enc_data_size, 0, 0, 0, 0, data_hash,
-                0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, output + 0x10, enc_data_size,
+                                 nullptr, 0, nullptr, 0, data_hash, 0x14);
 
   std::memcpy(output, data_hash, 0x10);
 
   // Generate RC4 key from data hash
   uint8_t rc4_key[0x14];
-  util::HmacSha(key, 0x10, data_hash, 0x10, 0, 0, 0, 0, rc4_key, 0x14);
+  xboxkrnl::XeCryptHmacSha_entry(key, 0x10, data_hash, 0x10, nullptr, 0,
+                                 nullptr, 0, rc4_key, 0x14);
 
   // Encrypt data
-  util::RC4(rc4_key, 0x10, output + 0x10, enc_data_size, output + 0x10,
-            enc_data_size);
+  xboxkrnl::XeCryptRc4_entry(rc4_key, 0x10, output + 0x10, enc_data_size);
 }
 
 ProfileManager::ProfileManager(KernelState* kernel_state,
@@ -333,14 +334,6 @@ bool ProfileManager::DismountProfile(const uint64_t xuid) {
 
 void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
                            bool notify) {
-  if (logged_profiles_.size() >= XUserMaxUserCount) {
-    XELOGE(
-        "Cannot login account with XUID: {:016X} due to lack of free slots "
-        "(Max 4 accounts at once)",
-        xuid);
-    return;
-  }
-
   if (user_index < XUserMaxUserCount) {
     const auto& profile = logged_profiles_.find(user_index);
     if (profile != logged_profiles_.cend()) {
@@ -351,6 +344,10 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
     }
   }
 
+  if (!accounts_.count(xuid)) {
+    return;
+  }
+
   // Find if xuid is already logged in. We might want to logout.
   auto it = std::find_if(
       logged_profiles_.begin(), logged_profiles_.end(),
@@ -359,7 +356,16 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
     Logout(it->first);
   }
 
-  if (!accounts_.count(xuid)) {
+  // Whoever holds the slot asked for leaves it.
+  if (user_index < XUserMaxUserCount) {
+    Logout(user_index, notify);
+  }
+
+  if (logged_profiles_.size() >= XUserMaxUserCount) {
+    XELOGE(
+        "Cannot login account with XUID: {:016X} due to lack of free slots "
+        "(Max 4 accounts at once)",
+        xuid);
     return;
   }
 

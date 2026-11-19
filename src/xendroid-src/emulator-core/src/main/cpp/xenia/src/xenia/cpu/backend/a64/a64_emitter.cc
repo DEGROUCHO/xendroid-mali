@@ -549,7 +549,9 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // TAIL CODE
   // ========================================================================
   emitting_tail_ = true;
-  for (auto& tail_item : tail_code_) {
+  // By index, so tails that a tail's callback adds are emitted too.
+  for (size_t tail_index = 0; tail_index < tail_code_.size(); ++tail_index) {
+    TailEmitter& tail_item = tail_code_[tail_index];
     // ARM64 instructions are always 4-byte aligned, so alignment is mostly
     // a no-op unless we want cache-line alignment for hot paths.
     L(tail_item.label);

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@ DECLARE_bool(vulkan_pass_head_overlap);
 DECLARE_bool(vulkan_resolve_texture_copy);
 DECLARE_bool(vulkan_texture_from_render_target);
 DECLARE_bool(vulkan_color_surface_resolve);
+DECLARE_bool(vulkan_color_surface_resolve_wide);
 DECLARE_bool(log_image_compression);
 DECLARE_int32(log_render_pass_breaks);
 
@@ -192,6 +194,18 @@ DEFINE_int32(log_pass_head_texture_rejects, 0,
              "Every N texture data requests, log why texture loads were not "
              "moved to the head of the current render pass (0 = off).",
              "GPU");
+DEFINE_bool(vulkan_resolve_texture_copy_cover, true,
+            "Fill partial resolves into outdated single-level textures too, and "
+            "make the texture current without reloading it once the resolves "
+            "since its last other write cover all of it (shadow atlases "
+            "rewritten cascade by cascade after an aliasing write).",
+            "GPU");
+UPDATE_from_bool(vulkan_resolve_texture_copy_cover, 2026, 11, 19, 6, false);
+DEFINE_bool(vulkan_resolve_texture_copy_mips, false,
+            "Also fill mipmapped textures from resolves rewriting one whole "
+            "level (power-of-two sizes): the base, or one mip when the other "
+            "mips are current, instead of reloading the whole texture.",
+            "GPU");
 DEFINE_bool(vulkan_resolve_texture_copy_covering, true,
             "With vulkan_resolve_texture_copy, also fill a texture from a "
             "resolve whose 8-pixel aligned rectangle covers it and more "
@@ -656,6 +670,14 @@ VulkanTextureCache::~VulkanTextureCache() {
   sampler_used_last_ = nullptr;
   sampler_used_first_ = nullptr;
 
+  for (auto& views : null_image_views_ones_) {
+    for (VkImageView& view : views) {
+      if (view != VK_NULL_HANDLE) {
+        dfn.vkDestroyImageView(device, view, nullptr);
+        view = VK_NULL_HANDLE;
+      }
+    }
+  }
   if (null_image_view_3d_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, null_image_view_3d_, nullptr);
   }
@@ -826,7 +848,11 @@ void VulkanTextureCache::TransitionTextureForGuestShader(
     texture.depth_surface_pending_sample = false;
     if (!texture.base_outdated_lockless() && !texture.mips_outdated_lockless())
       command_processor_.render_target_cache_->RecordDepthSurfaceTextureHit(
-          uint64_t(texture.key().GetWidth()) * texture.key().GetHeight() * 4);
+          uint64_t(texture.key().GetWidth()) * texture.key().GetHeight() *
+          (texture.surface_is_color &&
+                   IsColorSurface64bpp(texture.surface_color_kind)
+               ? 8
+               : 4));
   }
   if (texture.resolve_copy_pending_sample) {
     texture.resolve_copy_pending_sample = false;
@@ -880,30 +906,56 @@ void VulkanTextureCache::FlushEagerResolvedReloads() {
 }
 
 bool VulkanTextureCache::ResolveDeferTextureRead(
-    uint32_t used_texture_mask, uint32_t address, uint32_t length,
-    bool& unknown) const {
-  auto overlaps = [address, length](uint32_t start, uint64_t size) {
+    uint32_t used_texture_mask, const std::pair<uint32_t, uint32_t>* ranges,
+    size_t range_count, bool& unknown) const {
+  // Physical memory is periodic at 512 MiB: circular intervals.
+  auto overlaps = [ranges, range_count](uint32_t start, uint64_t size) {
     constexpr uint32_t mask = SharedMemory::kBufferSize - 1;
-    return length && size &&
-           (size >= SharedMemory::kBufferSize ||
-            ((start - address) & mask) < length ||
-            ((address - start) & mask) < size);
+    for (size_t i = 0; i < range_count; ++i) {
+      const uint32_t address = ranges[i].first, length = ranges[i].second;
+      if (length && size &&
+          (size >= SharedMemory::kBufferSize ||
+           ((start - address) & mask) < length ||
+           ((address - start) & mask) < size)) {
+        return true;
+      }
+    }
+    return false;
   };
   uint32_t slot;
   while (xe::bit_scan_forward(used_texture_mask, &slot)) {
     used_texture_mask = xe::clear_lowest_bit(used_texture_mask);
-    TextureKey key;
-    BindingInfoFromFetchConstant(register_file().GetTextureFetch(slot), key,
-                                 nullptr);
-    if (!key.is_valid) {
+    const xenos::xe_gpu_texture_fetch_t fetch =
+        register_file().GetTextureFetch(slot);
+    ResolveDeferExtents& extents = resolve_defer_extents_[slot];
+    const bool allow_invalid = cvars::gpu_allow_invalid_fetch_constants;
+    if (!extents.computed || extents.allow_invalid != allow_invalid ||
+        std::memcmp(&extents.fetch, &fetch, sizeof(fetch))) {
+      TextureKey key;
+      BindingInfoFromFetchConstant(fetch, key, nullptr);
+      extents.fetch = fetch;
+      extents.computed = true;
+      extents.allow_invalid = allow_invalid;
+      extents.valid = key.is_valid;
+      extents.base_length = extents.mip_length = 0;
+      if (key.is_valid) {
+        const auto layout = key.GetGuestLayout();
+        extents.base_address = key.base_page << 12;
+        extents.mip_address = key.mip_page << 12;
+        if (key.base_page) {
+          extents.base_length = layout.base.level_data_extent_bytes;
+        }
+        if (key.mip_page) {
+          extents.mip_length = layout.mips_total_extent_bytes;
+        }
+      }
+    }
+    if (!extents.valid) {
       unknown = true;
       continue;
     }
-    const auto layout = key.GetGuestLayout();
-    if ((key.base_page &&
-         overlaps(key.base_page << 12, layout.base.level_data_extent_bytes)) ||
-        (key.mip_page &&
-         overlaps(key.mip_page << 12, layout.mips_total_extent_bytes))) {
+    if (overlaps(extents.base_address, extents.base_length) ||
+        overlaps(extents.mip_address, extents.mip_length)) {
       return true;
     }
   }
@@ -982,14 +1034,79 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
   if (image_view != VK_NULL_HANDLE) {
     return image_view;
   }
+  return GetNullImageView(dimension,
+                          GetActiveTextureHostSwizzle(fetch_constant_index));
+}
+
+VkImageView VulkanTextureCache::GetNullImageView(
+    xenos::FetchOpDimension dimension, uint32_t host_swizzle) {
+  uint32_t dimension_index;
+  VkImageView zero_view;
   switch (dimension) {
     case xenos::FetchOpDimension::k3DOrStacked:
-      return null_image_view_3d_;
+      dimension_index = 2;
+      zero_view = null_image_view_3d_;
+      break;
     case xenos::FetchOpDimension::kCube:
-      return null_image_view_cube_;
+      dimension_index = 1;
+      zero_view = null_image_view_cube_;
+      break;
     default:
-      return null_image_view_2d_array_;
+      dimension_index = 0;
+      zero_view = null_image_view_2d_array_;
+      break;
   }
+  // The null image is (0, 0, 0, 0); components the swizzle makes constant 1
+  // need a view mapping them to 1. Without view swizzles the shader applies
+  // the host swizzle, constants included, itself.
+  uint32_t ones = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (((host_swizzle >> (3 * i)) & 0b111) == xenos::XE_GPU_TEXTURE_SWIZZLE_1) {
+      ones |= UINT32_C(1) << i;
+    }
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  if (!ones || !vulkan_device->properties().imageViewFormatSwizzle) {
+    return zero_view;
+  }
+  VkImageView& view = null_image_views_ones_[dimension_index][ones];
+  if (view != VK_NULL_HANDLE) {
+    return view;
+  }
+  VkImageViewCreateInfo view_create_info;
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.pNext = nullptr;
+  view_create_info.flags = 0;
+  view_create_info.image =
+      dimension_index == 2 ? null_image_3d_ : null_image_2d_array_cube_;
+  view_create_info.viewType =
+      dimension_index == 2
+          ? VK_IMAGE_VIEW_TYPE_3D
+          : (dimension_index == 1 ? VK_IMAGE_VIEW_TYPE_CUBE
+                                  : VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+  view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  view_create_info.components.r =
+      (ones & 0b0001) ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+  view_create_info.components.g =
+      (ones & 0b0010) ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+  view_create_info.components.b =
+      (ones & 0b0100) ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+  view_create_info.components.a =
+      (ones & 0b1000) ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+  view_create_info.subresourceRange =
+      ui::vulkan::util::InitializeSubresourceRange(
+          VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+          dimension_index == 1 ? 6 : 1);
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (dfn.vkCreateImageView(vulkan_device->device(), &view_create_info,
+                            nullptr, &view) != VK_SUCCESS) {
+    XELOGE("VulkanTextureCache: Failed to create a null image view with "
+           "constant 1 components");
+    view = VK_NULL_HANDLE;
+    return zero_view;
+  }
+  return view;
 }
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
@@ -1061,6 +1178,10 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
           ? fetch.aniso_filter
           : binding.aniso_filter;
   parameters.mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
+  // The base map samples level 0 when the base is available.
+  if (parameters.mip_base_map && subres_base_page != 0) {
+    mip_min_level = 0;
+  }
 
   parameters.mip_min_level = mip_min_level;
   if (parameters.mip_min_level) {
@@ -1633,8 +1754,16 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
     }
   }
   if (formats[0] == VK_FORMAT_UNDEFINED) {
-    // TODO(Triang3l): If there's no best format, set that a format unsupported
-    // by the emulator completely is used to report at the end of the frame.
+    // A format the emulator has no host format for: the texture is never
+    // created and samples as black. Reported once per format.
+    static std::atomic<uint64_t> reported_formats{0};
+    const uint64_t format_bit = uint64_t(1) << (uint32_t(key.format) & 63);
+    if (!(reported_formats.fetch_or(format_bit) & format_bit)) {
+      XELOGW(
+          "VulkanTextureCache: no host format for {} textures, they sample as "
+          "black",
+          FormatInfo::GetName(key.format));
+    }
     return nullptr;
   }
 
@@ -1687,10 +1816,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
   }
   bool depth_surface_renderable = false;
   // Resolve destinations the render target cache can draw straight into.
+  const ColorSurfaceKind color_surface_kind = GetColorSurfaceKind(key.format);
   const bool color_surface =
       RenderTargetShortcut(cvars::vulkan_color_surface_resolve) &&
-      key.format == xenos::TextureFormat::k_8_8_8_8 &&
-      formats[0] == VK_FORMAT_R8G8B8A8_UNORM;
+      color_surface_kind != kColorSurfaceKindCount &&
+      (color_surface_kind == kColorSurface8888 ||
+       cvars::vulkan_color_surface_resolve_wide) &&
+      formats[0] == GetColorSurfaceVulkanFormat(color_surface_kind);
   if (RenderTargetShortcut(cvars::vulkan_texture_from_render_target) &&
       ((key.format == xenos::TextureFormat::k_24_8_FLOAT &&
         formats[0] == VK_FORMAT_R32_SFLOAT &&
@@ -1771,8 +1903,16 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
   auto vulkan_texture = new VulkanTexture(*this, key, image, allocation);
   vulkan_texture->depth_surface_renderable = depth_surface_renderable;
   vulkan_texture->surface_is_color = depth_surface_renderable && color_surface;
+  if (vulkan_texture->surface_is_color) {
+    vulkan_texture->surface_color_kind = color_surface_kind;
+  }
   if (ResolveTextureBytesPerPixel(key)) {
     resolve_textures_.emplace(key.base_page << 12, vulkan_texture);
+  } else if (key.mip_max_level && ResolveTextureBytesPerPixel(key, true)) {
+    resolve_mipped_textures_.emplace(key.base_page << 12, vulkan_texture);
+    if (key.mip_page) {
+      resolve_mipped_textures_.emplace(key.mip_page << 12, vulkan_texture);
+    }
   }
   return std::unique_ptr<Texture>(vulkan_texture);
 }
@@ -2223,8 +2363,9 @@ void VulkanTextureCache::DebugWriteTextureAudit(
 }
 
 uint32_t VulkanTextureCache::ResolveTextureBytesPerPixel(
-    const TextureKey& key) const {
-  if (!key.base_page || !key.tiled || key.packed_mips || key.mip_max_level ||
+    const TextureKey& key, bool allow_mips) const {
+  if (!key.base_page || !key.tiled ||
+      (!allow_mips && (key.packed_mips || key.mip_max_level)) ||
       key.GetWidth() > (uint32_t(key.pitch) << 5) ||
       key.dimension != xenos::DataDimension::k2DOrStacked ||
       key.GetDepthOrArraySize() != 1) {
@@ -2292,6 +2433,7 @@ enum ResolveCopyReject : uint32_t {
   kRcBaseDelta, kRcNotFull, kRcSize, kRcArrayOrEndian, kRcTaken, kRcCount,
 };
 uint64_t resolve_copy_rejects[kRcCount];
+uint64_t resolve_cover_publishes = 0;
 uint32_t resolve_copy_reject_format[2];
 void NoteResolveCopy(ResolveCopyReject reason) {
   if (!cvars::log_resolve_texture_copy_rejects) return;
@@ -2301,11 +2443,13 @@ void NoteResolveCopy(ResolveCopyReject reason) {
   const auto& r = resolve_copy_rejects;
   XELOGI("ResolveCopyRejects: taken={} no_texture={} format={} (last "
          "texture {} vs resolve {}) scaled={} pitch={} endian={} tiling3d={} "
-         "base_delta={} not_full={} size={} array_or_endian={}",
+         "base_delta={} not_full={} size={} array_or_endian={} "
+         "cover_publishes={}",
          r[kRcTaken], r[kRcNoTexture], r[kRcFormat],
          resolve_copy_reject_format[0], resolve_copy_reject_format[1],
          r[kRcScaled], r[kRcPitch], r[kRcEndian], r[kRcTiling3D],
-         r[kRcBaseDelta], r[kRcNotFull], r[kRcSize], r[kRcArrayOrEndian]);
+         r[kRcBaseDelta], r[kRcNotFull], r[kRcSize], r[kRcArrayOrEndian],
+         resolve_cover_publishes);
 }
 }  // namespace
 
@@ -2396,9 +2540,11 @@ VulkanTextureCache::PrepareResolveTextureCopy(
             UINT32_C(0x20000000)) {
       continue;
     }
+    const bool cover_ok = cvars::vulkan_resolve_texture_copy_cover &&
+                          !scaled && partial_ok && !key.mip_max_level;
     if ((!full && (scaled || !partial_ok ||
-                   (!depth && (!texture.loaded_once() ||
-                               texture.base_outdated(lock))))) ||
+                   (!depth && !cover_ok &&
+                    (!texture.loaded_once() || texture.base_outdated(lock))))) ||
         x >= key.GetWidth() || y >= key.GetHeight()) {
       reject = kRcNotFull;
       texture.resolve_copy_last = 0x80 | kRcNotFull;
@@ -2439,6 +2585,7 @@ VulkanTextureCache::PrepareResolveTextureCopy(
         (depth && !x && !y && width >= key.GetWidth() &&
          height >= key.GetHeight()) ||
         (partial_ok && texture.loaded_once() && !texture.base_outdated(lock));
+    target.cover = !target.publish && cover_ok;
     target.region.bufferRowLength = width * sx;
     target.region.bufferImageHeight = height * sy;
     target.region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -2449,6 +2596,97 @@ VulkanTextureCache::PrepareResolveTextureCopy(
     copy.size = size;
     copy.linear_dest_flags = linear_dest_flags;
     copy.targets.push_back(target);
+  }
+  // Mipmapped textures: a resolve rewriting one whole level (a downsample
+  // chain's base or one of its mips) fills that level of the host image, and
+  // only that part (base or mips) is republished - other mips must already be
+  // current.
+  if (cvars::vulkan_resolve_texture_copy_mips && !scaled &&
+      !info.copy_dest_x0 && !info.copy_dest_y0) {
+    const uint32_t dest_pitch =
+        uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5;
+    const auto mipped = resolve_mipped_textures_.equal_range(base);
+    for (auto it = mipped.first; it != mipped.second; ++it) {
+      VulkanTexture& texture = *it->second;
+      const TextureKey& key = texture.key();
+      if (key.format != format || key.scaled_resolve ||
+          uint32_t(key.endianness) !=
+              uint32_t(info.copy_dest_info.copy_dest_endian) ||
+          texture.force_load_3d_tiling() || SkipsTopMip(key) ||
+          !xe::is_pow2(key.GetWidth()) ||
+          !xe::is_pow2(key.GetHeight())) {
+        continue;
+      }
+      const uint32_t bpp = ResolveTextureBytesPerPixel(key, true);
+      if (!bpp) continue;
+      const auto& layout = texture.guest_layout();
+      uint32_t level = UINT32_MAX;
+      if (base == (key.base_page << 12)) {
+        if (key.pitch != info.copy_dest_coordinate_info.pitch_aligned_div_32 ||
+            layout.packed_level == 0) {
+          continue;
+        }
+        level = 0;
+      } else if (key.mip_page) {
+        for (uint32_t l = 1; l <= layout.max_level && l < layout.packed_level;
+             ++l) {
+          if ((key.mip_page << 12) + layout.mip_offsets_bytes[l] == base) {
+            level = l;
+            break;
+          }
+        }
+        if (level == UINT32_MAX ||
+            layout.mips[level].row_pitch_bytes != dest_pitch * bpp ||
+            !texture.loaded_once() || texture.mips_outdated(lock)) {
+          if (cvars::log_resolve_texture_copy_rejects) {
+            static uint32_t logged = 0;
+            if (logged < 60) {
+              ++logged;
+              XELOGI("ResolveCopyMipReject: base {:08X} tex {:08X} mips "
+                     "{:08X}+{:X} level {} row_pitch {} dest_pitch {} bpp {} "
+                     "once {} mips_outdated {} packed_level {} max_level {}",
+                     base, key.base_page << 12, key.mip_page << 12,
+                     texture.GetGuestMipsSize(), level,
+                     level == UINT32_MAX ? 0 : layout.mips[level].row_pitch_bytes,
+                     dest_pitch, bpp, uint32_t(texture.loaded_once()),
+                     uint32_t(texture.mips_outdated(lock)), layout.packed_level,
+                     layout.max_level);
+            }
+          }
+          continue;
+        }
+      }
+      if (level == UINT32_MAX) continue;
+      const uint32_t level_width = std::max(key.GetWidth() >> level, 1u);
+      const uint32_t level_height = std::max(key.GetHeight() >> level, 1u);
+      if (width < level_width || height < level_height ||
+          level > key.mip_max_level) {
+        continue;
+      }
+      const uint32_t linear_dest_flags = ResolveTextureLinearDestFlags(key);
+      if (!copy.targets.empty() && linear_dest_flags != copy.linear_dest_flags) {
+        continue;
+      }
+      const VkDeviceSize size = VkDeviceSize(width) * height * bpp;
+      if (size > command_processor_.GetVulkanDevice()
+                     ->properties()
+                     .maxStorageBufferRange) {
+        continue;
+      }
+      ResolveTextureCopy::Target target = {};
+      target.texture = &texture;
+      target.publish = true;
+      target.part = level ? 2 : 1;
+      target.exact_level = width == level_width && height == level_height;
+      target.region.bufferRowLength = width;
+      target.region.bufferImageHeight = height;
+      target.region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+      target.region.imageExtent = {level_width, level_height, 1};
+      texture.MarkAsUsed();
+      copy.size = size;
+      copy.linear_dest_flags = linear_dest_flags;
+      copy.targets.push_back(target);
+    }
   }
   if (copy.targets.empty() && reject == kRcNoTexture &&
       cvars::log_resolve_texture_copy_rejects) {
@@ -2470,6 +2708,20 @@ void VulkanTextureCache::CompleteResolveTextureCopy(
     const draw_util::ResolveInfo& info, bool scaled,
     const global_unique_lock_type& lock) {
   assert_true(lock.owns_lock());
+  // Base epochs before this resolve's own invalidation: a cover target keeps
+  // accumulating only if nothing else wrote the texture since its last copy.
+  uint32_t cover_epochs[16];
+  // A level copy writes only that level's texels: the other part (mips for a
+  // base copy, base for a mip copy) stays current if it was before, even when
+  // the resolve's estimated extent reaches its pages.
+  bool other_part_current[16] = {};
+  for (size_t i = 0; i < copy.targets.size() && i < 16; ++i) {
+    const auto& t = copy.targets[i];
+    cover_epochs[i] = t.texture->base_invalidation_epoch();
+    other_part_current[i] =
+        t.part == 1 ? !t.texture->mips_outdated(lock)
+                    : (t.part == 2 && !t.texture->base_outdated(lock));
+  }
   // All aliases lose their old watches first. Only the exact images filled
   // below are republished, with new watches, under this same recursive lock.
   MarkRangeAsResolved(info.copy_dest_extent_start, info.copy_dest_extent_length,
@@ -2498,17 +2750,131 @@ void VulkanTextureCache::CompleteResolveTextureCopy(
         VK_QUEUE_FAMILY_IGNORED, false);
   }
   command_processor_.SubmitBarriers(true);
-  for (const auto& target : copy.targets) {
+  for (size_t target_index = 0; target_index < copy.targets.size();
+       ++target_index) {
+    const auto& target = copy.targets[target_index];
     auto& texture = *static_cast<VulkanTexture*>(target.texture);
     auto* region = commands.CmdCopyBufferToImageEmplace(
         buffer, texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
     *region = target.region;
     ++texture.resolve_copy_count;
     texture.resolve_copy_last = target.publish ? 2 : 3;
-    if (target.publish && texture.MakeUpToDateAndWatch(lock)) {
+    if (target.part && target.exact_level && target_index < 16 &&
+        other_part_current[target_index] &&
+        cvars::vulkan_resolve_texture_copy_mips) {
+      texture.MakePartUpToDateAndWatch(lock, target.part == 1);
+    }
+    if (target.publish &&
+        (target.part ? texture.MakePartUpToDateAndWatch(lock, target.part == 2)
+                     : texture.MakeUpToDateAndWatch(lock))) {
       texture.set_loaded_once();
       texture.resolve_copy_pending_sample = true;
       texture.resolve_copy_last = 1;
+    } else if (target.cover && target_index < 16 &&
+               texture.base_outdated(lock)) {
+      const TextureKey& key = texture.key();
+      const uint32_t blocks_x = (key.GetWidth() + 7) >> 3;
+      const uint32_t blocks_y = (key.GetHeight() + 7) >> 3;
+      const uint32_t block_count = blocks_x * blocks_y;
+      if (!texture.resolve_cover_active ||
+          texture.resolve_cover_epoch != cover_epochs[target_index] ||
+          texture.resolve_cover_bits.size() != ((block_count + 63) >> 6)) {
+        texture.resolve_cover_bits.assign((block_count + 63) >> 6, 0);
+        texture.resolve_cover_blocks = 0;
+        texture.resolve_cover_active = true;
+      }
+      // The region is clamped to the texture: a rectangle reaching its edge
+      // covers the partial edge block too, others end on 8-texel boundaries.
+      const uint32_t bx0 = uint32_t(target.region.imageOffset.x) >> 3;
+      const uint32_t by0 = uint32_t(target.region.imageOffset.y) >> 3;
+      const uint32_t bx1 = std::min(
+          (uint32_t(target.region.imageOffset.x) +
+           target.region.imageExtent.width + 7) >> 3, blocks_x);
+      const uint32_t by1 = std::min(
+          (uint32_t(target.region.imageOffset.y) +
+           target.region.imageExtent.height + 7) >> 3, blocks_y);
+      const bool aligned_x =
+          !(target.region.imageOffset.x & 7) &&
+          (!(target.region.imageExtent.width & 7) ||
+           uint32_t(target.region.imageOffset.x) +
+                   target.region.imageExtent.width == key.GetWidth());
+      const bool aligned_y =
+          !(target.region.imageOffset.y & 7) &&
+          (!(target.region.imageExtent.height & 7) ||
+           uint32_t(target.region.imageOffset.y) +
+                   target.region.imageExtent.height == key.GetHeight());
+      if (aligned_x && aligned_y) {
+        for (uint32_t by = by0; by < by1; ++by) {
+          for (uint32_t bx = bx0; bx < bx1; ++bx) {
+            const uint32_t bit = by * blocks_x + bx;
+            uint64_t& word = texture.resolve_cover_bits[bit >> 6];
+            const uint64_t mask = UINT64_C(1) << (bit & 63);
+            if (!(word & mask)) {
+              word |= mask;
+              ++texture.resolve_cover_blocks;
+            }
+          }
+        }
+      }
+      // This resolve's own invalidation is accounted for.
+      texture.resolve_cover_epoch = texture.base_invalidation_epoch();
+      if (texture.resolve_cover_blocks >= block_count) {
+        texture.resolve_cover_active = false;
+        texture.resolve_cover_bits.clear();
+        texture.resolve_cover_bits.shrink_to_fit();
+        if (texture.MakeUpToDateAndWatch(lock)) {
+          texture.set_loaded_once();
+          texture.resolve_copy_pending_sample = true;
+          texture.resolve_copy_last = 4;
+          ++resolve_cover_publishes;
+        }
+      } else {
+        texture.WatchOutdatedBase(lock);
+      }
+    } else if (target.publish && cvars::log_resolve_texture_copy_rejects) {
+      // Which pages keep a just-filled texture from being republished.
+      static uint32_t logged = 0;
+      if (logged < 60) {
+        ++logged;
+        const uint32_t tbase = texture.key().base_page << 12;
+        const uint32_t tsize = texture.GetGuestBaseSize();
+        uint32_t invalid = 0, first = 0, last = 0, in_surface = 0;
+        for (uint32_t off = 0; off < tsize; off += 4096) {
+          const uint32_t len = std::min(UINT32_C(4096), tsize - off);
+          if (shared_memory().IsRangeValid(tbase + off, len)) continue;
+          if (!invalid) first = tbase + off;
+          last = tbase + off;
+          ++invalid;
+          in_surface += shared_memory().IsRangeValidInSurface(tbase + off, len);
+        }
+        if (target.part == 2) {
+          const uint32_t mbase = texture.key().mip_page << 12;
+          const uint32_t msize = texture.GetGuestMipsSize();
+          uint32_t minvalid = 0, mfirst = 0;
+          for (uint32_t off = 0; off < msize; off += 4096) {
+            if (shared_memory().IsRangeValid(
+                    mbase + off, std::min(UINT32_C(4096), msize - off))) {
+              continue;
+            }
+            if (!minvalid) mfirst = mbase + off;
+            ++minvalid;
+          }
+          XELOGI("ResolveCopyPublishFailed: mips {:08X}+{:X} level {} invalid "
+                 "pages {} first {:08X} in_surface {}",
+                 mbase, msize, target.region.imageSubresource.mipLevel,
+                 minvalid, mfirst,
+                 uint32_t(minvalid && shared_memory().IsRangeValidInSurface(
+                                          mfirst, 4096)));
+        }
+        XELOGI("ResolveCopyPublishFailed: tex {:08X}+{:X} {}x{} | resolve "
+               "{:08X}+{:X} | invalid pages {} first {:08X} last {:08X} "
+               "in_surface {} base_outdated {} mips_outdated {}",
+               tbase, tsize, texture.key().GetWidth(),
+               texture.key().GetHeight(), info.copy_dest_extent_start,
+               info.copy_dest_extent_length, invalid, first, last, in_surface,
+               uint32_t(texture.base_outdated(lock)),
+               uint32_t(texture.mips_outdated(lock)));
+      }
     }
     // Leave the texture ready before the next guest pass without counting a
     // sample: only TransitionTextureForGuestShader at the consumer counts it.
@@ -2530,6 +2896,44 @@ void VulkanTextureCache::CompleteResolveTextureCopy(
   command_processor_.EndTimedSection(commands, timer);
 }
 
+VulkanTextureCache::ColorSurfaceKind VulkanTextureCache::GetColorSurfaceKind(
+    xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8_8_8_8:
+      return kColorSurface8888;
+    case xenos::TextureFormat::k_2_10_10_10:
+      return kColorSurface2101010;
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      return kColorSurface16_16Float;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      return kColorSurface16_16_16_16Float;
+    default:
+      return kColorSurfaceKindCount;
+  }
+}
+
+VkFormat VulkanTextureCache::GetColorSurfaceVulkanFormat(ColorSurfaceKind kind) {
+  switch (kind) {
+    case kColorSurface8888:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case kColorSurface2101010:
+      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case kColorSurface16_16Float:
+      return VK_FORMAT_R16G16_SFLOAT;
+    case kColorSurface16_16_16_16Float:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+
+VulkanTextureCache::ColorSurfaceKind
+VulkanTextureCache::GetTextureColorSurfaceKind(const Texture& texture) {
+  const auto& vulkan_texture = static_cast<const VulkanTexture&>(texture);
+  return vulkan_texture.surface_is_color ? vulkan_texture.surface_color_kind
+                                         : kColorSurfaceKindCount;
+}
+
 bool VulkanTextureCache::VulkanTexture::EnsureDepthSurfaceFramebuffer(
     VkRenderPass render_pass) {
   if (depth_surface_framebuffer != VK_NULL_HANDLE) return true;
@@ -2541,8 +2945,9 @@ bool VulkanTextureCache::VulkanTexture::EnsureDepthSurfaceFramebuffer(
     VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view.image = image();
     view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format =
-        surface_is_color ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R32_SFLOAT;
+    view.format = surface_is_color
+                      ? GetColorSurfaceVulkanFormat(surface_color_kind)
+                      : VK_FORMAT_R32_SFLOAT;
     view.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
     if (dfn.vkCreateImageView(device->device(), &view, nullptr,
                              &depth_surface_attachment_view) != VK_SUCCESS)
@@ -2619,7 +3024,8 @@ VulkanTextureCache::PrepareDepthSurfaceTargets(
       const bool d = info.IsCopyingDepth();
       uint32_t r = 0;
       if (key.format != (d ? xenos::TextureFormat::k_24_8_FLOAT
-                           : xenos::TextureFormat::k_8_8_8_8)) r = 1;
+                           : xenos::TextureFormat(
+                                 info.copy_dest_info.copy_dest_format))) r = 1;
       else if (static_cast<const VulkanTexture&>(texture).surface_is_color == d) r = 2;
       else if (!key.tiled) r = 3;
       else if (key.scaled_resolve) r = 4;
@@ -2662,7 +3068,8 @@ VulkanTextureCache::PrepareDepthSurfaceTargets(
     // for an exact match between the resolve and the texture fetch.
     const bool depth = info.IsCopyingDepth();
     if (key.format != (depth ? xenos::TextureFormat::k_24_8_FLOAT
-                             : xenos::TextureFormat::k_8_8_8_8) ||
+                             : xenos::TextureFormat(
+                                   info.copy_dest_info.copy_dest_format)) ||
         static_cast<const VulkanTexture&>(texture).surface_is_color == depth ||
         !key.tiled || key.scaled_resolve || key.mip_max_level ||
         key.dimension != xenos::DataDimension::k2DOrStacked ||
@@ -4356,6 +4763,19 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
       it = candidates.erase(it);
     } else {
       ++it;
+    }
+  }
+  auto& mipped = const_cast<VulkanTextureCache&>(vulkan_texture_cache)
+                     .resolve_mipped_textures_;
+  for (uint32_t address : {uint32_t(key().base_page << 12),
+                           uint32_t(key().mip_page << 12)}) {
+    auto mipped_range = mipped.equal_range(address);
+    for (auto it = mipped_range.first; it != mipped_range.second;) {
+      if (it->second == this) {
+        it = mipped.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
   if (depth_surface_framebuffer != VK_NULL_HANDLE) {

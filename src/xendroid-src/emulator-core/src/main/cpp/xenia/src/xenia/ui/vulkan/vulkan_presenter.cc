@@ -1250,7 +1250,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 #endif
   VkSurfaceFormatKHR image_format;
   if (surface_formats.empty() ||
-      (surface_formats.size() == 1 ||
+      (surface_formats.size() == 1 &&
        surface_formats[0].format == VK_FORMAT_UNDEFINED)) {
     // Can choose any format if the implementation specifies only UNDEFINED.
     image_format.format = kFormat8888Primary;

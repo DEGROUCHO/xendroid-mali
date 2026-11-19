@@ -15,6 +15,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_snapshot.h"
+#include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/kernel/xam/content_manager.h"
@@ -32,6 +33,24 @@ DECLARE_bool(allow_plugins);
 DECLARE_string(xma_decoder);
 namespace xe {
 namespace {
+// Restore phase trace: time since the restore began and the process memory, so
+// a slow or stuck restore shows which phase it is in.
+std::chrono::steady_clock::time_point restore_trace_begin;
+void LogRestorePhase(const char* phase) {
+  long rss_kb = 0, swap_kb = 0;
+  if (FILE* f = std::fopen("/proc/self/status", "r")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+      std::sscanf(line, "VmRSS: %ld", &rss_kb);
+      std::sscanf(line, "VmSwap: %ld", &swap_kb);
+    }
+    std::fclose(f);
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - restore_trace_begin);
+  XELOGI("RuntimeState: restore phase '{}' at {} ms (rss {} MB, swap {} MB)",
+         phase, elapsed.count(), rss_kb >> 10, swap_kb >> 10);
+}
 std::vector<uint8_t>& Part(snapshot::Image& image, snapshot::Section section) {
   return image.sections[uint32_t(section) - 1];
 }
@@ -421,6 +440,7 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
   runtime_snapshot_frozen_ = false;
   Shutdown();
   auto status = Setup(nullptr, nullptr, require_cpu_backend_, nullptr, nullptr, nullptr);
+  LogRestorePhase("core set up");
   if (XFAILED(status)) { error = "cold restore core setup failed"; return false; }
   MountStandardDrives();
   if (XFAILED(SetupSubsystems())) { error = "cold restore subsystem setup failed"; return false; }
@@ -428,6 +448,7 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
   std::vector<kernel::object_ref<kernel::XThread>> restored;
   bool hook_applied = false;
   kernel_state_->set_launch_hook([&](kernel::XThread* fresh_main) {
+    LogRestorePhase("title booted");
     if (!kernel_state_->FreezeSnapshotHostWriters(std::chrono::milliseconds(cvars::savestate_barrier_timeout_ms))) {
       error = "fresh kernel host writer barrier failed"; return false;
     }
@@ -443,6 +464,7 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
         }, gpu_timeout)) {
       error = "GPU restore failed"; return false;
     }
+    LogRestorePhase("GPU restored");
     graphics_system_->RestoreSnapshotInterrupts(gpu);
     const bool memory_applied =
         kernel::KernelSnapshot::LoadRuntimeModules(kernel_state_.get(), kernel, error) &&
@@ -451,6 +473,7 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
     // resumes: holding it until the restore returned pushed the phone into the
     // low memory killer.
     std::vector<uint8_t>().swap(Part(image, snapshot::Section::kMemory));
+    LogRestorePhase("modules and memory restored");
     if (!memory_applied ||
         !kernel::KernelSnapshot::Restore(kernel_state_.get(), fresh_main, kernel, restored, error) ||
         !audio_system_->RestoreRuntimeSnapshot(audio, error) ||
@@ -458,11 +481,21 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
       if (error.empty()) error = "cold restore subsystem apply failed";
       return false;
     }
+    // The restored timestamp bundle holds the interrupt time at the capture
+    // (in nanoseconds from a pre-fix snapshot); continue from it so a title
+    // waiting on it never sees it go back.
+    if (uint32_t bundle_ptr = kernel_state_->GetKeTimestampBundle()) {
+      auto* bundle =
+          memory_->TranslateVirtual<kernel::X_TIME_STAMP_BUNDLE*>(bundle_ptr);
+      Clock::ContinueGuestInterruptTime(
+          xe::load_and_swap<uint64_t>(&bundle->interrupt_time));
+    }
     bool timers_armed = true;
     ForEachRuntimeTimer([&](kernel::XTimer* timer) {
       timers_armed &= timer->CompleteRuntimeRestore();
     });
     if (!timers_armed) { error = "a restored timer could not be armed"; return false; }
+    LogRestorePhase("kernel, audio, clock and timers restored");
     hook_applied = true;
     return true;
   });
@@ -474,6 +507,7 @@ bool Emulator::ColdRestoreRuntimeImage(snapshot::Image& image, std::string& erro
     if (error.empty()) error = "cold title boot or snapshot launch hook failed";
     return false;
   }
+  LogRestorePhase("title launched");
   runtime_snapshot_failed_stopped_ = false;
   // All restored threads remain unqueued until RAM/kernel/GPU/APU/clock agree.
   if (!kernel::KernelSnapshot::ResumeThreads(restored, error)) {
@@ -562,6 +596,7 @@ bool Emulator::RestoreRuntimeState(const std::filesystem::path& path, std::strin
   };
   const auto t_begin = SnapClock::now();
   // A missing slot is the common case: report it before anything else.
+  restore_trace_begin = t_begin;
   std::error_code exists_error;
   if (!std::filesystem::exists(path, exists_error)) {
     error = "no saved state for this game";
@@ -573,6 +608,7 @@ bool Emulator::RestoreRuntimeState(const std::filesystem::path& path, std::strin
       !snapshot::ReadImageFile(path, identity, desired, &stats, error) ||
       !ValidateRuntimeImage(desired, error)) return false;
   const auto t_read = SnapClock::now();
+  LogRestorePhase("image read");
   // The running title is kept as a rollback in a file next to the slot (not
   // in RAM next to the image being restored), removed once it isn't needed.
   const auto rollback_path = path.parent_path() / ".rollback.xds";
@@ -618,6 +654,7 @@ bool Emulator::RestoreRuntimeState(const std::filesystem::path& path, std::strin
       std::filesystem::remove(rollback_path, ec);
     }
     const auto t_rollback = SnapClock::now();
+    LogRestorePhase("rollback kept");
     if (ColdRestoreRuntimeImage(desired, error)) {
       XELOGI("RuntimeState: restored {} MB from {} MB; read {:.0f} ms, rollback "
              "{:.0f} ms, cold restore {:.0f} ms",

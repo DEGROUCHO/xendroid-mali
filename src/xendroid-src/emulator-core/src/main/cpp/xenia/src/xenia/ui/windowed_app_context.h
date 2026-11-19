@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_WINDOWED_APP_CONTEXT_H_
 #define XENIA_UI_WINDOWED_APP_CONTEXT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -20,6 +21,10 @@
 
 namespace xe {
 namespace ui {
+
+// Kernel thread id of the platform UI loop (0 if unknown), for stack dumps of
+// a stalled UI thread.
+inline std::atomic<int> ui_loop_thread_tid{0};
 
 // Context for inputs provided by the entry point and interacting with the
 // platform's UI loop, to be implemented by platforms.
@@ -73,6 +78,10 @@ class WindowedAppContext {
   // otherwise.
   bool CallInUIThread(std::function<void()> function);
   bool CallInUIThreadSynchronous(std::function<void()> function);
+  // Enqueues the function and returns without waiting for the UI loop, even on
+  // platforms whose CallInUIThread waits for it. For notifications posted from
+  // threads the UI thread may itself be waiting on (the command processor).
+  bool CallInUIThreadAsync(std::function<void()> function);
   // It's okay to call this function from the queued functions themselves (such
   // as in the case of waiting for a pending async CallInUIThreadDeferred
   // described above - the wait may be done inside a CallInUIThreadSynchronous
@@ -142,6 +151,10 @@ class WindowedAppContext {
   // followed by PlatformQuitFromUIThread in the UI thread - so it can still be
   // called after a quit.
   virtual void NotifyUILoopOfPendingFunctions() = 0;
+  // Like NotifyUILoopOfPendingFunctions, but never waits for the UI loop.
+  virtual void NotifyUILoopOfPendingFunctionsAsync() {
+    NotifyUILoopOfPendingFunctions();
+  }
 
   // Called when requesting a quit in the UI thread to tell the platform that
   // the UI loop needs to be terminated. The pending function queue is assumed

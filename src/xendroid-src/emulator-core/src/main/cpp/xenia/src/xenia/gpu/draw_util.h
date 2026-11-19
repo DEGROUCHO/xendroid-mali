@@ -463,6 +463,13 @@ void GetScissor(const RegisterFile& XE_RESTRICT regs,
                 Scissor& XE_RESTRICT scissor_out,
                 bool clamp_to_surface_pitch = true);
 
+// Whether a draw must wait for its pipeline being created asynchronously
+// instead of being skipped or drawn with a placeholder: the surface is at most
+// this wide (160 pixels without MSAA). Small surfaces are mostly data kept past
+// the frame, like 1x1 eye adaptation history, that may never be redone.
+inline constexpr uint32_t kAsyncPipelineWaitMaxPitchTiles = 2;
+bool IsAsyncPipelineWaitNeededForDraw(const RegisterFile& XE_RESTRICT regs);
+
 // Returns the color component write mask for the draw command taking into
 // account which color targets are written to by the pixel shader, as well as
 // components that don't exist in the formats of the render targets (render

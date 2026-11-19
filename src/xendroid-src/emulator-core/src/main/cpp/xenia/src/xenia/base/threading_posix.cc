@@ -181,9 +181,6 @@ enum class SignalType {
 #endif
   k_Count
 };
-#if XE_PLATFORM_xendroid
-static std::atomic<void*> g_thr_user_callback{nullptr};
-#endif
 
 #if XE_PLATFORM_MAC
 // macOS lacks real-time signals (SIGRTMIN/SIGRTMAX). Use SIGUSR1/SIGUSR2.
@@ -1603,14 +1600,12 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     WaitStarted();
     std::unique_lock lock(callback_mutex_);
     user_callback_ = std::move(callback);
-#if XE_PLATFORM_xendroid
-    // No reliable si_value payload delivery on the fork's Android build; hand
-    // the target condition through a global and wake with pthread_kill.
-    assert_zero(g_thr_user_callback.load());
-    g_thr_user_callback.store(this);
-    pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-#elif XE_PLATFORM_MAC
-    // No pthread_sigqueue on macOS, use pthread_kill (no si_value payload).
+#if XE_PLATFORM_xendroid || XE_PLATFORM_MAC
+    // No si_value payload with pthread_kill (no reliable delivery on the
+    // fork's Android build, no pthread_sigqueue on macOS): the handler runs on
+    // the target thread and finds its own condition there. A shared slot for
+    // the target raced when two threads were alerted at once (the second
+    // overwrote the first, one handler then read null and crashed).
     pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
 #elif XE_PLATFORM_ANDROID
     sigval value{};
@@ -2291,18 +2286,9 @@ static void signal_handler(int signal, siginfo_t* info, void* /*context*/) {
       current_thread_->WaitSuspended();
     } break;
     case SignalType::kThreadUserCallback: {
-#if XE_PLATFORM_xendroid
-      // The fork's Android build delivers the target via a global (see
-      // QueueUserCallback) since si_value is not carried by pthread_kill.
-      void* ptr = g_thr_user_callback.load();
-      assert_not_null(ptr);
-      g_thr_user_callback.store(nullptr);
-      auto p_thread = static_cast<PosixCondition<Thread>*>(ptr);
-      if (alertable_state_) {
-        p_thread->CallUserCallback();
-      }
-#elif XE_PLATFORM_MAC
-      // macOS: no si_value payload when using pthread_kill.
+#if XE_PLATFORM_xendroid || XE_PLATFORM_MAC
+      // pthread_kill carries no payload: this handler runs on the target
+      // thread, whose condition holds the queued callback.
       if (alertable_state_ && current_thread_) {
         auto& condition =
             static_cast<PosixCondition<Thread>&>(current_thread_->condition());

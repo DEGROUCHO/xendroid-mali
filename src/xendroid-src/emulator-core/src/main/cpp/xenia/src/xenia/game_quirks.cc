@@ -73,6 +73,25 @@ static const Quirk kQuirks[] = {
     // Most Wanted and Assassin's Creed showed only their first strip.
     {0x545407F2, "gpu_untile_predicated_tiling", true,
      "tiled scene drawn once, verified"},
+    // Per-game accuracy settings: only entries
+    // using an option we have, independent of the GPU vendor.
+    // Assassin's Creed: missing and flickering geometry with fake occlusion
+    // queries; strict waits for the real result.
+    {0x555307D4, "occlusion_query", "strict",
+     "missing and flickering geometry"},
+    // Divinity II: The Dragon Knight Saga: dark, striped character editor;
+    // converts 24-bit float depth in the pixel shader (costs some fill rate).
+    {0x464507D6, "depth_float24_convert_in_pixel_shader", true,
+     "dark striped character editor"},
+    // Assassin's Creed Rogue reads a bitset built by a resolve and crashes
+    // (828EC0D4) on the previous frame's copy: CPU reads get the current
+    // resolve, waiting for the GPU (off for the other games, see gpu_flags).
+    {0x555308CE, "readback_resolve_uma_provider", true,
+     "crash 828EC0D4 on a stale resolve"},
+    // Spider-Man: Shattered Dimensions: black or duplicated band.
+    {0x41560881, "force_depth_clamp", true, "black or duplicated band"},
+    // Rise of the Tomb Raider: opening scene geometry.
+    {0x53510823, "force_depth_clamp", true, "opening scene geometry"},
     // No vulkan_bindless_textures for GTA IV: with it Mali raises ~15 GPU
     // faults a second (GROUP_ERROR_FATAL, translation faults; the MediaTek
     // driver recreates the queue), shown as black frames and swapchain

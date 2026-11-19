@@ -2748,72 +2748,67 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
 
 spv::Id SpirvShaderTranslator::PackFloat16x2ExtendedRange(
     spv::Id float2_value) {
-  // The Xbox 360 float16 has no NaN, map it to 0. Also keeps the overflow
-  // detection below from misreading a NaN's exponent 31 as a finite extended
-  // value, and FClamp's NaN result is undefined.
-  float2_value = builder_->createTriOp(
-      spv::OpSelect, type_float2_,
-      builder_->createUnaryOp(spv::OpIsNan, type_bool2_, float2_value),
-      const_float2_0_, float2_value);
-  // Standard conversion handles +-0..65504; larger magnitudes overflow to Inf
-  // (exponent field 0x7C00). Re-encode the overflowed lanes using the extended
-  // range: halve into the standard range, convert (exponent <= 30), then bump
-  // the exponent by 1 into the exponent 31 slot the Xbox 360 treats as finite.
-  spv::Id standard = builder_->createUnaryBuiltinCall(
-      type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16, float2_value);
-  spv::Id const_0x7C00 = builder_->makeUintConstant(0x7C00);
-  spv::Id lower_overflow =
-      builder_->createBinOp(spv::OpIEqual, type_bool_,
-                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                  standard, const_0x7C00),
-                            const_0x7C00);
-  spv::Id upper_overflow = builder_->createBinOp(
-      spv::OpIEqual, type_bool_,
+  // Encoded with integers since the rounding and overflow of the host's
+  // float16 conversion differ between drivers. The Xenos rounds the mantissa
+  // half away from zero and keeps denormals and the sign of zero. Exponent 31
+  // is an ordinary exponent, larger magnitudes, infinities and NaNs saturate to
+  // sign | 0x7FFF.
+  auto uint2_op = [&](spv::Op op, spv::Id a, spv::Id b) {
+    return builder_->createBinOp(op, type_uint2_, a, b);
+  };
+  auto uint2_constant = [&](uint32_t value) {
+    return builder_->smearUintConstant(value, type_uint2_);
+  };
+  spv::Id bits =
+      builder_->createUnaryOp(spv::OpBitcast, type_uint2_, float2_value);
+  spv::Id magnitude =
+      uint2_op(spv::OpBitwiseAnd, bits, uint2_constant(0x7FFFFFFF));
+  // Normal results: rebias the exponent from 127 to 15 and round to 10
+  // mantissa bits, a rounding carry goes into the exponent.
+  spv::Id normal = builder_->createBinBuiltinCall(
+      type_uint2_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+      uint2_op(spv::OpShiftRightLogical,
+               uint2_op(spv::OpIAdd,
+                        uint2_op(spv::OpISub, magnitude,
+                                 uint2_constant(UINT32_C(112) << 23)),
+                        uint2_constant(UINT32_C(1) << 12)),
+               uint2_constant(13)),
+      uint2_constant(0x7FFF));
+  // Denormal results: the significand shifted right by 126 - exponent with
+  // rounding. 31 is enough to make everything below 2^-25 zero.
+  spv::Id shift = builder_->createBinBuiltinCall(
+      type_uint2_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+      uint2_op(
+          spv::OpISub, uint2_constant(126),
+          uint2_op(spv::OpShiftRightLogical, magnitude, uint2_constant(23))),
+      uint2_constant(31));
+  spv::Id denormal = uint2_op(
+      spv::OpShiftRightLogical,
+      uint2_op(spv::OpIAdd,
+               uint2_op(spv::OpBitwiseOr,
+                        uint2_op(spv::OpBitwiseAnd, magnitude,
+                                 uint2_constant(0x7FFFFF)),
+                        uint2_constant(0x800000)),
+               uint2_op(spv::OpShiftLeftLogical, uint2_constant(1),
+                        uint2_op(spv::OpISub, shift, uint2_constant(1)))),
+      shift);
+  spv::Id lanes = uint2_op(
+      spv::OpBitwiseOr,
+      uint2_op(spv::OpBitwiseAnd,
+               uint2_op(spv::OpShiftRightLogical, bits, uint2_constant(16)),
+               uint2_constant(0x8000)),
+      builder_->createTriOp(
+          spv::OpSelect, type_uint2_,
+          builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool2_,
+                                magnitude, uint2_constant(0x38800000)),
+          normal, denormal));
+  return builder_->createBinOp(
+      spv::OpBitwiseOr, type_uint_,
+      builder_->createCompositeExtract(lanes, type_uint_, 0),
       builder_->createBinOp(
-          spv::OpBitwiseAnd, type_uint_,
-          builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, standard,
-                                builder_->makeUintConstant(16)),
-          const_0x7C00),
-      const_0x7C00);
-  id_vector_temp_.clear();
-  id_vector_temp_.resize(2, builder_->makeFloatConstant(-131008.0f));
-  spv::Id const_neg_131008 =
-      builder_->makeCompositeConstant(type_float2_, id_vector_temp_);
-  id_vector_temp_.clear();
-  id_vector_temp_.resize(2, builder_->makeFloatConstant(131008.0f));
-  spv::Id const_131008 =
-      builder_->makeCompositeConstant(type_float2_, id_vector_temp_);
-  spv::Id clamped = builder_->createTriBuiltinCall(
-      type_float2_, ext_inst_glsl_std_450_, GLSLstd450FClamp, float2_value,
-      const_neg_131008, const_131008);
-  id_vector_temp_.clear();
-  id_vector_temp_.resize(2, builder_->makeFloatConstant(0.5f));
-  spv::Id halved = builder_->createBinOp(
-      spv::OpFMul, type_float2_, clamped,
-      builder_->makeCompositeConstant(type_float2_, id_vector_temp_));
-  spv::Id halved_packed = builder_->createUnaryBuiltinCall(
-      type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16, halved);
-  // halved_packed has exponent <= 30 in both lanes, so adding 0x0400 per lane
-  // bumps the exponent without ever carrying across lanes.
-  spv::Id extended =
-      builder_->createBinOp(spv::OpIAdd, type_uint_, halved_packed,
-                            builder_->makeUintConstant(0x04000400));
-  spv::Id const_0xFFFF = builder_->makeUintConstant(0xFFFF);
-  spv::Id const_0xFFFF0000 = builder_->makeUintConstant(0xFFFF0000);
-  spv::Id result_lower =
-      builder_->createTriOp(spv::OpSelect, type_uint_, lower_overflow,
-                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                  extended, const_0xFFFF),
-                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                  standard, const_0xFFFF));
-  spv::Id result_upper =
-      builder_->createTriOp(spv::OpSelect, type_uint_, upper_overflow,
-                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                  extended, const_0xFFFF0000),
-                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                  standard, const_0xFFFF0000));
-  return builder_->createBinOp(spv::OpBitwiseOr, type_uint_, result_lower,
-                               result_upper);
+          spv::OpShiftLeftLogical, type_uint_,
+          builder_->createCompositeExtract(lanes, type_uint_, 1),
+          builder_->makeUintConstant(16)));
 }
 
 spv::Id SpirvShaderTranslator::UnpackFloat16x2ExtendedRange(
@@ -3117,14 +3112,14 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
     builder_->setBuildPoint(&block_format_16);
     id_vector_temp_.clear();
     id_vector_temp_.resize(4, builder_->makeFloatConstant(-32.0f));
-    spv::Id const_float4_minus_32 =
+    spv::Id const_float4_min =
         builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
     id_vector_temp_.clear();
-    id_vector_temp_.resize(4, builder_->makeFloatConstant(32.0f));
-    spv::Id const_float4_32 =
+    id_vector_temp_.resize(4, builder_->makeFloatConstant(32767.0f / 1024.0f));
+    spv::Id const_float4_max =
         builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
     id_vector_temp_.clear();
-    // NaN to 0, not to -32.
+    // Convert NaN to 0 before clamping.
     spv::Id color_scaled = builder_->createNoContractionBinOp(
         spv::OpVectorTimesScalar, type_float4_,
         builder_->createTriBuiltinCall(
@@ -3133,19 +3128,14 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
                                   builder_->createUnaryOp(
                                       spv::OpIsNan, type_bool4_, color_float4),
                                   const_float4_0_, color_float4),
-            const_float4_minus_32, const_float4_32),
-        builder_->makeFloatConstant(32767.0f / 32.0f));
-    id_vector_temp_.clear();
-    id_vector_temp_.resize(4, builder_->makeFloatConstant(-0.5f));
-    spv::Id unorm_round_offset_negative_float4 =
-        builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
-    spv::Id color_offset = builder_->createNoContractionBinOp(
-        spv::OpFAdd, type_float4_, color_scaled,
-        builder_->createTriOp(
-            spv::OpSelect, type_float4_,
-            builder_->createBinOp(spv::OpFOrdLessThan, type_bool4_,
-                                  color_scaled, const_float4_0_),
-            unorm_round_offset_negative_float4, unorm_round_offset_float4));
+            const_float4_min, const_float4_max),
+        builder_->makeFloatConstant(1024.0f));
+    // Rounded half up (-0.5 packs to 0, -32 to 0x8000).
+    spv::Id color_offset = builder_->createUnaryBuiltinCall(
+        type_float4_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+        builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_,
+                                           color_scaled,
+                                           unorm_round_offset_float4));
     spv::Id color_uint4 = builder_->createUnaryOp(
         spv::OpBitcast, type_uint4_,
         builder_->createUnaryOp(spv::OpConvertFToS, type_int4_, color_offset));
@@ -3168,7 +3158,6 @@ std::array<spv::Id, 2> SpirvShaderTranslator::FSI_ClampAndPackColor(
   std::array<spv::Id, 2> packed_16_float;
   {
     builder_->setBuildPoint(&block_format_16_float);
-    // NaN is flushed to 0 inside PackFloat16x2ExtendedRange.
     for (uint32_t i = 0; i < 2; ++i) {
       uint_vector_temp_.clear();
       uint_vector_temp_.push_back(2 * i);
@@ -3421,8 +3410,8 @@ std::array<spv::Id, 4> SpirvShaderTranslator::FSI_UnpackColor(
   std::array<spv::Block*, 2> block_format_16_end;
   {
     spv::Id component_width = builder_->makeUintConstant(16);
-    spv::Id component_scale = builder_->makeFloatConstant(32.0f / 32767.0f);
-    spv::Id component_min = builder_->makeFloatConstant(-1.0f);
+    // 10 fractional bits. Keep negative values below -1.
+    spv::Id component_scale = builder_->makeFloatConstant(1.0f / 1024.0f);
     for (uint32_t i = 0; i < 2; ++i) {
       builder_->setBuildPoint(i ? &block_format_16_16_16_16
                                 : &block_format_16_16);
@@ -3441,9 +3430,6 @@ std::array<spv::Id, 4> SpirvShaderTranslator::FSI_UnpackColor(
                                       builder_->makeUintConstant(16 * (j & 1)),
                                       component_width)),
             component_scale);
-        component = builder_->createBinBuiltinCall(
-            type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax, component_min,
-            component);
         unpacked_16[i][j] = component;
       }
       builder_->createBranch(&block_format_merge);

@@ -103,6 +103,10 @@ class XmaDecoder {
   static const uint32_t kContextCount = 320;
   XmaContext* contexts_[kContextCount];
   BitMap context_bitmap_;
+  // The enabled contexts, for the worker to visit
+  // (xma_worker_enabled_contexts_only; see XmaContext::set_is_enabled).
+  static constexpr uint32_t kEnabledContextMaskWords = (kContextCount + 63) / 64;
+  std::atomic<uint64_t> enabled_context_mask_[kEnabledContextMaskWords] = {};
 
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;

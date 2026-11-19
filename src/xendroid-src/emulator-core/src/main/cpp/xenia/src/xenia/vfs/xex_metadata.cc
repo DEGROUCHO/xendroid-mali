@@ -120,6 +120,10 @@ std::optional<XexMetadata> ExtractXexMetadata(const uint8_t* data,
   if (header_size < sizeof(xex2_header) || header_size > size) {
     return std::nullopt;
   }
+  // The optional headers below are found by the counts and offsets in the file.
+  if (XexHeaderProblem(data, size)) {
+    return std::nullopt;
+  }
 
   XexMetadata metadata;
   metadata.format = format;
@@ -185,7 +189,9 @@ std::optional<XexMetadata> ExtractXexMetadata(
   }
 
   uint32_t header_size = base_header.header_size;
-  if (header_size < sizeof(xex2_header)) {
+  std::error_code ec;
+  const auto file_size = std::filesystem::file_size(path, ec);
+  if (header_size < sizeof(xex2_header) || ec || header_size > file_size) {
     return std::nullopt;
   }
 

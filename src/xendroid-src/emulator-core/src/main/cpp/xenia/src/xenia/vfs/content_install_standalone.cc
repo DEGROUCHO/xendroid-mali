@@ -23,6 +23,52 @@
 namespace xe {
 namespace vfs {
 
+namespace {
+
+// Moves what is under `from` to the same places under `to`, a file replacing
+// the one there (or a folder in its way), the folders created where missing.
+// Renames within one volume: each file is either old or new, and only a failed
+// rename, unlikely there, leaves some of each (or neither, where a file and a
+// folder trade places). False at the first failure.
+bool MoveTreeInto(const std::filesystem::path& from,
+                  const std::filesystem::path& to) {
+  std::error_code ec;
+  std::vector<std::filesystem::directory_entry> entries;
+  for (std::filesystem::recursive_directory_iterator it(from, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    entries.push_back(*it);  // a folder before what it holds
+  }
+  if (ec) {
+    return false;
+  }
+  for (const std::filesystem::directory_entry& entry : entries) {
+    const std::filesystem::path target =
+        to / entry.path().lexically_relative(from);
+    std::error_code type_ec;
+    const std::filesystem::file_status target_status =
+        std::filesystem::status(target, type_ec);
+    if (entry.is_directory(ec)) {
+      if (!std::filesystem::is_directory(target_status)) {
+        std::filesystem::remove(target, type_ec);
+        std::filesystem::create_directories(target, ec);
+      }
+    } else {
+      if (std::filesystem::is_directory(target_status)) {
+        std::filesystem::remove_all(target, type_ec);
+      }
+      std::filesystem::rename(entry.path(), target, ec);
+    }
+    if (ec) {
+      XELOGE("InstallContentPackageStandalone: cannot move {}: {}",
+             entry.path().string(), ec.message());
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 X_STATUS InstallContentPackageStandalone(
     const std::filesystem::path& src_path,
     const std::filesystem::path& content_root, ContentProgress& progress,
@@ -94,7 +140,26 @@ X_STATUS InstallContentPackageStandalone(
   }
 
   ec.clear();
-  std::filesystem::create_directories(data_path, ec);
+  // What is there stays until the new folder is complete, which is extracted
+  // aside then: a package a title installed by copying the package file itself
+  // (XamContentResolve creates its folder, and the emulator mounts the file as
+  // it is) gives way to the folder; the folder of an earlier install takes the
+  // new files over the old ones, and keeps those the package doesn't have.
+  const std::filesystem::file_status existing =
+      std::filesystem::status(data_path, ec);
+  const bool replaces_file = std::filesystem::is_regular_file(existing);
+  const bool over_folder = std::filesystem::is_directory(existing);
+  const std::filesystem::path extract_path =
+      replaces_file || over_folder
+          ? data_path.parent_path() /
+                (".xd-install-" + data_path.filename().string())
+          : data_path;
+  ec.clear();
+  if (extract_path != data_path) {
+    std::filesystem::remove_all(extract_path, ec);  // an install cut short
+    ec.clear();
+  }
+  std::filesystem::create_directories(extract_path, ec);
   if (ec) {
     XELOGE("InstallContentPackageStandalone: mkdir failed: {}", ec.message());
     return X_STATUS_ACCESS_DENIED;
@@ -102,21 +167,63 @@ X_STATUS InstallContentPackageStandalone(
 
   progress.total.store(device->data_size());
 
-  // .header sidecar (F9) then the inner file tree (F8). No kernel broadcast /
-  // ReloadProfiles -- that is the whole point of the standalone variant (F14).
-  if (write_header) {
-    VirtualFileSystem::ExtractContentHeader(device.get(), header_base);
-  }
+  // The inner file tree (F8), then the .header sidecar (F9) once the files it
+  // describes are in place. No kernel broadcast / ReloadProfiles -- that is the
+  // whole point of the standalone variant (F14).
   X_STATUS status = VirtualFileSystem::ExtractContentFiles(
-      device.get(), data_path, progress.current);
-  if (status == X_STATUS_SUCCESS) {
-    progress.current.store(progress.total.load());
-  } else {
+      device.get(), extract_path, progress.current);
+  if (status != X_STATUS_SUCCESS) {
     XELOGE("InstallContentPackageStandalone: extract failed 0x{:08X} for {}",
            status, src_path.string());
     std::error_code cleanup_ec;
-    std::filesystem::remove_all(data_path, cleanup_ec);
+    std::filesystem::remove_all(extract_path, cleanup_ec);
+    return status;
   }
+  if (replaces_file) {
+    // Swap the folder in for the file; the file goes back if that fails.
+    const std::filesystem::path old_file =
+        data_path.parent_path() /
+        (".xd-replaced-" + data_path.filename().string());
+    std::filesystem::rename(data_path, old_file, ec);
+    if (ec) {
+      XELOGE("InstallContentPackageStandalone: cannot move {} aside: {}",
+             data_path.string(), ec.message());
+      std::error_code cleanup_ec;
+      std::filesystem::remove_all(extract_path, cleanup_ec);
+      return X_STATUS_ACCESS_DENIED;
+    }
+    std::filesystem::rename(extract_path, data_path, ec);
+    if (ec) {
+      XELOGE("InstallContentPackageStandalone: cannot put {} in place: {}",
+             data_path.string(), ec.message());
+      std::error_code back_ec;
+      std::filesystem::rename(old_file, data_path, back_ec);
+      if (back_ec) {
+        // Neither is in place: leave both for the user rather than lose one.
+        XELOGE("InstallContentPackageStandalone: the package file stays at {}",
+               old_file.string());
+      } else {
+        std::filesystem::remove_all(extract_path, back_ec);
+      }
+      return X_STATUS_ACCESS_DENIED;
+    }
+    XELOGI("InstallContentPackageStandalone: replaced package file {}",
+           data_path.string());
+    std::filesystem::remove(old_file, ec);
+  } else if (over_folder) {
+    const bool moved = MoveTreeInto(extract_path, data_path);
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(extract_path, cleanup_ec);
+    if (!moved) {
+      XELOGE("InstallContentPackageStandalone: cannot move the files into {}",
+             data_path.string());
+      return X_STATUS_ACCESS_DENIED;
+    }
+  }
+  if (write_header) {
+    VirtualFileSystem::ExtractContentHeader(device.get(), header_base);
+  }
+  progress.current.store(progress.total.load());
   return status;
 }
 
@@ -339,8 +446,37 @@ std::vector<InstalledContentItem> ListInstalledContent(
     if (ec) {
       break;
     }
-    if (!it->is_directory(ec)) {
+    // An install or a save unpack cut short (.xd-install-, .xd-replaced-,
+    // .xd-unpack-, .xd-unpacked-) is no package.
+    if (it->path().filename().string().starts_with(".xd-")) {
       continue;
+    }
+    std::error_code entry_ec;
+    const bool is_folder = it->is_directory(entry_ec);
+    // A package a title copied as one file, which the emulator mounts as it
+    // is: its own header has the name.
+    std::string container_name;
+    uint64_t container_size = 0;
+    if (!is_folder) {
+      if (!it->is_regular_file(entry_ec)) {
+        continue;
+      }
+      auto header = XContentContainerDevice::ReadContainerHeader(it->path());
+      if (!header || !header->content_header.is_magic_valid()) {
+        continue;
+      }
+      // Same choice as XContentContainerDevice::content_header(): English,
+      // else the first language with a name.
+      auto& metadata = header->content_metadata;
+      auto name = metadata.display_name(XLanguage::kEnglish);
+      for (uint8_t i = 0; name.empty() && i < metadata.kNumLanguagesV2; i++) {
+        name = metadata.display_name(XLanguage(i));
+      }
+      container_name = xe::to_utf8(name);
+      container_size = it->file_size(entry_ec);
+      if (entry_ec) {
+        container_size = 0;
+      }
     }
     const std::string pkg_dir = it->path().filename().string();
     const std::filesystem::path header_path =
@@ -351,11 +487,12 @@ std::vector<InstalledContentItem> ListInstalledContent(
     std::string name;
     if (ReadHeaderDisplayName(header_path, name) && !name.empty()) {
       item.display_name = name;
-      item.size = DirectorySizeOnDisk(it->path());
+    } else if (!container_name.empty()) {
+      item.display_name = container_name;
     } else {
       item.display_name = pkg_dir;
-      item.size = DirectorySizeOnDisk(it->path());
     }
+    item.size = is_folder ? DirectorySizeOnDisk(it->path()) : container_size;
     items.push_back(std::move(item));
   }
 

@@ -888,12 +888,11 @@ X_STATUS Emulator::DataMigration(const uint64_t xuid) {
       const auto previous_path = content_root_ / title.name / content_type.name;
       const auto path = content_root_ / used_xuid / title.name;
 
-      if (!std::filesystem::exists(path)) {
-        std::filesystem::create_directories(path);
-      }
-
       std::error_code ec;
-      std::filesystem::rename(previous_path, path / content_type.name, ec);
+      std::filesystem::create_directories(path, ec);
+      if (!ec) {
+        std::filesystem::rename(previous_path, path / content_type.name, ec);
+      }
 
       if (ec) {
         failure_count++;
@@ -905,57 +904,55 @@ X_STATUS Emulator::DataMigration(const uint64_t xuid) {
     // Other directories:
     // Headers - Just copy everything to both common and xuid locations
     // profile - ?
-    if (std::filesystem::exists(title.path / title.name / "Headers")) {
-      const auto xuid_path =
-          content_root_ / xuid_string / title.name / "Headers";
-
-      std::filesystem::create_directories(xuid_path);
-
-      std::error_code ec;
-      // Copy to specific user
-      std::filesystem::copy(title.path / title.name / "Headers", xuid_path,
-                            std::filesystem::copy_options::recursive |
-                                std::filesystem::copy_options::skip_existing,
-                            ec);
-      if (ec) {
-        failure_count++;
-        XELOGW("{}: Copying from: {} to: {} failed! Error message: {} ({:08X})",
-               __func__, title.path / title.name / "Headers", xuid_path,
-               ec.message(), ec.value());
-      }
-
-      const auto header_types =
-          xe::filesystem::ListDirectories(title.path / title.name / "Headers");
-
-      if (!(header_types.size() == 1 &&
-            header_types.at(0).name == "00000001")) {
-        const auto common_path =
-            content_root_ / common_xuid_string / title.name / "Headers";
-
-        std::filesystem::create_directories(common_path);
-
-        // Copy to common, skip cases where only savefile header is available
-        std::filesystem::copy(title.path / title.name / "Headers", common_path,
-                              std::filesystem::copy_options::recursive |
-                                  std::filesystem::copy_options::skip_existing,
-                              ec);
+    std::error_code exists_error;
+    const auto headers_path = title.path / title.name / "Headers";
+    if (std::filesystem::exists(headers_path, exists_error)) {
+      // Copies the headers to |path|, counting a failure if it can't.
+      auto copy_headers = [&,
+                           func = __func__](const std::filesystem::path& path) {
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        if (!ec) {
+          std::filesystem::copy(
+              headers_path, path,
+              std::filesystem::copy_options::recursive |
+                  std::filesystem::copy_options::skip_existing,
+              ec);
+        }
         if (ec) {
           failure_count++;
           XELOGW(
               "{}: Copying from: {} to: {} failed! Error message: {} ({:08X})",
-              __func__, title.path / title.name / "Headers", common_path,
-              ec.message(), ec.value());
+              func, headers_path, path, ec.message(), ec.value());
+          return false;
+        }
+        return true;
+      };
+
+      // Copy to specific user
+      bool copied =
+          copy_headers(content_root_ / xuid_string / title.name / "Headers");
+
+      const auto header_types = xe::filesystem::ListDirectories(headers_path);
+
+      // Copy to common, skip cases where only savefile header is available
+      if (!(header_types.size() == 1 &&
+            header_types.at(0).name == "00000001")) {
+        if (!copy_headers(content_root_ / common_xuid_string / title.name /
+                          "Headers")) {
+          copied = false;
         }
       }
 
-      if (!ec) {
-        // Remove previous directory
+      // The originals go only once every copy of them exists.
+      if (copied) {
         std::error_code ec;
-        std::filesystem::remove_all(title.path / title.name / "Headers", ec);
+        std::filesystem::remove_all(headers_path, ec);
       }
     }
 
-    if (std::filesystem::exists(title.path / title.name / "profile")) {
+    if (std::filesystem::exists(title.path / title.name / "profile",
+                                exists_error)) {
       // Find directory with previous username. There should be only one!
       const auto old_profile_data =
           xe::filesystem::ListDirectories(title.path / title.name / "profile");
@@ -1628,6 +1625,13 @@ void Emulator::RelaunchTitle(const std::string& host_path,
   if (graphics_system_ && graphics_system_->command_processor()) {
     graphics_system_->command_processor()->Shutdown();
   }
+  // The other host workers too, as they're not terminated below.
+  if (graphics_system_) {
+    graphics_system_->StopFrameLimiter();
+  }
+  if (audio_system_) {
+    audio_system_->StopWorker();
+  }
 
 #if XE_PLATFORM_xendroid
   // Mirror ResetTitle (emulator.cc:1529): stop the cooperative dispatch threads
@@ -1644,6 +1648,11 @@ void Emulator::RelaunchTitle(const std::string& host_path,
             kernel::XObject::Type::Thread);
     XELOGI("RelaunchTitle: terminating {} threads", threads.size());
     for (auto thread : threads) {
+      // Their owners stop host threads. Killing one could leave a lock it
+      // holds taken for good.
+      if (thread->is_host_thread()) {
+        continue;
+      }
       thread->Terminate(0);
     }
   }
@@ -1779,6 +1788,13 @@ void Emulator::ResetTitle() {
   if (graphics_system_ && graphics_system_->command_processor()) {
     graphics_system_->command_processor()->Shutdown();
   }
+  // The other host workers too, as they're not terminated below.
+  if (graphics_system_) {
+    graphics_system_->StopFrameLimiter();
+  }
+  if (audio_system_) {
+    audio_system_->StopWorker();
+  }
 
   // Stop the dispatch thread before tearing down guest threads. Their fibers
   // run on it, so terminating one from this host thread while the dispatcher is
@@ -1792,6 +1808,11 @@ void Emulator::ResetTitle() {
             kernel::XObject::Type::Thread);
     XELOGI("ResetTitle: terminating {} threads", threads.size());
     for (auto thread : threads) {
+      // Their owners stop host threads. Killing one could leave a lock it
+      // holds taken for good.
+      if (thread->is_host_thread()) {
+        continue;
+      }
       thread->Terminate(0);
     }
   }
@@ -2642,13 +2663,24 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     return X_STATUS_NOT_SUPPORTED;
   }
 
-  X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
-  if (XFAILED(result)) {
-    XELOGE("Failed to apply title update! Cannot run module {}", path);
-    return result;
+  // A patch that fails part way leaves the module unusable, so it is loaded
+  // again and runs without the update (xenia-edge 8984c68712).
+  kernel_state_->ResetTitleUpdateState();
+  if (XFAILED(kernel_state_->ApplyTitleUpdate(module))) {
+    XELOGE("Failed to apply title update, starting {} without it", path);
+    kernel_state_->UnloadUserModule(module, false);
+    kernel_state_->content_manager()->CloseContent("UPDATE");
+    // Its image is freed with its last reference, which has to go before the
+    // reload maps the image at the same address.
+    module = nullptr;
+    module = kernel_state_->LoadUserModule(module_path);
+    if (!module) {
+      XELOGE("Failed to load user module {}", path);
+      return X_STATUS_NOT_FOUND;
+    }
   }
 
-  result = kernel_state_->FinishLoadingUserModule(module);
+  X_RESULT result = kernel_state_->FinishLoadingUserModule(module);
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}", path);
     return result;

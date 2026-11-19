@@ -9,6 +9,9 @@
 
 #include "xenia/gpu/texture_cache.h"
 
+#include <dlfcn.h>
+#include <unwind.h>
+
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -46,6 +49,10 @@ DEFINE_bool(eager_resolved_texture_reload, false,
             "(where the load dispatch ends the render pass - a tile store and "
             "reload on tiled GPUs).",
             "GPU");
+DEFINE_uint32(log_texture_invalidation_callers, 0,
+              "Diagnostic: log the first N invalidations of loaded textures of "
+              "at least 2M texels (and all mip invalidations), with the caller stack (library offsets).",
+              "GPU");
 DEFINE_uint32(log_texture_reloads, 0,
               "Diagnostic: log the first N reloads of textures that had been "
               "loaded before (format, size, addresses).",
@@ -498,10 +505,17 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
-      if (old_key.is_valid) {
+      // An invalid fetch constant still has a destination swizzle: its
+      // constant components read as 0 or 1, the rest as the null texture's 0.
+      // Halo 4's video shader takes the frame's opacity from the constant 1
+      // of a fetch constant with no texture - 0 left the videos invisible.
+      const uint32_t constant_swizzle = GuestToHostSwizzle(
+          fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
+      if (old_key.is_valid || binding.host_swizzle != constant_swizzle) {
         bindings_changed |= index_bit;
       }
       binding.Reset();
+      binding.host_swizzle = constant_swizzle;
       continue;
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
@@ -993,11 +1007,19 @@ TextureCache::Texture::~Texture() {
     pending.erase(std::remove(pending.begin(), pending.end(), this),
                   pending.end());
   }
-  if (mips_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
-  }
-  if (base_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+  {
+    // A watch fired by a guest thread unlinks its range and clears the handle
+    // under the global lock, so check the handles under it too, or a stale
+    // range would be unlinked twice, corrupting the watch free lists (xenia-edge
+    // aa94c6a28f: Need for Speed: Most Wanted crashed on textures evicted on
+    // the GPU thread while guest threads fired their watches).
+    auto global_lock = xe::global_critical_region::Acquire();
+    if (mips_watch_handle_) {
+      texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+    }
+    if (base_watch_handle_) {
+      texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+    }
   }
 
   // Only remove from usage list if we were added to it (track_usage=true).
@@ -1041,6 +1063,7 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
   if (watch_base) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
+    if (base_watch_handle_) shared_memory.UnwatchMemoryRange(base_watch_handle_);
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
         this, nullptr, 0);
@@ -1052,6 +1075,37 @@ bool TextureCache::Texture::MakeUpToDateAndWatch(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback,
         this, nullptr, 1);
   }
+  return true;
+}
+
+bool TextureCache::Texture::MakePartUpToDateAndWatch(
+    const global_unique_lock_type& global_lock, bool mips) {
+  assert_true(global_lock.owns_lock());
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  if (mips) {
+    if (!mips_outdated_) return true;
+    if (!GetGuestMipsSize() ||
+        !shared_memory.IsRangeValid(
+            key().mip_page << 12, xe::align(GetGuestMipsSize(), UINT32_C(16)))) {
+      return false;
+    }
+    mips_outdated_ = false;
+    mips_watch_handle_ = shared_memory.WatchMemoryRange(
+        key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback,
+        this, nullptr, 1);
+    return true;
+  }
+  if (!base_outdated_) return true;
+  if (!GetGuestBaseSize() ||
+      !shared_memory.IsRangeValid(
+          key().base_page << 12, xe::align(GetGuestBaseSize(), UINT32_C(16)))) {
+    return false;
+  }
+  base_outdated_ = false;
+  if (base_watch_handle_) shared_memory.UnwatchMemoryRange(base_watch_handle_);
+  base_watch_handle_ = shared_memory.WatchMemoryRange(
+      key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
+      this, nullptr, 0);
   return true;
 }
 
@@ -1095,13 +1149,54 @@ void TextureCache::Texture::WatchCallback(
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
+    ++base_invalidation_epoch_;
   }
+}
+
+void TextureCache::Texture::WatchOutdatedBase(
+    const global_unique_lock_type& global_lock) {
+  assert_true(global_lock.owns_lock());
+  if (!base_outdated_ || base_watch_handle_ || !GetGuestBaseSize()) return;
+  base_watch_handle_ = texture_cache().shared_memory().WatchMemoryRange(
+      key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
+      this, nullptr, 0);
 }
 
 void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
+  if (cvars::log_texture_invalidation_callers && texture.loaded_once() &&
+      (argument != 0 ||
+       uint64_t(texture.key().GetWidth()) * texture.key().GetHeight() >=
+           (UINT64_C(1) << 21))) {
+    static uint32_t logged = 0;
+    if (logged < cvars::log_texture_invalidation_callers) {
+      ++logged;
+      struct Trace { uintptr_t pcs[10]; int count = 0; } trace;
+      _Unwind_Backtrace(
+          [](_Unwind_Context* c, void* arg) -> _Unwind_Reason_Code {
+            auto& t = *static_cast<Trace*>(arg);
+            if (t.count >= 10) return _URC_END_OF_STACK;
+            t.pcs[t.count++] = _Unwind_GetIP(c);
+            return _URC_NO_REASON;
+          },
+          &trace);
+      Dl_info info;
+      const uintptr_t base =
+          dladdr(reinterpret_cast<void*>(&TextureCache::WatchCallback), &info)
+              ? reinterpret_cast<uintptr_t>(info.dli_fbase)
+              : 0;
+      std::string stack;
+      for (int i = 1; i < trace.count; ++i) {
+        stack += fmt::format("{:X}/", uint32_t(trace.pcs[i] - base));
+      }
+      XELOGI("TexInvalidate: {}x{} fmt {} base {:08X} mip {} gpu {} | {}",
+             texture.key().GetWidth(), texture.key().GetHeight(),
+             uint32_t(texture.key().format), texture.key().base_page << 12,
+             uint32_t(argument != 0), uint32_t(invalidated_by_gpu), stack);
+    }
+  }
   texture.WatchCallback(global_lock, argument != 0);
   texture.set_last_invalidated_by_gpu(invalidated_by_gpu);
   TextureCache& texture_cache = texture.texture_cache();

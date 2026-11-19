@@ -94,13 +94,18 @@ inline std::string TranslateAnsiPath(const Memory* memory,
       std::string(TranslateAnsiString(memory, ansi_string)));
 }
 
+// A null pointer is no string. Translating it would point at guest address 0.
+inline const X_ANSI_STRING* TranslateAnsiStringPointer(const Memory* memory,
+                                                       uint32_t guest_address) {
+  return guest_address
+             ? memory->TranslateVirtual<const X_ANSI_STRING*>(guest_address)
+             : nullptr;
+}
+
 inline std::string_view TranslateAnsiStringAddress(const Memory* memory,
                                                    uint32_t guest_address) {
-  if (!guest_address) {
-    return "";
-  }
-  return TranslateAnsiString(
-      memory, memory->TranslateVirtual<const X_ANSI_STRING*>(guest_address));
+  return TranslateAnsiString(memory,
+                             TranslateAnsiStringPointer(memory, guest_address));
 }
 
 inline std::u16string TranslateUnicodeString(
@@ -161,11 +166,11 @@ class Param {
 template <>
 inline void Param::LoadValue<float>(Param::Init& init, float* out_value) {
   *out_value =
-      static_cast<float>(init.ppc_context->f[1 + ++init.float_ordinal]);
+      static_cast<float>(init.ppc_context->f[1 + init.float_ordinal++]);
 }
 template <>
 inline void Param::LoadValue<double>(Param::Init& init, double* out_value) {
-  *out_value = init.ppc_context->f[1 + ++init.float_ordinal];
+  *out_value = init.ppc_context->f[1 + init.float_ordinal++];
 }
 template <typename T>
 class ParamBase : public Param {
@@ -346,7 +351,11 @@ class ResultBase : public Result {
  public:
   ResultBase(T value) : value_(value) {}
   void Store(PPCContext* ppc_context) {
-    ppc_context->r[3] = uint64_t(int32_t(value_));
+    if constexpr (sizeof(T) == sizeof(uint64_t)) {
+      ppc_context->r[3] = uint64_t(value_);
+    } else {
+      ppc_context->r[3] = uint64_t(int32_t(value_));
+    }
   }
   ResultBase() = delete;
   ResultBase& operator=(const ResultBase&) = delete;
@@ -456,7 +465,7 @@ inline void AppendParam(StringBuffer* string_buffer,
   string_buffer->AppendHexUInt32(record.guest_address());
   if (record) {
     auto name_string =
-        kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(record->name_ptr);
+        util::TranslateAnsiStringPointer(kernel_memory(), record->name_ptr);
     std::string_view name =
         name_string == nullptr
             ? "(null)"

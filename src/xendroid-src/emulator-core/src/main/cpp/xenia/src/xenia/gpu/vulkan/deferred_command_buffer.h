@@ -620,6 +620,55 @@ class DeferredCommandBuffer {
   // Bit per DispatchSite recorded since the caller last cleared it (the GPU
   // time breakdown labels the time between two render passes with it).
   static uint32_t& dispatch_site_mask() { return dispatch_site_mask_; }
+  // Pipeline barriers as executed: those making the vertex stages (binning on
+  // tilers) of later commands wait for fragment work or compute serialize the
+  // GPU queues (vulkan_pass_head_overlap).
+  struct BarrierStats {
+    uint64_t total;
+    uint64_t fragment_to_vertex;
+    uint64_t compute_to_vertex;
+    uint64_t full;
+  };
+  static BarrierStats& barrier_stats() { return barrier_stats_; }
+  // log_vertex_wait_barrier_sites: recording stacks of the barriers making
+  // vertex stages wait, logged and cleared per GPU time breakdown interval.
+  static void RecordVertexWaitSite(
+      VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
+      uint32_t memory_barrier_count, uint32_t buffer_memory_barrier_count,
+      const VkBufferMemoryBarrier* buffer_memory_barriers,
+      uint32_t image_memory_barrier_count,
+      const VkImageMemoryBarrier* image_memory_barriers);
+  static void LogVertexWaitSites(uint32_t frames);
+  static void CountBarrier(VkPipelineStageFlags src_stage_mask,
+                           VkPipelineStageFlags dst_stage_mask) {
+    constexpr VkPipelineStageFlags kLate =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT |
+        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    constexpr VkPipelineStageFlags kVertex =
+        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+        VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+        VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+        VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    ++barrier_stats_.total;
+    if (dst_stage_mask & kVertex) {
+      if (src_stage_mask & kLate) {
+        ++barrier_stats_.fragment_to_vertex;
+      } else if (src_stage_mask & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+        ++barrier_stats_.compute_to_vertex;
+      }
+    }
+    if (src_stage_mask == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+        dst_stage_mask == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) {
+      ++barrier_stats_.full;
+    }
+  }
 
   void CmdVkDispatch(uint32_t group_count_x, uint32_t group_count_y,
                      uint32_t group_count_z,
@@ -1506,6 +1555,7 @@ class DeferredCommandBuffer {
   bool use_size_cursor_;
   static inline DispatchStats dispatch_stats_;
   static inline uint32_t dispatch_site_mask_ = 0;
+  static inline BarrierStats barrier_stats_ = {};
 };
 
 }  // namespace vulkan

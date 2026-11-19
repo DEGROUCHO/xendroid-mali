@@ -67,7 +67,6 @@ Lever confirmed → default in the code (with config migration) → track update
 | Command replay | ~2 vkCmd per draw with only fetches: already lean | no lever |
 
 **Verdict CP4 (25/10 02:21, ABAB BO q551, everything off vs the 4 levers together):** fps off 34.2 / 31,7, on 31.9 / 36.3; CP off 24.3 / 27.5 ms, on 25.4 / 23.8 ms. The heat alternated (starts 33.0 / 34.3 / 37.1 / 32.9 °C). Pair at the same temperature (off1 and on2, ~33 °C): 34.2 → 36.3 fps (+6%), CP 24.3 → 23.8 ms. Mechanism confirmed: stale preswap 272 → 139 per frame (−49%), mprotect 178 → 143 calls per frame (−20%), but mprotect time stays 4.6-5.7 ms (more pages per call). Image identical (dynamic constants clean on Mali). Gain +3-6%, at the edge of noise; the CP stays ~24 ms. **Promoted to default in q554 (decision 25/10: clean and in the right direction → turned on)**, with migration `UPDATE_from_bool(…, 2026, 10, 25, 3, false)`; the dynamic constants stay off on the proprietary Qualcomm driver. The big CP lever is not here.
-| X360 Mobile / aX360e | closed source / = upstream | nothing to copy |
 
 **Where BO's CPU goes (q541, per-thread profile):** 5.66 cores total = CP 0.89 + **6 guest threads ~4.7 cores** (the game's job system waiting by spinning, as on the 360). Slowing those spins has already failed (7/10: block, then −18% fps): only the wait on host producers (GPU ring, fence) is touched, never the worker spins.
 

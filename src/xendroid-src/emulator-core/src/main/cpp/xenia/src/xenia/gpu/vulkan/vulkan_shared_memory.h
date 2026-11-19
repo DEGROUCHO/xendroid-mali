@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -51,6 +52,12 @@ class VulkanSharedMemory : public SharedMemory {
   // Pending records own an R32 source and a CP-only compute closure. CPU
   // faults request work and wait outside the once-held global region.
   bool CanPublishDepthSurface(uint32_t length = 0) const;
+  // vulkan_surface_skip_cpu_read: a surface the CPU read back (materialized
+  // with a GPU wait) makes the next resolves to the same start take the
+  // memory path for a while - the guest reads them on the CPU, the zero-copy
+  // texture only adds a draw and a compute (Rogue: 70/s, never sampled).
+  // Returns true (and spends one skip) if the resolve at start should skip.
+  bool ConsumeSurfaceCpuReadSkip(uint32_t start);
   bool has_depth_surface_records() const { return depth_provider_stats_.pending_bytes != 0; }
   uint32_t depth_surface_page_size_log2() const { return page_size_log2(); }
   // geometry identifies the guest bytes the resolve writes inside the range.
@@ -110,7 +117,11 @@ class VulkanSharedMemory : public SharedMemory {
   };
   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
   // read-write accesses are ordered with each other.
-  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+  // materialize = false only restores an earlier declaration (the deferred
+  // resolve tail): its writes were declared, and their ranges materialized,
+  // when it was first made; surfaces published since must stay pending.
+  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {},
+           bool materialize = true);
   Usage usage() const { return last_usage_; }
   // vulkan_pass_head_overlap: compute writes reach the read stages except the
   // vertex ones (vertex input, guest vertex shaders), so the next pass's
@@ -148,6 +159,24 @@ class VulkanSharedMemory : public SharedMemory {
     vertex_debt_ranges_ = std::move(debt.vertex_ranges);
     vertex_debt_start_ = debt.vertex_start;
     vertex_debt_end_ = debt.vertex_end;
+  }
+  // vulkan_pass_head_overlap: the tail ends with a barrier that leaves the
+  // vertex stages out, so the debts of its own compute writes stay open on
+  // top of the main stream's (settled by SettleVertexReads where read).
+  void MergeReadDebt(ReadDebt&& debt) {
+    vertex_debt_ = vertex_debt_ || debt.vertex;
+    fragment_debt_ = fragment_debt_ || debt.fragment;
+    if (vertex_debt_all_ || debt.vertex_all ||
+        vertex_debt_ranges_.size() + debt.vertex_ranges.size() > 64) {
+      vertex_debt_all_ = true;
+      vertex_debt_ranges_.clear();
+    } else {
+      vertex_debt_ranges_.insert(vertex_debt_ranges_.end(),
+                                 debt.vertex_ranges.cbegin(),
+                                 debt.vertex_ranges.cend());
+    }
+    vertex_debt_start_ = std::min(vertex_debt_start_, debt.vertex_start);
+    vertex_debt_end_ = std::max(vertex_debt_end_, debt.vertex_end);
   }
 
   struct BufferSlice {
@@ -286,6 +315,9 @@ class VulkanSharedMemory : public SharedMemory {
   // Only the CP retires records. CPU waiters never hold a vector reference
   // while unlocked, and rescan after every wake before permitting access.
   std::vector<DepthSurfaceSnapshot> depth_surfaces_;
+  // Starts of surfaces the CPU read -> remaining resolves to skip (CP only,
+  // written under the global critical region by the CP materialization).
+  std::unordered_map<uint32_t, uint32_t> surface_cpu_read_skips_;
   void* depth_read_callback_ = nullptr;
   DepthProviderStats depth_provider_stats_;
   struct MaterializeCaller {

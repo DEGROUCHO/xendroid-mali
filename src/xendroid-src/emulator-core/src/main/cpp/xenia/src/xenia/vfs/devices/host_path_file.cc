@@ -17,16 +17,18 @@ namespace vfs {
 HostPathFile::HostPathFile(
     uint32_t file_access, HostPathEntry* entry,
     std::unique_ptr<xe::filesystem::FileHandle> file_handle)
-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
-
-HostPathFile::~HostPathFile() = default;
-
-void HostPathFile::Destroy() {
-  if (entry_ && entry_->delete_on_close()) {
-    entry()->Delete();
-  }
-  delete this;
+    : File(file_access, entry), file_handle_(std::move(file_handle)) {
+  entry->RetainFile();
 }
+
+HostPathFile::~HostPathFile() {
+  // Closed first, or a delete on Windows can leave the name in place until
+  // this handle closes.
+  file_handle_.reset();
+  entry_->ReleaseFile();
+}
+
+void HostPathFile::Destroy() { delete this; }
 
 X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                 size_t* out_bytes_read) {

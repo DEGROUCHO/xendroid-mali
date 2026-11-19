@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <atomic>
 #include <ranges>
 
 #include "xenia/kernel/kernel_state.h"
@@ -472,9 +473,10 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
 
   // Create a thread to run in.
   // We start suspended so we can run the debugger prep.
-  auto thread = object_ref<XThread>(
-      new XThread(kernel_state(), module->stack_size(), 0,
-                  module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
+  // The console's XexStartExecutable always starts it on CPU 0.
+  auto thread = object_ref<XThread>(new XThread(
+      kernel_state(), module->stack_size(), 0, module->entry_point(), 0,
+      X_CREATE_SUSPENDED | (1u << 24), true, true));  // affinity mask: CPU 0
 
   // We know this is the 'main thread'.
   thread->set_name("Main XThread");
@@ -753,7 +755,7 @@ X_RESULT KernelState::FinishLoadingUserModule(
     // Call DllMain(DLL_PROCESS_ATTACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
-        module->handle(),
+        module->hmodule_ptr(),
         1,  // DLL_PROCESS_ATTACH
         0,  // 0 because always dynamic
     };
@@ -770,7 +772,16 @@ X_RESULT KernelState::FinishLoadingUserModule(
 X_RESULT KernelState::ApplyTitleUpdate(
     const object_ref<UserModule> title_module) {
   const auto title_updates = FindTitleUpdate(title_module->title_id());
+  XELOGI("Title update: {} found for {:08X}", title_updates.size(),
+         title_module->title_id());
   if (title_updates.empty()) {
+    return X_STATUS_SUCCESS;
+  }
+  // A module loaded after the executable runs the version the executable
+  // runs: none when the executable's update failed and it started without.
+  if (title_update_failed_ && GetExecutableModule()) {
+    XELOGW("Title update: not applied to {}, the executable runs without it",
+           title_module->name());
     return X_STATUS_SUCCESS;
   }
 
@@ -831,16 +842,22 @@ const object_ref<UserModule> KernelState::LoadTitleUpdate(
 
   std::string mount_path = "";
   if (!file_system()->FindSymbolicLink(kDefaultGameSymbolicLink, mount_path)) {
+    XELOGW("Title update '{}': no game mount (open status {:08X})",
+           title_update->file_name(), open_status);
     return nullptr;
   }
 
   if (!module->path().starts_with(mount_path)) {
+    XELOGW("Title update '{}': module path {} is not under {}",
+           title_update->file_name(), module->path(), mount_path);
     return nullptr;
   }
 
   std::string resolved_path = "";
   if (!file_system()->FindSymbolicLink(kDefaultUpdateSymbolicLink,
                                        resolved_path)) {
+    XELOGW("Title update '{}': package not mounted (open status {:08X})",
+           title_update->file_name(), open_status);
     return nullptr;
   }
 
@@ -851,6 +868,8 @@ const object_ref<UserModule> KernelState::LoadTitleUpdate(
       kernel_state()->file_system()->ResolvePath(resolved_path + relative_path);
 
   if (!patch_entry) {
+    XELOGW("Title update '{}': {} not in the package",
+           title_update->file_name(), relative_path);
     return nullptr;
   }
 
@@ -911,12 +930,18 @@ X_RESULT KernelState::ApplyTitleUpdate(
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  X_STATUS result =
+  // ApplyPatch fails with positive codes, which XFAILED reads as success: the
+  // title then ran a partly rewritten image (xenia-edge 8984c68712).
+  const int result =
       patch_module->xex_module()->ApplyPatch(title_module->xex_module());
-  if (result != X_STATUS_SUCCESS) {
+  if (result) {
     XELOGE("Failed to apply XEX patch, code: {}", result);
+    if (!GetExecutableModule()) {
+      title_update_failed_ = true;
+    }
+    return X_STATUS_UNSUCCESSFUL;
   }
-  return result;
+  return X_STATUS_SUCCESS;
 }
 
 void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
@@ -927,7 +952,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
     // Call DllMain(DLL_PROCESS_DETACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
-        module->handle(),
+        module->hmodule_ptr(),
         0,  // DLL_PROCESS_DETACH
         0,  // 0 for now, assume XexUnloadImage is like FreeLibrary
     };
@@ -992,11 +1017,24 @@ void KernelState::UnregisterThread(XThread* thread) {
   }
 }
 
+// The kernel only notifies DLLs about threads of the title process. A thread of
+// another process taking a DLL's DLL_PROCESS_ATTACH would run the module's
+// process init, including its KeTlsAlloc calls, in that process. Host threads
+// aren't console threads at all.
+static bool NotifiesDlls(XThread* thread) {
+  return thread->is_guest_thread() &&
+         thread->guest_object<X_KTHREAD>()->process_type == X_PROCTYPE_TITLE;
+}
+
 void KernelState::OnThreadExecute(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
 
   // Must be called on executing thread.
   assert_true(XThread::GetCurrentThread() == thread);
+
+  if (!NotifiesDlls(thread)) {
+    return;
+  }
 
   // Call DllMain(DLL_THREAD_ATTACH) for each user module:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
@@ -1004,7 +1042,7 @@ void KernelState::OnThreadExecute(XThread* thread) {
   for (auto user_module : user_modules_) {
     if (user_module->is_dll_module() && user_module->entry_point()) {
       uint64_t args[] = {
-          user_module->handle(),
+          user_module->hmodule_ptr(),
           user_module->is_attached()
               ? static_cast<uint64_t>(2)   // DLL_THREAD_ATTACH - Used to call
                                            // DLL for each thread created.
@@ -1030,10 +1068,12 @@ void KernelState::OnThreadExit(XThread* thread) {
   // Call DllMain(DLL_THREAD_DETACH) for each user module:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
   auto thread_state = thread->thread_state();
+  const bool notifies_dlls = NotifiesDlls(thread);
   for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point()) {
+    if (notifies_dlls && user_module->is_dll_module() &&
+        user_module->entry_point()) {
       uint64_t args[] = {
-          user_module->handle(),
+          user_module->hmodule_ptr(),
           3,  // DLL_THREAD_DETACH
           0,  // 0 because always dynamic
       };
@@ -1118,30 +1158,37 @@ void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
 }
 
 void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
-  CompleteOverlappedEx(overlapped_ptr, result, result, 0);
+  CompleteOverlappedEx(overlapped_ptr, result, result, 0,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
-                                       uint32_t extended_error,
-                                       uint32_t length) {
+                                       uint32_t extended_error, uint32_t length,
+                                       X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetResult(ptr, result);
+  // Read before the result, after which a caller polling it may reuse the
+  // overlapped for its next request.
+  const X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  const uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
+  // Result last, so a caller polling it for completion reads a valid length.
+  // A completed request leaves no context behind.
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
-  X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle) {
+  XOverlappedSetContext(ptr, 0);
+  std::atomic_thread_fence(std::memory_order_release);
+  XOverlappedSetResult(ptr, result);
+  // The event is left unsignaled when there is a completion routine.
+  if (event_handle && !routine) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {
       ev->Set(0, false);
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
+  if (routine) {
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
       thread->EnqueueApc(routine, result, length, overlapped_ptr);
     }
   }
@@ -1160,9 +1207,8 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr,
                                                 X_RESULT result,
                                                 uint32_t extended_error,
                                                 uint32_t length) {
-  auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedDeferred(
@@ -1208,7 +1254,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     std::function<void()> post_callback) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  const X_HANDLE thread_handle = XThread::GetCurrentThreadHandle();
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
   if (event_handle) {
     auto ev = object_table()->LookupObject<XObject>(event_handle);
@@ -1220,7 +1266,7 @@ void KernelState::CompleteOverlappedDeferredEx(
   }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
-                             pre_callback, post_callback]() {
+                             thread_handle, pre_callback, post_callback]() {
     if (pre_callback) {
       pre_callback();
     }
@@ -1228,7 +1274,8 @@ void KernelState::CompleteOverlappedDeferredEx(
     xe::threading::Sleep(kDeferredOverlappedDelayMillis);
     uint32_t extended_error, length;
     auto result = completion_callback(extended_error, length);
-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                         thread_handle);
     if (post_callback) {
       post_callback();
     }

@@ -872,7 +872,9 @@ class Shader {
   const uint32_t* ucode_dwords() const { return ucode_data_.data(); }
   size_t ucode_dword_count() const { return ucode_data_.size(); }
 
-  bool is_ucode_analyzed() const { return is_ucode_analyzed_; }
+  bool is_ucode_analyzed() const {
+    return is_ucode_analyzed_.load(std::memory_order_acquire);
+  }
   // ucode_disasm_buffer is temporary storage for disassembly (provided
   // externally so it won't need to be reallocated for every shader).
   void AnalyzeUcode(StringBuffer& ucode_disasm_buffer);
@@ -1073,7 +1075,10 @@ class Shader {
   // extremely rare; however care should be taken regarding depth format-related
   // translation modifications in this case), also some info needed for drawing
   // is collected during the ucode analysis.
-  bool is_ucode_analyzed_ = false;
+  // Set (release) only after every analysis result above is written: pipeline
+  // creation threads, shader storage translation and the draw thread may all
+  // reach the same shader, and AnalyzeUcode serializes them.
+  std::atomic<bool> is_ucode_analyzed_{false};
 
   std::string ucode_disassembly_;
   std::vector<VertexBinding> vertex_bindings_;

@@ -345,7 +345,7 @@ DEFINE_bool(readback_resolve_uma_sync, false,
             "Rogue: a bitset built by the resolve) sees stale bits.",
             "GPU");
 
-DEFINE_bool(readback_resolve_uma_provider, true,
+DEFINE_bool(readback_resolve_uma_provider, false,
             "In uma readback, later resolves of a range are not copied into "
             "guest RAM eagerly: the range is protected and the first CPU "
             "access copies the CURRENT resolve, waiting for the GPU only if "
@@ -353,6 +353,11 @@ DEFINE_bool(readback_resolve_uma_provider, true,
             "previous resolve (Assassin's Creed Rogue crash) and skips the "
             "copies of resolves the CPU never reads.",
             "GPU");
+// Default true from q705 (16/11) for every game; off again in q745 (18/11) and
+// on only for Assassin's Creed Rogue (game_quirks.cc): a CPU read of a resolve
+// waits for the GPU, and Halo: Reach reads one every frame, which serialized
+// the CPU and the GPU (30 -> 24 fps, measured q744 A/B).
+UPDATE_from_bool(readback_resolve_uma_provider, 2026, 11, 18, 14, true);
 
 DEFINE_bool(readback_resolve_uma_readwatch, false,
             "In uma readback, once the CPU has read a resolve destination, "

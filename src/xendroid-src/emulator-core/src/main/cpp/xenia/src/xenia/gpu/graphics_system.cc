@@ -277,11 +277,7 @@ void GraphicsSystem::Shutdown() {
     command_processor_.reset();
   }
 
-  if (frame_limiter_worker_thread_) {
-    frame_limiter_worker_running_ = false;
-    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
-    frame_limiter_worker_thread_.reset();
-  }
+  StopFrameLimiter();
 
   if (presenter_) {
     if (app_context_) {
@@ -294,6 +290,14 @@ void GraphicsSystem::Shutdown() {
   }
 
   provider_.reset();
+}
+
+void GraphicsSystem::StopFrameLimiter() {
+  if (frame_limiter_worker_thread_) {
+    frame_limiter_worker_running_ = false;
+    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
+    frame_limiter_worker_thread_.reset();
+  }
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread(
@@ -523,6 +527,7 @@ bool GraphicsSystem::PauseForRuntimeSnapshot(std::function<bool()> operation,
   // Suppress every vblank writer before the CP captures guest-visible state.
   paused_.store(true, std::memory_order_seq_cst);
   while (vblank_dispatch_active_.load(std::memory_order_seq_cst)) threading::MaybeYield();
+  XELOGI("GPU snapshot: vblank quiet, asking the CP thread");
   if (!command_processor_->PauseForRuntimeSnapshot(std::move(operation), timeout)) {
     // If the operation actually entered, it remains parked even on failure.
     // Caller must Resume or fail stopped explicitly; no automatic guest run.

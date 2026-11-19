@@ -524,6 +524,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
     bool spirv_texture_sign_specialization_used = {};
     bool vulkan_allow_reverse_z = {};
     bool vulkan_async_skip_draws = {};
+    bool vulkan_async_wait_unredoable_draws = {};
     bool vulkan_debug_disable_alpha_to_mask = {};
     bool vulkan_defer_descriptor_updates = {};
     bool vulkan_depth_4x_as_1x = {};
@@ -894,6 +895,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
     return !submission_open_ &&
            GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
+  // For command_processor_memexport.inc: submits what is recorded and waits for
+  // it, so the RAM mirror of export output completes before the guest reads.
+  void AwaitMemexportOutput() {
+    if (EndSubmission(false) && AwaitAllQueueOperationsCompletion()) {
+      BeginSubmission(false);
+    }
+  }
+  // Export output not yet in guest RAM: host-routed pages, or ranges the RAM
+  // mirror has yet to copy.
+  bool IsMemexportOutputRange(uint32_t base_bytes, uint32_t size_bytes) const;
 
   void ClearTransientDescriptorPools();
 
@@ -1206,6 +1217,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t float_stride = 0;
     uint32_t max_vertex_count = 0;
     std::vector<uint8_t> system, float_vertex, bool_loop, fetch;
+    // Bytes [start, end) the batched draws export to.
+    std::vector<std::pair<uint32_t, uint32_t>> written;
   };
   MemExportBatch memexport_batch_;
   bool memexport_batch_flushing_ = false;
@@ -1213,10 +1226,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool memexport_batch_supported_ = false;
   uint64_t memexport_batched_draws_ = 0;
   uint64_t memexport_batch_dispatches_ = 0;
+  // Batches closed early because a draw reads what the batch exports.
+  uint64_t memexport_batch_read_splits_ = 0;
+  bool MemExportBatchWritesReadBy(const Shader& vertex_shader) const;
   void PushMemexportBeforeBarrier();
   void PushMemexportAfterBarrier();
-  void AddToMemExportBatch(VkPipeline pipeline, VkPipelineLayout layout,
-                           uint32_t set_count, uint32_t float_constant_count,
+  void AddToMemExportBatch(const Shader& vertex_shader, VkPipeline pipeline,
+                           VkPipelineLayout layout, uint32_t set_count,
+                           uint32_t float_constant_count,
                            uint32_t vertex_count);
   void FlushMemExportBatch();
   void OpenPassTimestamp(uint32_t bucket_key);
@@ -1545,21 +1562,66 @@ class VulkanCommandProcessor final : public CommandProcessor {
                          const VulkanShader* pixel_shader,
                          const IndexBufferInfo* indices);
   void ResolveDeferDrawWrites(reg::RB_DEPTHCONTROL depth, uint32_t color_mask);
+  // Hazards of the current draw against resolve destinations (read and
+  // unknown bits) and against EDRAM source tiles (true if written).
+  uint32_t ResolveDeferDrawReads(const VulkanShader& vertex_shader,
+                                 const VulkanShader* pixel_shader,
+                                 const IndexBufferInfo* indices,
+                                 const std::pair<uint32_t, uint32_t>* ranges,
+                                 size_t range_count);
+  bool ResolveDeferDrawWritesTiles(
+      reg::RB_DEPTHCONTROL depth, uint32_t color_mask,
+      const std::array<uint64_t, xenos::kEdramTileCount / 64>& tiles);
+  // Whether any of `count` EDRAM tiles from `first` (modulo the EDRAM size)
+  // is set, by 64-bit words.
+  static bool ResolveDeferAnyTile(
+      const std::array<uint64_t, xenos::kEdramTileCount / 64>& tiles,
+      uint32_t first, uint32_t count) {
+    constexpr uint32_t kTileMask = xenos::kEdramTileCount - 1;
+    first &= kTileMask;
+    while (count) {
+      const uint32_t bit = first & 63;
+      const uint32_t n = count < 64 - bit ? count : 64 - bit;
+      const uint64_t run = n == 64 ? ~uint64_t(0) : (uint64_t(1) << n) - 1;
+      if (tiles[first >> 6] & (run << bit)) return true;
+      count -= n;
+      first = (first + n) & kTileMask;
+    }
+    return false;
+  }
   void ResolveDeferReport();
   enum class ResolveDeferStop : uint32_t {
     kPassEnd, kWrite, kDestination, kClear, kReadback, kEvent,
     kSubmission, kNextResolve, kResource, kCount
   };
   void FlushDeferredResolve(ResolveDeferStop reason);
+  // Census of what flushes a pending deferred resolve as an event (key:
+  // 0x1xxxx register, 0x2xxxx PM4 opcode, 0x30000 swap, 0x40000 primary
+  // buffer end, 0x50000 draw), logged with [RDEFER].
+  void NoteDeferEventSource(uint32_t key) {
+    if (deferred_resolve_pending_) {
+      ++deferred_resolve_event_sources_[key];
+    }
+  }
+  std::unordered_map<uint32_t, uint64_t> deferred_resolve_event_sources_;
   bool RecordDeferredResolve(const draw_util::ResolveInfo& info);
   std::unique_ptr<DeferredCommandBuffer> deferred_resolve_commands_;
   bool deferred_resolve_pending_ = false;
   bool deferred_resolve_recording_ = false;
   bool deferred_resolve_scratch_pinned_ = false;
   VkPipeline deferred_resolve_final_compute_pipeline_ = VK_NULL_HANDLE;
+  // vulkan_deferred_surface_resolve: the tail drew (zero-copy surface draw),
+  // so the cached graphics state matches neither the main stream after
+  // recording nor the command buffer after the tail executes.
+  bool deferred_resolve_tail_graphics_ = false;
+  bool deferred_resolve_tail_graphics_recorded_ = false;
+  void InvalidateGraphicsStateCache();
   ResolveDeferStop deferred_resolve_stop_ = ResolveDeferStop::kPassEnd;
   uint64_t deferred_resolve_queued_ = 0, deferred_resolve_executed_ = 0;
   uint64_t deferred_resolve_with_draws_ = 0, deferred_resolve_uma_queued_ = 0;
+  // "Resource" rejections split into scratch buffer in use, pending barriers,
+  // render target cache.
+  std::array<uint64_t, 3> deferred_resolve_rejected_resource_ = {};
   bool deferred_resolve_has_draws_ = false;
   std::array<uint64_t, size_t(ResolveDeferStop::kCount)>
       deferred_resolve_stops_ = {}, deferred_resolve_rejected_ = {};
@@ -1626,6 +1688,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   };
   std::vector<PendingBarrier> pending_barriers_;
   PendingBarrier current_pending_barrier_;
+  void SplitPendingBarrierIfVertexWaitGrows(VkPipelineStageFlags src_stage_mask,
+                                           VkPipelineStageFlags dst_stage_mask);
+  uint64_t vertex_wait_barrier_splits_ = 0;
 
   // GPU-local scratch buffer.
   static constexpr VkDeviceSize kScratchBufferSizeIncrement = 16 * 1024 * 1024;

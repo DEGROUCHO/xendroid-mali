@@ -102,6 +102,10 @@ class Processor {
 
   bool AddModule(std::unique_ptr<Module> module);
   void RemoveModule(const std::string_view name);
+  // Removes exactly this module. A title update (default.xexp) has the same
+  // base name as its executable (default.xex), so removal by name can destroy
+  // the wrong one.
+  void RemoveModule(const Module* module);
   Module* GetModule(const std::string_view name);
   std::vector<Module*> GetModules();
 

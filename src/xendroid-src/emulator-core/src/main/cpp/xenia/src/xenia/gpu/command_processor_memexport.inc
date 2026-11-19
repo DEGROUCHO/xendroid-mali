@@ -40,25 +40,27 @@ void MarkMemexportPagesWritten(uint32_t base_bytes, uint32_t size_bytes) {
 // Ring buffer read-pointer writeback is deliberately not covered: it reports
 // parse progress rather than execution, but fires per batch, so stalling there
 // would serialize the command processor against the GPU.
-void AwaitMemexportForFence() {
+void AwaitMemexportForFence() override {
   if (!memexport_await_pending_) {
     return;
   }
   memexport_await_pending_ = false;
   // Flushes the open submission before waiting, so a draw that is still only
   // recorded gets submitted rather than skipped.
-  AwaitAllQueueOperationsCompletion();
+  AwaitMemexportOutput();
 }
 
 // Same, for the guest asking the GPU to flush a range it is about to read
 // (COHER_BASE_HOST/COHER_SIZE_HOST). Gated on the range actually holding export
 // output, unlike the fence path which cannot know what the fence refers to.
-void AwaitMemexportForCoherency(uint32_t base_bytes, uint32_t size_bytes) {
-  if (!memexport_await_pending_ || !IsMemexportRange(base_bytes, size_bytes)) {
+void AwaitMemexportForCoherency(uint32_t base_bytes,
+                                uint32_t size_bytes) override {
+  if (!memexport_await_pending_ ||
+      !IsMemexportOutputRange(base_bytes, size_bytes)) {
     return;
   }
   memexport_await_pending_ = false;
-  AwaitAllQueueOperationsCompletion();
+  AwaitMemexportOutput();
 }
 
 // Clears memexport marks for a range a resolve just wrote, so its device-buffer

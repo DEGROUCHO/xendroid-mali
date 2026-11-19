@@ -94,6 +94,9 @@ class Entry {
   uint64_t access_timestamp() const { return access_timestamp_; }
   uint64_t write_timestamp() const { return write_timestamp_; }
   bool delete_on_close() const { return delete_on_close_; }
+  virtual bool has_open_files() const { return false; }
+  virtual void RetainFile() {}
+  virtual void ReleaseFile() {}
 
   virtual bool SetAttributes(uint64_t attributes) { return false; }
   virtual bool SetCreateTimestamp(uint64_t timestamp) { return false; }
@@ -124,8 +127,10 @@ class Entry {
                          size_t* current_index);
 
   Entry* CreateEntry(const std::string_view name, uint32_t attributes);
-  bool Delete(Entry* entry);
-  bool Delete();
+  // An entry with open files is refused unless detach_open is set: then it is
+  // removed from the host and lives on, detached, until its last file closes.
+  bool Delete(Entry* entry, bool detach_open = false);
+  bool Delete(bool detach_open = false);
   void Touch();
 
   void Rename(const std::filesystem::path file_path);

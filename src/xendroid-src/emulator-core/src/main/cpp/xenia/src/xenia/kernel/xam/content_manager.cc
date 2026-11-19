@@ -582,8 +582,11 @@ bool ContentManager::UpdateSpaData(vfs::Entry* spa_file_update) {
   std::vector<uint8_t> data(spa_file_update->size());
 
   size_t read_bytes = 0;
-  if (file->ReadSync(std::span<uint8_t>(data.data(), spa_file_update->size()),
-                     0, &read_bytes) != X_STATUS_SUCCESS) {
+  const X_STATUS read_result = file->ReadSync(
+      std::span<uint8_t>(data.data(), spa_file_update->size()), 0, &read_bytes);
+  // An open handle keeps the package's device alive after CloseContent.
+  file->Destroy();
+  if (read_result != X_STATUS_SUCCESS) {
     return false;
   }
 

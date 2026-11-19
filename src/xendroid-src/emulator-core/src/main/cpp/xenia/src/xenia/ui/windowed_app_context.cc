@@ -79,6 +79,21 @@ bool WindowedAppContext::CallInUIThreadDeferred(
   return true;
 }
 
+bool WindowedAppContext::CallInUIThreadAsync(std::function<void()> function) {
+  {
+    std::unique_lock<std::mutex> pending_functions_lock(
+        pending_functions_mutex_);
+    if (!pending_functions_accepted_) {
+      return false;
+    }
+    pending_functions_.emplace_back(std::move(function));
+  }
+  if (!is_in_destructor_) {
+    NotifyUILoopOfPendingFunctionsAsync();
+  }
+  return true;
+}
+
 bool WindowedAppContext::CallInUIThread(std::function<void()> function) {
   if (IsInUIThread()) {
     // The intention is just to make sure the code is executed in the UI thread,

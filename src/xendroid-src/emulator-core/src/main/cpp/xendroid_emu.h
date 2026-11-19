@@ -36,6 +36,7 @@ public:
     pthread_cond_t wake_cond;
 
     void NotifyUILoopOfPendingFunctions() override;
+    void NotifyUILoopOfPendingFunctionsAsync() override;
 
     void PlatformQuitFromUIThread() override;
 

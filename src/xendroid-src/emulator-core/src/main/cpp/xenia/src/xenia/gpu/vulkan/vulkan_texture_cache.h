@@ -41,6 +41,14 @@ class VulkanTextureCache final : public TextureCache {
       Texture* texture;
       VkBufferImageCopy region;
       bool publish;
+      // 0: the whole (single-level) texture, 1: only the base level of a
+      // mipmapped texture, 2: one level of its mips.
+      uint8_t part = 0;
+      // The resolve rectangle is exactly that level (it wrote nothing else).
+      bool exact_level = false;
+      // Not published: filled into an outdated texture, which becomes current
+      // once such copies made since the last other write cover all of it.
+      bool cover = false;
     };
     VkDeviceSize size = 0;
     // Host bits for RB_COPY_DEST_INFO of the resolve filling the buffer.
@@ -57,6 +65,27 @@ class VulkanTextureCache final : public TextureCache {
                                   const draw_util::ResolveInfo& info,
                                   bool scaled,
                                   const global_unique_lock_type& lock);
+
+  // vulkan_color_surface_resolve: raw resolves into these texture formats are
+  // drawn straight into the texture (the render target and the texture have
+  // the same Vulkan format and the loader copies the bits). 8_8_8_8 always;
+  // the others with vulkan_color_surface_resolve_wide.
+  enum ColorSurfaceKind : uint8_t {
+    kColorSurface8888,
+    kColorSurface2101010,
+    kColorSurface16_16Float,
+    kColorSurface16_16_16_16Float,
+    kColorSurfaceKindCount,
+  };
+  // kColorSurfaceKindCount if the format has no color surface.
+  static ColorSurfaceKind GetColorSurfaceKind(xenos::TextureFormat format);
+  static VkFormat GetColorSurfaceVulkanFormat(ColorSurfaceKind kind);
+  static bool IsColorSurface64bpp(ColorSurfaceKind kind) {
+    return kind == kColorSurface16_16_16_16Float;
+  }
+  // The color surface kind of a texture made renderable for it, otherwise
+  // kColorSurfaceKindCount.
+  static ColorSurfaceKind GetTextureColorSurfaceKind(const Texture& texture);
 
   // Independent R32 images retain depth until the synchronous provider runs.
   struct DepthSurfaceTarget {
@@ -130,7 +159,10 @@ class VulkanTextureCache final : public TextureCache {
   // All candidates, including compatible aliases at the same guest base.
   // Removed by the image destructor before it can become a dangling pointer.
   std::unordered_multimap<uint32_t, VulkanTexture*> resolve_textures_;
-  uint32_t ResolveTextureBytesPerPixel(const TextureKey& key) const;
+  // Mipmapped resolve-capable textures, by base address and by mips address.
+  std::unordered_multimap<uint32_t, VulkanTexture*> resolve_mipped_textures_;
+  uint32_t ResolveTextureBytesPerPixel(const TextureKey& key,
+                                       bool allow_mips = false) const;
   uint32_t ResolveTextureLinearDestFlags(const TextureKey& key) const;
   // Whether the texture's mips are generated on the host from its base level
   // (vulkan_generate_texture_mips) instead of loaded from guest memory.
@@ -231,9 +263,18 @@ class VulkanTextureCache final : public TextureCache {
   void EnsureTexturesSampled(uint32_t used_texture_mask,
                              uint32_t vertex_texture_mask);
 
-  // Diagnostic only, including resident bindings that need no reload.
+  // Whether the bound textures overlap a resolve destination, including
+  // resident bindings that need no reload (the census and the deferred resolve
+  // queue). The range list form checks every queued destination with one key
+  // and layout computation per binding.
   bool ResolveDeferTextureRead(uint32_t used_texture_mask, uint32_t address,
-                               uint32_t length, bool& unknown) const;
+                               uint32_t length, bool& unknown) const {
+    const std::pair<uint32_t, uint32_t> range(address, length);
+    return ResolveDeferTextureRead(used_texture_mask, &range, 1, unknown);
+  }
+  bool ResolveDeferTextureRead(uint32_t used_texture_mask,
+                               const std::pair<uint32_t, uint32_t>* ranges,
+                               size_t range_count, bool& unknown) const;
 
   // Loads the textures queued by GPU-write invalidations (see
   // TextureCache::HasEagerReloads) and transitions them back for guest shader
@@ -250,6 +291,10 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension,
                                               bool is_signed);
+  // The null image view for the dimension, with the components the host
+  // swizzle makes constant 1 mapped to 1.
+  VkImageView GetNullImageView(xenos::FetchOpDimension dimension,
+                               uint32_t host_swizzle);
 
   // Descriptor set (kStorageBufferCompute layout) binding the whole shared
   // memory buffer for compute load/store, or VK_NULL_HANDLE if the buffer
@@ -470,12 +515,19 @@ class VulkanTextureCache final : public TextureCache {
     // base did since its last load (0 none, 1 published, 2 published but the
     // range was not valid, 3 copied without publishing, 0x80 | reason
     // rejected) and how many there were.
+    // vulkan_resolve_texture_copy_cover: 8x8-texel blocks filled by resolve
+    // copies since base_invalidation_epoch was resolve_cover_epoch.
+    std::vector<uint64_t> resolve_cover_bits;
+    uint32_t resolve_cover_epoch = 0;
+    uint32_t resolve_cover_blocks = 0;
+    bool resolve_cover_active = false;
     uint8_t resolve_copy_last = 0;
     uint8_t resolve_copy_count = 0;
     bool depth_surface_renderable = false;
     // vulkan_color_surface_resolve: a renderable k_8_8_8_8 image (RGBA8 view,
     // no stencil image) instead of the R32 depth one.
     bool surface_is_color = false;
+    ColorSurfaceKind surface_color_kind = kColorSurface8888;
     bool depth_surface_pending_sample = false;
     VkImageView depth_surface_attachment_view = VK_NULL_HANDLE;
     // The guest stencil next to the R32 depth, so the provider can rebuild
@@ -720,6 +772,9 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView null_image_view_2d_array_ = VK_NULL_HANDLE;
   VkImageView null_image_view_cube_ = VK_NULL_HANDLE;
   VkImageView null_image_view_3d_ = VK_NULL_HANDLE;
+  // Null views per dimension (2D array, cube, 3D) and per mask of components
+  // that are constant 1, created on first use (GetNullImageView).
+  std::array<std::array<VkImageView, 16>, 3> null_image_views_ones_{};
   bool null_images_cleared_ = false;
   // Set by OnTextureDataRequest for the load that follows it: the texture is
   // not bound in the current render pass and no command of the pass touched
@@ -784,6 +839,21 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t scaled_resolve_heap_count_ = 0;
   // Memory type for sparse allocations
   uint32_t scaled_resolve_memory_type_ = UINT32_MAX;
+
+  // ResolveDeferTextureRead: guest memory extents of each fetch constant
+  // slot, a pure function of its words and gpu_allow_invalid_fetch_constants.
+  // The check runs for every draw while a deferred resolve is pending, mostly
+  // with unchanged fetch constants: decode and layout only on a change.
+  struct ResolveDeferExtents {
+    xenos::xe_gpu_texture_fetch_t fetch;
+    bool computed = false;
+    bool allow_invalid = false;
+    bool valid = false;
+    uint32_t base_address = 0, base_length = 0;
+    uint32_t mip_address = 0, mip_length = 0;
+  };
+  mutable std::array<ResolveDeferExtents, xenos::kTextureFetchConstantCount>
+      resolve_defer_extents_ = {};
 };
 
 }  // namespace vulkan

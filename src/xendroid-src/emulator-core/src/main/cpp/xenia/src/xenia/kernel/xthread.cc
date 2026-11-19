@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xthread.h"
 
+#include <algorithm>
 #include <exception>
 
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
@@ -386,7 +387,9 @@ X_STATUS XThread::Create() {
   uint32_t tls_slots = kDefaultTlsSlotCount;
   uint32_t tls_extended_size = 0;
   if (tls_header && tls_header->slot_count) {
-    tls_slots = tls_header->slot_count;
+    // Pad like KernelState::SetProcessTLSVars does for the slot bitmap, so
+    // every slot KeTlsAlloc can hand out has storage.
+    tls_slots = (tls_header->slot_count + 3) & ~3u;
     tls_extended_size = tls_header->data_size;
   }
 
@@ -1166,8 +1169,14 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
   }
 }
 
+uint32_t XThread::tls_slot_count() const {
+  // The block is the extended (static) data followed by the slots.
+  uint32_t extended_size = tls_dynamic_address_ - tls_static_address_;
+  return (tls_total_size_ - extended_size) / 4;
+}
+
 bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-  if (slot * 4 > tls_total_size_) {
+  if (slot >= tls_slot_count()) {
     return false;
   }
 
@@ -1177,7 +1186,7 @@ bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
 }
 
 bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
-  if (slot * 4 >= tls_total_size_) {
+  if (slot >= tls_slot_count()) {
     return false;
   }
 
@@ -1326,10 +1335,13 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
-    // Absolute time, based on January 1, 1601.
-    // TODO(benvanik): convert time to relative time.
-    assert_always();
-    timeout_ms = 0;
+    // Absolute time, based on January 1, 1601. A time that has passed
+    // returns at once.
+    uint64_t now = Clock::QueryGuestSystemTime();
+    uint64_t due = static_cast<uint64_t>(timeout_ticks);
+    timeout_ms = due > now ? uint32_t(std::min<uint64_t>(
+                                 (due - now) / 10000, UINT32_MAX - 1))
+                           : 0;
   } else if (timeout_ticks < 0) {
     // Relative time.
     timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
